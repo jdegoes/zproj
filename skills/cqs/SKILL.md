@@ -129,6 +129,7 @@ cqs -q stale --json                             # What needs re-indexing?
 ## Do / Don't
 
 **Do:**
+- Use single quotes for queries containing `$` — in double quotes, `$letter` is silently expanded by the shell, changing the query without any error
 - Run `cqs init` + `cqs index` at the start of every new project
 - Start with `scout` or `task` before implementing — they assemble context in one call
 - Use `impact` before any refactor — even "small" changes can have transitive callers

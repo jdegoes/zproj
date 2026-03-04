@@ -45,6 +45,13 @@ directly — `ck` will never find them. When in doubt, check `.ckignore` first.
 | Hybrid | `--hybrid` | Balance precision and recall — "JWT token validation" |
 | Regex | _(default)_ | Exact identifiers and patterns — `fn authenticate`, `class.*Handler` |
 
+**Quoting:** Use single quotes for regex patterns containing `$` or `[`. In double quotes, `$letter` and `$[...]` are expanded by the shell before `ck` sees them, silently corrupting the pattern.
+
+```bash
+ck 'Scope\.$'   # correct — $ preserved
+ck "Scope\.$"   # wrong   — $ may be expanded by the shell
+```
+
 **`--lex` caveat:** BM25 lexical search requires embeddings to be present. Always run
 `ck --index .` before using `--lex`. Auto-indexing on first `--sem` does not guarantee
 the BM25 index is ready for `--lex`.
@@ -204,6 +211,7 @@ Use the score shown to decide whether to retry with a lower threshold.
 ## Do / Don't
 
 **Do:**
+- Use single quotes for regex patterns containing `$` or `[`
 - After first indexing a project, run `echo "*" > .ck/.gitignore` to prevent index files polluting git
 - Run `ck --index .` at the start of a session before using `--sem`, `--lex`, or `--hybrid`
 - Use `--sem` for conceptual or behavioral searches
@@ -217,6 +225,7 @@ Use the score shown to decide whether to retry with a lower threshold.
 - Reach for `cqs` when you need call graph navigation, impact analysis, or refactoring safety
 
 **Don't:**
+- Use double quotes for patterns with `$` or `[` — the shell expands them silently before `ck` receives the pattern
 - Use `grep`, `rg`, or Glob for source code search — but DO use them for excluded file types
 - Use `--threshold` above `0.9` or below `0.3` for semantic search
 - Apply semantic threshold values (0.0–1.0) to hybrid searches — hybrid uses RRF (0.01–0.05)
