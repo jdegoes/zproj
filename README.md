@@ -19,6 +19,10 @@ branches, and windows are created and torn down together as a unit.
 A built-in review workflow lets you annotate lines during a diff review and
 dispatch the collected notes to your coding agent for implementation.
 
+`zproj integrate` bootstraps a new machine in one command: installs `ck` and
+`cqs` code search tools, copies bundled skill files into your coding agent's
+global skills directory, and asks your agent to wire up your editor.
+
 ## Requirements
 
 | Tool | Version | Purpose |
@@ -33,10 +37,17 @@ One of the following coding agents is auto-discovered (or set `$CODING_AGENT`):
 One of the following editors is auto-discovered (or set `$ZPROJ_EDITOR`):  
 `$EDITOR`, `nvim`, `vim`
 
+**Optional** (used by `zproj integrate` to install tools):
+
+| Tool | Purpose |
+|------|---------|
+| cargo | Install `ck` and `cqs` (preferred) |
+| npm | Install `ck` if cargo is absent |
+
 ## Installation
 
 ```bash
-# Clone the repo
+# Clone the repo (required — zproj needs the bundled skills/ directory)
 git clone https://github.com/jdegoes/zproj ~/Documents/git/zproj
 
 # Symlink the script into your PATH
@@ -46,7 +57,10 @@ ln -s ~/Documents/git/zproj/main/zproj ~/.local/bin/zproj
 zproj --version
 ```
 
-Or just copy the single `zproj` script anywhere on your `$PATH`.
+> **Note:** Clone the repo rather than copying the script. The `skills/`
+> directory next to the script is needed for `zproj integrate` to install
+> skill files and tools. A standalone script copy will warn gracefully but
+> cannot install skills.
 
 ## Quick start
 
@@ -134,34 +148,86 @@ The dispatch command assembles a prompt from the notes, saves it to a temp
 file, and sends a one-line handoff message to the coding agent pane via tmux.
 The notes file is deleted after the temp file is safely written.
 
-### Editor integration
+## Machine integration
+
+`zproj integrate` bootstraps a new machine in one step:
+
+1. **Installs `ck`** — semantic code search (`cargo install ck-search`, or
+   `npm install -g @beaconbay/ck-search` if cargo is absent)
+2. **Installs `cqs`** — code intelligence and call graph analysis
+   (`cargo install cqs`)
+3. **Copies skill files** from `skills/*/SKILL.md` in the zproj repo into
+   your coding agent's global skills directory (e.g.
+   `~/.config/opencode/skills/` for OpenCode)
+4. **Asks your coding agent** to implement the review workflow in your editor
+   (add note / view / dispatch / clear), using the Neovim reference
+   implementation as a concrete example
 
 ```bash
-zproj integrate        # ask your coding agent to integrate your editor
-zproj integrate --plan # inspect the integration prompt first
+zproj integrate                      # full bootstrap
+zproj integrate --skills-only        # install tools + skills, skip editor
+zproj integrate --plan               # dry run: show what would be done
+zproj integrate --skills-only --plan # dry run: tools + skills only
 ```
 
-`zproj integrate` generates a detailed prompt that instructs your coding agent
-to research your editor, check for existing integration, and implement the four
-review actions (add note, view, dispatch, clear) using the editor's native
-mechanisms. The reference implementation for Neovim is included as an example.
+Skills directory per agent:
+
+| Agent | Global skills directory |
+|-------|------------------------|
+| opencode | `~/.config/opencode/skills/` |
+| claude | `~/.claude/skills/` |
+| codex | `~/.agents/skills/` |
+| amp | `~/.config/agents/skills/` |
+
+### Bundled skills
+
+The `skills/` directory in this repo contains skill files for:
+
+- **`ck`** — semantic code search; replaces grep/rg for source files
+- **`cqs`** — call graphs, impact analysis, refactoring safety, dead code
+
+Add a `skills/<toolname>/SKILL.md` to the repo and it will be installed
+automatically on the next `zproj integrate` run.
+
+### Code search tools and git worktrees
+
+`ck` and `cqs` both store their indexes inside the project directory (`.ck/`
+and `.cqs/`). In a bare worktree setup, each worktree has its own index. To
+avoid slow cold indexing when creating a new worktree, copy the index from
+the most recently indexed sibling:
+
+```bash
+# When starting a new worktree (e.g. feature-auth)
+ls -dt ../*/. | head -5            # find most recently indexed sibling
+
+cp -r ../main/.ck  ./.ck           # copy ck index
+cp -r ../main/.cqs ./.cqs          # copy cqs index
+echo "*" > .ck/.gitignore          # prevent index files polluting git
+
+ck --index .                       # delta-index (~0.2s — reuses cached embeddings)
+cqs index                          # delta-index (~27s — reuses blake3-hashed chunks)
+```
+
+Both tools use content hashing (not mtime), so unchanged files are reused
+from the copied index. Only files that actually differ on the feature branch
+get re-processed.
 
 ## Command reference
 
 ```
-zproj                                     Open project session (from repo root)
-zproj <worktree-dir>                      Create (if needed) and launch
-zproj init <dir> [--main <branch>]        Init, convert, or upgrade to bare worktree repo
-zproj clone <git-url> [dir]               Clone remote repo as bare worktree structure
-zproj create <worktree-dir> [--from ref]  Create a new worktree
-zproj delete <worktree-dir> [--force]     Remove worktree, branch, and window
-zproj launch <worktree-dir>               Start or switch to tmux window
-zproj list [dir]                          Show worktrees with status
-zproj review <subcommand>                 Manage review notes (path/view/dispatch/clear)
-zproj integrate [--plan]                  Generate editor integration prompt for coding agent
-zproj --env                               Show resolved editor and coding agent
-zproj --diagnostics                       Check environment for problems
-zproj --test                              Run the built-in test suite
+zproj                                       Open project session (from repo root)
+zproj <worktree-dir>                        Create (if needed) and launch
+zproj init <dir> [--main <branch>]          Init, convert, or upgrade to bare worktree repo
+zproj clone <git-url> [dir]                 Clone remote repo as bare worktree structure
+zproj create <worktree-dir> [--from ref]    Create a new worktree
+zproj delete <worktree-dir> [--force]       Remove worktree, branch, and window
+zproj launch <worktree-dir>                 Start or switch to tmux window
+zproj list [dir]                            Show worktrees with status
+zproj review <subcommand>                   Manage review notes (path/view/dispatch/clear)
+zproj integrate [--plan] [--skills-only]    Install tools, skills, and editor integration
+zproj --env                                 Show resolved editor and coding agent
+zproj --diagnostics                         Check environment for problems
+zproj --test                                Run the built-in test suite
 ```
 
 Run `zproj <command> --help` for details on any command.
@@ -172,8 +238,9 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-228 tests covering init, clone, upgrade, worktree management, review workflow,
-tmux pane naming, diagnostics, and more. Requires tmux, git, and bash in PATH.
+257 tests covering init, clone, upgrade, worktree management, review workflow,
+tmux pane naming, diagnostics, integrate, skills installation, and tool
+detection. Requires tmux, git, and bash in PATH.
 
 ## License
 
