@@ -1,6 +1,6 @@
 ---
 name: cqs
-description: "Use cqs for call graph analysis: callers, callees, impact of changing a function, dead functions, refactoring safety, diff risk. Requires a callable function name — does not find text, types, or identifiers. Triggers: who calls this, what breaks if I change, impact analysis, callers, callees, dead code, refactor function, rename function, review diff."
+description: "Use cqs for call graph analysis: callers of a function, callees of a function, impact of changing a function, dead functions, refactoring safety, diff risk. Requires a callable function name — does not find text, types, identifiers, or build-level dependencies. Triggers: who calls this function, what functions call this, what breaks if I change this function, impact analysis, dead code, refactor function, rename function, review diff."
 license: MIT
 compatibility: opencode
 metadata:

@@ -1,6 +1,6 @@
 ---
 name: ck
-description: "Use ck to find anything in source code: identifiers, types, patterns, concepts. Replaces grep, rg, and ripgrep — never use those on source files. Triggers: find, search, locate, where is, usages, references, grep, rg, ripgrep."
+description: "Use ck to find anything in any file in the repository: identifiers, types, patterns, concepts, build files, config files. Replaces grep, rg, and ripgrep — never use those for searching files. Triggers: find, search, locate, where is, usages, references, depends on, grep, rg, ripgrep."
 license: MIT
 compatibility: opencode
 metadata:
