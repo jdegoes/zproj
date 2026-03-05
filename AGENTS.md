@@ -72,7 +72,6 @@ The bundled Neovim reference implementation lives as a literal heredoc inside
 `_integrate_build_prompt` in `zproj`. It is the source of truth for what
 `zproj integrate` hands to a new user's coding agent.
 
-The live editor config at `~/.config/nvim/lua/plugins/diffview.lua` is a
-deployed instance of that reference. **These two must stay in sync.** Any
-change to the Lua code in the heredoc must also be applied to `diffview.lua`,
-and vice versa.
+If the review workflow changes (e.g. new subcommands, changed note format,
+different key bindings), the heredoc must be updated to reflect the new
+workflow so that new users get correct integration instructions.
