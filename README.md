@@ -51,7 +51,7 @@ One of the following editors is auto-discovered (or set `$ZPROJ_EDITOR`):
 git clone https://github.com/jdegoes/zproj ~/Documents/git/zproj
 
 # Symlink the script into your PATH
-ln -s ~/Documents/git/zproj/main/zproj ~/.local/bin/zproj
+ln -s ~/Documents/git/zproj/zproj ~/.local/bin/zproj
 
 # Verify
 zproj --version
