@@ -1857,7 +1857,7 @@ EOF
 # No slash command needed; works with any coding agent.
 _REVIEW_DISPATCH_PREAMBLE="I have completed a review pass on your recent changes. \
 Below are my directed notes — implement every item exactly as described. \
-Do not ask for clarification; implement all items as written. \
+If you cannot do exactly as described, ask me for help rather than improvising. \
 Line numbers reflect the state of the files at review time and may have shifted; \
 each note includes the reviewed line's content as a blockquote to help you locate \
 the correct position.\n\n\
