@@ -2386,7 +2386,42 @@ _integrate_build_prompt() {
   # Embed the reference Neovim+diffview.nvim implementation as a literal
   # heredoc bundled in the script — not read from the user's live config,
   # which may not exist (the user may not use Neovim at all).
+  #
+  # The implementation is split across two files:
+  #   lua/config/keymaps.lua     — permanent global <leader>rn (add note)
+  #   lua/plugins/diffview.lua   — diffview plugin + diffview-scoped review bindings
+  keymaps_lua_contents="$(cat <<'KEYMAPS_LUA'
+-- lua/config/keymaps.lua
+
+vim.keymap.set("n", "<leader>rn", function()
+  local file = vim.fn.expand("%:p")
+  local line = vim.fn.line(".")
+  vim.ui.input({ prompt = "Note: " }, function(comment)
+    if not comment or comment == "" then return end
+    local review_file = vim.fn.system("zproj review path --abs 2>/dev/null"):match("^([^\n]*)")
+    if vim.v.shell_error ~= 0 or not review_file or review_file == "" then
+      vim.notify("zproj review path failed — are you in a zproj worktree?", vim.log.levels.ERROR)
+      return
+    end
+    vim.fn.mkdir(vim.fn.fnamemodify(review_file, ":h"), "p")
+    local timestamp = os.date("%Y-%m-%d %H:%M")
+    local entry = string.format("### `%s` line %d -- %s\n%s\n\n", file, line, timestamp, comment)
+    local f = io.open(review_file, "a")
+    if f then
+      f:write(entry)
+      f:close()
+      vim.notify("Note added: " .. file .. ":" .. line)
+    else
+      vim.notify("Could not open review file: " .. review_file, vim.log.levels.ERROR)
+    end
+  end)
+end, { desc = "Add review note" })
+KEYMAPS_LUA
+)"
+
   diffview_lua_contents="$(cat <<'DIFFVIEW_LUA'
+-- lua/plugins/diffview.lua
+
 return {
   {
     "sindrets/diffview.nvim",
@@ -2398,30 +2433,6 @@ return {
           vim.bo[bufnr].modifiable = false
         end,
         view_opened = function(_view)
-          vim.keymap.set("n", "<leader>rn", function()
-            local file = vim.fn.expand("%:p")
-            local line = vim.fn.line(".")
-            vim.ui.input({ prompt = "Note: " }, function(comment)
-              if not comment or comment == "" then return end
-              local review_file = vim.fn.system("zproj review path --abs 2>/dev/null"):gsub("\n", "")
-              if review_file == "" then
-                vim.notify("zproj review path failed — are you in a zproj worktree?", vim.log.levels.ERROR)
-                return
-              end
-              vim.fn.mkdir(vim.fn.fnamemodify(review_file, ":h"), "p")
-              local timestamp = os.date("%Y-%m-%d %H:%M")
-              local entry = string.format("### `%s` line %d -- %s\n%s\n\n", file, line, timestamp, comment)
-              local f = io.open(review_file, "a")
-              if f then
-                f:write(entry)
-                f:close()
-                vim.notify("Note added: " .. file .. ":" .. line)
-              else
-                vim.notify("Could not open review file: " .. review_file, vim.log.levels.ERROR)
-              end
-            end)
-          end, { desc = "Add review note" })
-
           vim.keymap.set("n", "<leader>rv", function()
             local review_file = vim.fn.system("zproj review path --abs 2>/dev/null"):gsub("\n", "")
             if review_file == "" or vim.fn.filereadable(review_file) == 0 then
@@ -2460,7 +2471,6 @@ return {
           end, { desc = "Clear review notes" })
         end,
         view_closed = function(_view)
-          pcall(vim.keymap.del, "n", "<leader>rn")
           pcall(vim.keymap.del, "n", "<leader>rv")
           pcall(vim.keymap.del, "n", "<leader>rd")
           pcall(vim.keymap.del, "n", "<leader>rc")
@@ -2633,6 +2643,21 @@ invariants that must hold regardless of editor are:
 - The review notes path must be obtained at runtime via \`zproj review path --abs\`
 - The note entry format must be exactly: \`### \`<abs-file>\` line <n> -- <YYYY-MM-DD HH:MM>\`
 
+The implementation is split across two files. **\`lua/config/keymaps.lua\`**
+holds the \`<leader>rn\` add-note binding as a permanent global keymap,
+available in any buffer — not just when diffview is open. This is important:
+\`<leader>rn\` must NOT be registered inside a diffview \`view_opened\` hook,
+because \`view_opened\` registers it as a global keymap that \`view_closed\` then
+deletes entirely, leaving no binding after diffview closes.
+
+**\`lua/plugins/diffview.lua\`** holds the diffview plugin spec and the three
+diffview-scoped bindings (\`<leader>rv\`, \`<leader>rd\`, \`<leader>rc\`), which are
+legitimately only useful when a diff view is open.
+
+\`\`\`lua
+${keymaps_lua_contents}
+\`\`\`
+
 \`\`\`lua
 ${diffview_lua_contents}
 \`\`\`
@@ -2641,8 +2666,10 @@ Key observations from this implementation:
 - File path is recorded as absolute (\`vim.fn.expand("%:p")\`), never relative
 - The review notes path is obtained via \`zproj review path --abs\` (shelled
   out), never hardcoded
-- \`<leader>rn\` prompts interactively, captures file + line, appends entry
-- \`<leader>rv\` opens the file in a split for inspection
+- \`<leader>rn\` is a permanent global keymap in \`keymaps.lua\` — works in any
+  buffer, not just inside diffview; both \`vim.v.shell_error\` and the
+  empty-string check are used to detect \`zproj\` failures
+- \`<leader>rv\` opens the notes file in a split for inspection
 - \`<leader>rd\` calls \`zproj review dispatch\` — one line, no tmux knowledge
 - \`<leader>rc\` calls \`zproj review clear\`, then wipes the buffer if open
 - The dispatch keymap closes Diffview after dispatching (editor-specific cleanup)
