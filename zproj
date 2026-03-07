@@ -1857,7 +1857,10 @@ EOF
 # No slash command needed; works with any coding agent.
 _REVIEW_DISPATCH_PREAMBLE="I have completed a review pass on your recent changes. \
 Below are my directed notes — implement every item exactly as described. \
-Do not ask for clarification; implement all items as written.\n\n\
+Do not ask for clarification; implement all items as written. \
+Line numbers reflect the state of the files at review time and may have shifted; \
+each note includes the reviewed line's content as a blockquote to help you locate \
+the correct position.\n\n\
 ---\n\n"
 
 # Resolve a pane target for use with send-keys / paste-buffer.
@@ -2396,6 +2399,7 @@ _integrate_build_prompt() {
 vim.keymap.set("n", "<leader>rn", function()
   local file = vim.fn.expand("%:p")
   local line = vim.fn.line(".")
+  local line_text = vim.fn.getline(".")
   vim.ui.input({ prompt = "Note: " }, function(comment)
     if not comment or comment == "" then return end
     local review_file = vim.fn.system("zproj review path --abs 2>/dev/null"):match("^([^\n]*)")
@@ -2405,7 +2409,7 @@ vim.keymap.set("n", "<leader>rn", function()
     end
     vim.fn.mkdir(vim.fn.fnamemodify(review_file, ":h"), "p")
     local timestamp = os.date("%Y-%m-%d %H:%M")
-    local entry = string.format("### `%s` line %d -- %s\n%s\n\n", file, line, timestamp, comment)
+    local entry = string.format("### `%s` line %d -- %s\n> %s\n\n%s\n\n", file, line, timestamp, line_text, comment)
     local f = io.open(review_file, "a")
     if f then
       f:write(entry)
