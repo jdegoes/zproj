@@ -1583,9 +1583,10 @@ cmd_open() {
     return
   fi
 
-  # Find the first worktree to use as the initial window (prefer main/master).
-  # Inlined — a callback via variable name cannot write to `first_wt` here.
+  # Collect all worktree names, preferring main/master as the first one
+  # launched (it creates the tmux session; subsequent launches add windows).
   local first_wt=""
+  local -a other_wts=()
   local _op_path="" _op_branch=""
   while IFS= read -r _line; do
     if   [[ "$_line" == "worktree "* ]]; then _op_path="${_line#worktree }"
@@ -1597,24 +1598,42 @@ cmd_open() {
       if [[ "$_op_branch" != "(bare)" ]]; then
         local _op_name; _op_name="$(basename "$_op_path")"
         if [[ "$_op_name" == "main" || "$_op_name" == "master" ]]; then
+          # main/master always goes first; demote any previous first_wt
+          [[ -n "$first_wt" ]] && other_wts+=("$first_wt")
           first_wt="$_op_name"
+        elif [[ -z "$first_wt" ]]; then
+          first_wt="$_op_name"
+        else
+          other_wts+=("$_op_name")
         fi
-        [[ -z "$first_wt" ]] && first_wt="$_op_name"
       fi
       _op_path="" _op_branch=""
     fi
   done < <(git -C "$root" worktree list --porcelain 2>/dev/null)
+  # Handle last entry (porcelain output may not end with a blank line)
   if [[ -n "$_op_path" && "$_op_branch" != "(bare)" ]]; then
     local _op_name; _op_name="$(basename "$_op_path")"
-    [[ "$_op_name" == "main" || "$_op_name" == "master" ]] && first_wt="$_op_name"
-    [[ -z "$first_wt" ]] && first_wt="$_op_name"
+    if [[ "$_op_name" == "main" || "$_op_name" == "master" ]]; then
+      [[ -n "$first_wt" ]] && other_wts+=("$first_wt")
+      first_wt="$_op_name"
+    elif [[ -z "$first_wt" ]]; then
+      first_wt="$_op_name"
+    else
+      other_wts+=("$_op_name")
+    fi
   fi
 
   if [[ -z "$first_wt" ]]; then
     die "No worktrees found. Create one first:\n  ${CYAN}$SCRIPT_NAME main${RESET}"
   fi
 
+  # Launch the first worktree (creates the tmux session), then all others
+  # (each adds a window to the existing session).
   cmd_launch "$first_wt"
+  local _ow
+  for _ow in "${other_wts[@]+"${other_wts[@]}"}"; do
+    cmd_launch "$_ow"
+  done
 }
 
 # ─── Default action (upsert + launch) ────────────────────────────────────────
@@ -3835,6 +3854,49 @@ NOTES
   _t_grep  "T8: prints 'Attaching to session'" "Attaching to session" echo "$open_out"
 
   tmux kill-session -t "$open_session" 2>/dev/null || true
+
+  # ── T9: cmd_open launches windows for ALL worktrees ──────────────────────
+
+  _section "T9 — cmd_open: launches a window for every worktree"
+
+  # Create two additional worktrees alongside main
+  (cd "$lt_root" && "$BASH" "$0" create feature-a 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$0" create feature-b 2>/dev/null) || true
+
+  _t_check "T9: feature-a/ exists"  test -d "$lt_root/feature-a"
+  _t_check "T9: feature-b/ exists"  test -d "$lt_root/feature-b"
+
+  # Run cmd_open — should create a session with windows for all 3 worktrees
+  local t9_session
+  t9_session="$(basename "$lt_root")"
+  # Ensure no pre-existing session
+  tmux kill-session -t "$t9_session" 2>/dev/null || true
+
+  local t9_out
+  t9_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1 || true)"
+
+  # Verify the session was created
+  _t_check "T9: session exists" \
+    tmux has-session -t "$t9_session"
+
+  # List all window names in the session
+  local t9_windows
+  t9_windows="$(tmux list-windows -t "$t9_session" -F '#{window_name}' 2>/dev/null)"
+
+  _t_grep  "T9: main window exists"      "^main$"       echo "$t9_windows"
+  _t_grep  "T9: feature-a window exists"  "^feature-a$"  echo "$t9_windows"
+  _t_grep  "T9: feature-b window exists"  "^feature-b$"  echo "$t9_windows"
+
+  # Verify we have exactly 3 windows (not more, not fewer)
+  local t9_count
+  t9_count="$(echo "$t9_windows" | wc -l | tr -d ' ')"
+  _t_check "T9: exactly 3 windows created" test "$t9_count" -eq 3
+
+  tmux kill-session -t "$t9_session" 2>/dev/null || true
+
+  # Clean up the extra worktrees
+  (cd "$lt_root" && "$BASH" "$0" delete feature-a 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$0" delete feature-b 2>/dev/null) || true
 
   fi  # end: command -v tmux
 
