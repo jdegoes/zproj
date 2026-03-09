@@ -32,7 +32,11 @@ global skills directory, and asks your agent to wire up your editor.
 | tmux | 3.0+ | Named pane support |
 
 One of the following coding agents is auto-discovered (or set `$CODING_AGENT`):  
-`opencode`, `claude`, `codex`, `amp`, `aider`, `goose`, `gemini`
+`opencode`, `claude`, `codex`, `amp`, `aider`, `goose`, `gemini`, `agent`
+
+> **Cursor CLI Agent:** In repositories containing `.cursor/`, `.cursorrules`,
+> or `.cursorignore`, the Cursor CLI agent (`agent`) is automatically preferred
+> over the default discovery order.
 
 One of the following editors is auto-discovered (or set `$ZPROJ_EDITOR`):  
 `$EDITOR`, `nvim`, `vim`
@@ -181,6 +185,7 @@ Skills directory per agent:
 | claude | `~/.claude/skills/` |
 | codex | `~/.agents/skills/` |
 | amp | `~/.config/agents/skills/` |
+| agent | `~/.cursor/skills/` |
 
 ### Bundled skills
 

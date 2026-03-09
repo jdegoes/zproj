@@ -12,7 +12,11 @@ readonly MIN_TMUX_VERSION="3.0"
 readonly REVIEW_NOTES_RELPATH=".agents/plans/review-notes.md"
 
 # Known coding agents in discovery order (single source of truth)
-readonly _KNOWN_AGENTS=(opencode claude codex amp aider goose gemini)
+readonly _KNOWN_AGENTS=(opencode claude codex amp aider goose gemini agent)
+
+# Cursor repo markers — presence of any of these in a worktree signals that
+# cursor has been used, so `agent` (Cursor's CLI agent) is preferred.
+readonly _CURSOR_MARKERS=(.cursor .cursorrules .cursorignore)
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
@@ -279,10 +283,33 @@ _resolve_editor_source() {
   fi
 }
 
+# Check whether a directory contains Cursor repo markers.
+# Returns 0 (and prints "agent") if any marker is found and `agent` is in PATH.
+# Returns 1 otherwise.
+_repo_preferred_agent() {
+  local dir="${1:-}"
+  [[ -z "$dir" ]] && return 1
+  local marker
+  for marker in "${_CURSOR_MARKERS[@]}"; do
+    if [[ -e "$dir/$marker" ]]; then
+      if command -v agent &>/dev/null; then
+        echo "agent"
+        return 0
+      fi
+      return 1
+    fi
+  done
+  return 1
+}
+
 # Resolve the coding agent command to use in pane 1.
-# Resolution order: $CODING_AGENT → auto-discover → empty string (graceful no-op)
+# $1 (optional): worktree directory — when provided, repo-specific markers
+# are checked before the global _KNOWN_AGENTS walk.
+# Resolution order: $CODING_AGENT → repo-preferred → auto-discover → empty
 # Prints the resolved command string to stdout, or empty string if none found.
 _resolve_ai() {
+  local dir="${1:-}"
+
   # Explicit override — must exist as a command
   if [[ -n "${CODING_AGENT:-}" ]]; then
     local binary="${CODING_AGENT%% *}"
@@ -292,6 +319,13 @@ _resolve_ai() {
     else
       die "\$CODING_AGENT is set to '${CODING_AGENT}' but '${binary}' was not found in PATH."
     fi
+  fi
+
+  # Repo-preferred agent (e.g. Cursor markers → `agent`)
+  local preferred
+  if [[ -n "$dir" ]] && preferred="$(_repo_preferred_agent "$dir")"; then
+    echo "$preferred"
+    return 0
   fi
 
   # Auto-discover from known terminal coding agents
@@ -322,12 +356,14 @@ _resolve_ai() {
 #   aider     (none — uses CONVENTIONS.md, no skills concept)
 #   goose     (none — uses extensions, no skills concept)
 #   gemini    (none — uses ~/.gemini/GEMINI.md, no skills concept)
+#   agent     ~/.cursor/skills/             (Cursor CLI Agent, since 2.4)
 _agent_skills_dir() {
   case "$1" in
     opencode) echo "${HOME}/.config/opencode/skills" ; return 0 ;;
     claude)   echo "${HOME}/.claude/skills"          ; return 0 ;;
     codex)    echo "${HOME}/.agents/skills"          ; return 0 ;;
     amp)      echo "${HOME}/.config/agents/skills"   ; return 0 ;;
+    agent)    echo "${HOME}/.cursor/skills"          ; return 0 ;;
     *)        return 1 ;;
   esac
 }
@@ -346,6 +382,7 @@ _agent_skills_dir() {
 #   aider     (none — no global instructions concept)
 #   goose     (none — no global instructions concept)
 #   gemini    (none — no global instructions concept)
+#   agent     (none — Cursor uses .cursor/rules/*.mdc, no single global file)
 _agent_instructions_file() {
   case "$1" in
     opencode) echo "${HOME}/.config/opencode/AGENTS.md" ; return 0 ;;
@@ -437,7 +474,7 @@ _integrate_install_instructions() {
   ai_binary="${ai%% *}"
 
   if ! instructions_file="$(_agent_instructions_file "$ai_binary")"; then
-    warn "Agent '${ai_binary:-none}' has no known global instructions file. Supported: opencode, claude, codex, amp."
+    warn "Agent '${ai_binary:-none}' has no known global instructions file. Supported: opencode, claude, codex, amp. (agent uses .cursor/rules/*.mdc)"
     return 0
   fi
 
@@ -1324,7 +1361,7 @@ cmd_launch() {
   # Resolve editor and AI agent
   local editor ai
   editor="$(_resolve_editor)"
-  ai="$(_resolve_ai)"
+  ai="$(_resolve_ai "$PROJECT_DIR")"
 
   # Derive pane names from the binary names
   local ai_pane_name editor_pane_name
@@ -1782,7 +1819,11 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME launch <worktree-dir>
     Run ${CYAN}$SCRIPT_NAME --env${RESET} to see which editor and agent will be used.
 
   ${BOLD}Auto-discovered agents (in order):${RESET}
-    opencode, claude, codex, amp, aider, goose, gemini
+    opencode, claude, codex, amp, aider, goose, gemini, agent
+
+  ${BOLD}Repo-preferred agent:${RESET}
+    If the worktree contains .cursor/, .cursorrules, or .cursorignore,
+    the Cursor CLI agent (\`agent\`) is preferred over the default order.
 
   ${BOLD}Environment variables:${RESET}
     CODING_AGENT   Override the coding agent (e.g. ${CYAN}export CODING_AGENT=claude${RESET})
@@ -2032,7 +2073,7 @@ cmd_review() {
     # Find the agent pane — addressed by name, not number
     _review_find_session || die "Not inside a zproj worktree. Run from within a worktree to dispatch."
     local ai_name
-    ai_name="$(_resolve_ai 2>/dev/null)" || ai_name=""
+    ai_name="$(_resolve_ai "$_REVIEW_WT_ROOT" 2>/dev/null)" || ai_name=""
     ai_name="${ai_name%% *}"
     [[ -z "$ai_name" ]] && ai_name="shell"
 
@@ -2664,7 +2705,7 @@ _integrate_install_skills() {
 
   # Resolve target install directory for this agent
   if ! target_dir="$(_agent_skills_dir "$ai_binary")"; then
-    warn "Agent '${ai_binary:-none}' has no known skills directory. Supported: opencode, claude, codex, amp."
+    warn "Agent '${ai_binary:-none}' has no known skills directory. Supported: opencode, claude, codex, amp, agent."
     return 1
   fi
 
@@ -2939,12 +2980,14 @@ ${BOLD}Skills directory per agent:${RESET}
   claude   → ~/.claude/skills/
   codex    → ~/.agents/skills/
   amp      → ~/.config/agents/skills/
+  agent    → ~/.cursor/skills/
 
 ${BOLD}Global instructions file per agent:${RESET}
   opencode → ~/.config/opencode/AGENTS.md
   claude   → ~/.claude/CLAUDE.md
   codex    → ~/.codex/AGENTS.md
   amp      → ~/.config/amp/AGENTS.md
+  agent    → (none — Cursor uses .cursor/rules/*.mdc)
 
 ${BOLD}Environment:${RESET}
   ZPROJ_INTEGRATE_DELAY   Seconds to wait for agent TUI before sending the
@@ -3357,6 +3400,83 @@ STUB
   _t_grep "--env shows source tag"  "CODING_AGENT"   echo "$env_out"
 
   fi  # end: command -v opencode
+
+  # ── Section: _repo_preferred_agent / cursor repo detection ──────────────
+
+  _section "RP1 — _repo_preferred_agent: .cursor/ marker detected"
+  local rp1_dir
+  rp1_dir="$(mktemp -d)"
+  mkdir -p "$rp1_dir/.cursor"
+  if command -v agent &>/dev/null; then
+    local rp1_result
+    rp1_result="$(_repo_preferred_agent "$rp1_dir" 2>/dev/null)" || true
+    _t_check "RP1: .cursor/ dir → agent" test "$rp1_result" = "agent"
+  else
+    _t_skip "RP1 (agent not in PATH)"
+  fi
+  rm -rf "$rp1_dir"
+
+  _section "RP2 — _repo_preferred_agent: .cursorrules marker detected"
+  local rp2_dir
+  rp2_dir="$(mktemp -d)"
+  touch "$rp2_dir/.cursorrules"
+  if command -v agent &>/dev/null; then
+    local rp2_result
+    rp2_result="$(_repo_preferred_agent "$rp2_dir" 2>/dev/null)" || true
+    _t_check "RP2: .cursorrules → agent" test "$rp2_result" = "agent"
+  else
+    _t_skip "RP2 (agent not in PATH)"
+  fi
+  rm -rf "$rp2_dir"
+
+  _section "RP3 — _repo_preferred_agent: .cursorignore marker detected"
+  local rp3_dir
+  rp3_dir="$(mktemp -d)"
+  touch "$rp3_dir/.cursorignore"
+  if command -v agent &>/dev/null; then
+    local rp3_result
+    rp3_result="$(_repo_preferred_agent "$rp3_dir" 2>/dev/null)" || true
+    _t_check "RP3: .cursorignore → agent" test "$rp3_result" = "agent"
+  else
+    _t_skip "RP3 (agent not in PATH)"
+  fi
+  rm -rf "$rp3_dir"
+
+  _section "RP4 — _repo_preferred_agent: no markers → returns 1"
+  local rp4_dir rp4_exit
+  rp4_dir="$(mktemp -d)"
+  rp4_exit="$(_repo_preferred_agent "$rp4_dir" &>/dev/null; echo $?)" || true
+  _t_check "RP4: empty dir → exit 1" test "$rp4_exit" -eq 1
+  rm -rf "$rp4_dir"
+
+  _section "RP5 — _repo_preferred_agent: empty dir arg → returns 1"
+  local rp5_exit
+  rp5_exit="$(_repo_preferred_agent "" &>/dev/null; echo $?)" || true
+  _t_check "RP5: empty string → exit 1" test "$rp5_exit" -eq 1
+
+  _section "RP6 — _resolve_ai: repo preference overrides default order"
+  if command -v agent &>/dev/null && command -v opencode &>/dev/null; then
+    local rp6_dir rp6_result
+    rp6_dir="$(mktemp -d)"
+    mkdir -p "$rp6_dir/.cursor"
+    rp6_result="$(CODING_AGENT="" _resolve_ai "$rp6_dir" 2>/dev/null)"
+    _t_check "RP6: cursor repo prefers agent over opencode" test "$rp6_result" = "agent"
+    rm -rf "$rp6_dir"
+  else
+    _t_skip "RP6 (requires both agent and opencode in PATH)"
+  fi
+
+  _section "RP7 — _resolve_ai: \$CODING_AGENT still wins over repo preference"
+  if command -v agent &>/dev/null && command -v opencode &>/dev/null; then
+    local rp7_dir rp7_result
+    rp7_dir="$(mktemp -d)"
+    mkdir -p "$rp7_dir/.cursor"
+    rp7_result="$(CODING_AGENT=opencode _resolve_ai "$rp7_dir" 2>/dev/null)"
+    _t_check "RP7: CODING_AGENT beats repo preference" test "$rp7_result" = "opencode"
+    rm -rf "$rp7_dir"
+  else
+    _t_skip "RP7 (requires both agent and opencode in PATH)"
+  fi
 
   # ── Section: zproj review ────────────────────────────────────────────────
   # Review tests run from inside a zproj worktree so _review_find_path works.
@@ -4362,6 +4482,9 @@ NOTES
   sk1_result="$("$BASH" "$sk1_script" amp 2>/dev/null)" || true
   _t_check "SK1: amp → .config/agents/skills" \
     bash -c '[[ "$1" == */".config/agents/skills" ]]' -- "$sk1_result"
+  sk1_result="$("$BASH" "$sk1_script" agent 2>/dev/null)" || true
+  _t_check "SK1: agent → .cursor/skills" \
+    bash -c '[[ "$1" == *"/.cursor/skills" ]]' -- "$sk1_result"
   rm -f "$sk1_script" || true
 
   _section "SK2 — _agent_skills_dir: unsupported agents return 1"
@@ -4570,7 +4693,7 @@ NOTES
 
   _section "IN2 — _agent_instructions_file: unsupported agents return 1"
   local in2_exit
-  for in2_agent in aider goose gemini unknown-agent; do
+  for in2_agent in aider goose gemini agent unknown-agent; do
     in2_exit="$(_agent_instructions_file "$in2_agent" &>/dev/null; echo $?)" || true
     _t_check "IN2: $in2_agent exits 1" test "$in2_exit" -eq 1
   done
