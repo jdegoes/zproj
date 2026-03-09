@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.9.6"
+readonly VERSION="4.9.7"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -271,6 +271,15 @@ _plural() { [[ "${1:-0}" == "1" ]] && echo "" || echo "s"; }
 # name causes every -t argument to be misparsed.  Replace both with '-'.
 # Usage: session_name="$(_tmux_session_name "$dir")"
 _tmux_session_name() { tr '.:'  '--' <<< "$1"; }
+
+# Return the path to the user's tmux config file.
+# Prefers XDG location ($XDG_CONFIG_HOME/tmux/tmux.conf) if it exists,
+# otherwise falls back to ~/.tmux.conf.
+_tmux_config_path() {
+  local xdg="${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"
+  [[ -f "$xdg" ]] && echo "$xdg" && return
+  echo "$HOME/.tmux.conf"
+}
 
 # Return a human-readable label for which config source resolved the editor.
 # $1 = resolved editor binary name (first word of the resolved command)
@@ -2390,7 +2399,7 @@ cmd_diagnostics() {
 # All facts known to zproj are embedded directly — the agent does not guess.
 _integrate_build_prompt() {
   local zproj_path editor editor_binary ai ai_binary review_path_rel review_path_abs
-  local zproj_version diffview_lua_contents
+  local zproj_version diffview_lua_contents tmux_conf
 
   zproj_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   zproj_version="$VERSION"
@@ -2400,6 +2409,7 @@ _integrate_build_prompt() {
   ai_binary="${ai%% *}"
   [[ -z "$ai_binary" ]] && ai_binary="(none detected)"
   review_path_rel="$REVIEW_NOTES_RELPATH"
+  tmux_conf="$(_tmux_config_path)"
 
   # Absolute review path only meaningful inside a worktree; best-effort
   review_path_abs="$("$zproj_path" review path --abs 2>/dev/null)" \
@@ -2577,7 +2587,7 @@ tools in one window, already positioned in the worktree directory.
 ## tmux worktree keybindings
 
 In addition to the editor integration, you must add the following tmux key
-bindings to the user's \`~/.tmux.conf\`. These bindings make worktree
+bindings to the user's tmux config file (\`${tmux_conf}\`). These bindings make worktree
 management available from anywhere inside the tmux session, without needing
 a shell prompt:
 
@@ -2600,8 +2610,8 @@ user to navigate manually. \`zproj <name>\` handles the upsert: if the
 worktree doesn't exist it creates it; if it already exists it switches to it.
 
 Check whether these binding names (\`N\`, \`X\`) conflict with any existing
-bindings in the user's \`~/.tmux.conf\`. If they do, choose alternatives and
-document the change. If \`~/.tmux.conf\` does not exist, create it with just
+bindings in the user's tmux config. If they do, choose alternatives and
+document the change. If the tmux config file does not exist, create it with just
 these bindings.
 
 ---
@@ -5121,6 +5131,50 @@ NOTES
   local in7_out
   in7_out="$(CODING_AGENT=opencode "$BASH" "$0" integrate --plan 2>/dev/null)" || true
   _t_grep "IN7: instructions section present" "Instructions" echo "$in7_out"
+
+  _section "TX1 — _tmux_config_path: returns XDG when it exists"
+  local tx1_home tx1_xdg tx1_script tx1_result
+  tx1_home="$(mktemp -d)"
+  tx1_xdg="$(mktemp -d)/tmux"
+  mkdir -p "$tx1_xdg"
+  touch "$tx1_xdg/tmux.conf"
+  touch "$tx1_home/.tmux.conf"
+  tx1_script="$(mktemp)"
+  { echo "#!/usr/bin/env bash"
+    sed -n '/^_tmux_config_path()/,/^}/p' "$0"
+    echo '_tmux_config_path'
+  } > "$tx1_script"
+  chmod +x "$tx1_script"
+  tx1_result="$(HOME="$tx1_home" XDG_CONFIG_HOME="$(dirname "$tx1_xdg")" "$BASH" "$tx1_script" 2>/dev/null)" || true
+  _t_grep "TX1: XDG path preferred" "$tx1_xdg/tmux.conf" echo "$tx1_result"
+  rm -rf "$tx1_home" "$(dirname "$tx1_xdg")" "$tx1_script"
+
+  _section "TX2 — _tmux_config_path: returns home when XDG absent"
+  local tx2_home tx2_script tx2_result
+  tx2_home="$(mktemp -d)"
+  touch "$tx2_home/.tmux.conf"
+  tx2_script="$(mktemp)"
+  { echo "#!/usr/bin/env bash"
+    sed -n '/^_tmux_config_path()/,/^}/p' "$0"
+    echo '_tmux_config_path'
+  } > "$tx2_script"
+  chmod +x "$tx2_script"
+  tx2_result="$(HOME="$tx2_home" XDG_CONFIG_HOME="$tx2_home/.config" "$BASH" "$tx2_script" 2>/dev/null)" || true
+  _t_grep "TX2: home path returned" "$tx2_home/.tmux.conf" echo "$tx2_result"
+  rm -rf "$tx2_home" "$tx2_script"
+
+  _section "TX3 — _tmux_config_path: returns home as default when neither exists"
+  local tx3_home tx3_script tx3_result
+  tx3_home="$(mktemp -d)"
+  tx3_script="$(mktemp)"
+  { echo "#!/usr/bin/env bash"
+    sed -n '/^_tmux_config_path()/,/^}/p' "$0"
+    echo '_tmux_config_path'
+  } > "$tx3_script"
+  chmod +x "$tx3_script"
+  tx3_result="$(HOME="$tx3_home" XDG_CONFIG_HOME="$tx3_home/.config" "$BASH" "$tx3_script" 2>/dev/null)" || true
+  _t_grep "TX3: home path as default" "$tx3_home/.tmux.conf" echo "$tx3_result"
+  rm -rf "$tx3_home" "$tx3_script"
 
   # ── Summary ──────────────────────────────────────────────────────────────
 
