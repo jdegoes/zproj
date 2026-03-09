@@ -286,7 +286,7 @@ _resolve_editor_source() {
 # Check whether a directory contains Cursor repo markers.
 # Returns 0 (and prints "agent") if any marker is found and `agent` is in PATH.
 # Returns 1 otherwise.
-_repo_preferred_agent() {
+_repo_preferred_cursor() {
   local dir="${1:-}"
   [[ -z "$dir" ]] && return 1
   local marker
@@ -323,7 +323,7 @@ _resolve_ai() {
 
   # Repo-preferred agent (e.g. Cursor markers → `agent`)
   local preferred
-  if [[ -n "$dir" ]] && preferred="$(_repo_preferred_agent "$dir")"; then
+  if [[ -n "$dir" ]] && preferred="$(_repo_preferred_cursor "$dir")"; then
     echo "$preferred"
     return 0
   fi
@@ -3401,57 +3401,57 @@ STUB
 
   fi  # end: command -v opencode
 
-  # ── Section: _repo_preferred_agent / cursor repo detection ──────────────
+  # ── Section: _repo_preferred_cursor / cursor repo detection ──────────────
 
-  _section "RP1 — _repo_preferred_agent: .cursor/ marker detected"
+  _section "RP1 — _repo_preferred_cursor: .cursor/ marker detected"
   local rp1_dir
   rp1_dir="$(mktemp -d)"
   mkdir -p "$rp1_dir/.cursor"
   if command -v agent &>/dev/null; then
     local rp1_result
-    rp1_result="$(_repo_preferred_agent "$rp1_dir" 2>/dev/null)" || true
+    rp1_result="$(_repo_preferred_cursor "$rp1_dir" 2>/dev/null)" || true
     _t_check "RP1: .cursor/ dir → agent" test "$rp1_result" = "agent"
   else
     _t_skip "RP1 (agent not in PATH)"
   fi
   rm -rf "$rp1_dir"
 
-  _section "RP2 — _repo_preferred_agent: .cursorrules marker detected"
+  _section "RP2 — _repo_preferred_cursor: .cursorrules marker detected"
   local rp2_dir
   rp2_dir="$(mktemp -d)"
   touch "$rp2_dir/.cursorrules"
   if command -v agent &>/dev/null; then
     local rp2_result
-    rp2_result="$(_repo_preferred_agent "$rp2_dir" 2>/dev/null)" || true
+    rp2_result="$(_repo_preferred_cursor "$rp2_dir" 2>/dev/null)" || true
     _t_check "RP2: .cursorrules → agent" test "$rp2_result" = "agent"
   else
     _t_skip "RP2 (agent not in PATH)"
   fi
   rm -rf "$rp2_dir"
 
-  _section "RP3 — _repo_preferred_agent: .cursorignore marker detected"
+  _section "RP3 — _repo_preferred_cursor: .cursorignore marker detected"
   local rp3_dir
   rp3_dir="$(mktemp -d)"
   touch "$rp3_dir/.cursorignore"
   if command -v agent &>/dev/null; then
     local rp3_result
-    rp3_result="$(_repo_preferred_agent "$rp3_dir" 2>/dev/null)" || true
+    rp3_result="$(_repo_preferred_cursor "$rp3_dir" 2>/dev/null)" || true
     _t_check "RP3: .cursorignore → agent" test "$rp3_result" = "agent"
   else
     _t_skip "RP3 (agent not in PATH)"
   fi
   rm -rf "$rp3_dir"
 
-  _section "RP4 — _repo_preferred_agent: no markers → returns 1"
+  _section "RP4 — _repo_preferred_cursor: no markers → returns 1"
   local rp4_dir rp4_exit
   rp4_dir="$(mktemp -d)"
-  rp4_exit="$(_repo_preferred_agent "$rp4_dir" &>/dev/null; echo $?)" || true
+  rp4_exit="$(_repo_preferred_cursor "$rp4_dir" &>/dev/null; echo $?)" || true
   _t_check "RP4: empty dir → exit 1" test "$rp4_exit" -eq 1
   rm -rf "$rp4_dir"
 
-  _section "RP5 — _repo_preferred_agent: empty dir arg → returns 1"
+  _section "RP5 — _repo_preferred_cursor: empty dir arg → returns 1"
   local rp5_exit
-  rp5_exit="$(_repo_preferred_agent "" &>/dev/null; echo $?)" || true
+  rp5_exit="$(_repo_preferred_cursor "" &>/dev/null; echo $?)" || true
   _t_check "RP5: empty string → exit 1" test "$rp5_exit" -eq 1
 
   _section "RP6 — _resolve_ai: repo preference overrides default order"
