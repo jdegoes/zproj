@@ -474,7 +474,7 @@ _integrate_install_instructions() {
   ai_binary="${ai%% *}"
 
   if ! instructions_file="$(_agent_instructions_file "$ai_binary")"; then
-    warn "Agent '${ai_binary:-none}' has no known global instructions file. Supported: opencode, claude, codex, amp. (agent uses .cursor/rules/*.mdc)"
+    warn "Agent '${ai_binary:-none}' has no known global instructions file. Supported: opencode, claude, codex, amp. (agent (Cursor) uses .cursor/rules/*.mdc)"
     return 0
   fi
 
@@ -1819,7 +1819,7 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME launch <worktree-dir>
     Run ${CYAN}$SCRIPT_NAME --env${RESET} to see which editor and agent will be used.
 
   ${BOLD}Auto-discovered agents (in order):${RESET}
-    opencode, claude, codex, amp, aider, goose, gemini, agent
+    opencode, claude, codex, amp, aider, goose, gemini, agent (Cursor)
 
   ${BOLD}Repo-preferred agent:${RESET}
     If the worktree contains .cursor/, .cursorrules, or .cursorignore,
@@ -2705,7 +2705,7 @@ _integrate_install_skills() {
 
   # Resolve target install directory for this agent
   if ! target_dir="$(_agent_skills_dir "$ai_binary")"; then
-    warn "Agent '${ai_binary:-none}' has no known skills directory. Supported: opencode, claude, codex, amp, agent."
+    warn "Agent '${ai_binary:-none}' has no known skills directory. Supported: opencode, claude, codex, amp, agent (Cursor)."
     return 1
   fi
 
@@ -2976,18 +2976,18 @@ ${BOLD}Tool installation:${RESET}
   cqs:  cargo install cqs
 
 ${BOLD}Skills directory per agent:${RESET}
-  opencode → ~/.config/opencode/skills/
-  claude   → ~/.claude/skills/
-  codex    → ~/.agents/skills/
-  amp      → ~/.config/agents/skills/
-  agent    → ~/.cursor/skills/
+  opencode         → ~/.config/opencode/skills/
+  claude           → ~/.claude/skills/
+  codex            → ~/.agents/skills/
+  amp              → ~/.config/agents/skills/
+  agent (Cursor)   → ~/.cursor/skills/
 
 ${BOLD}Global instructions file per agent:${RESET}
-  opencode → ~/.config/opencode/AGENTS.md
-  claude   → ~/.claude/CLAUDE.md
-  codex    → ~/.codex/AGENTS.md
-  amp      → ~/.config/amp/AGENTS.md
-  agent    → (none — Cursor uses .cursor/rules/*.mdc)
+  opencode         → ~/.config/opencode/AGENTS.md
+  claude           → ~/.claude/CLAUDE.md
+  codex            → ~/.codex/AGENTS.md
+  amp              → ~/.config/amp/AGENTS.md
+  agent (Cursor)   → (none — Cursor uses .cursor/rules/*.mdc)
 
 ${BOLD}Environment:${RESET}
   ZPROJ_INTEGRATE_DELAY   Seconds to wait for agent TUI before sending the
