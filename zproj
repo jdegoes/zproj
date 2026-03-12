@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.9.4"
+readonly VERSION="4.10.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -77,9 +77,14 @@ _hint_next_steps() {
 }
 
 # Switch to or attach a tmux session, respecting ZPROJ_TEST_NO_ATTACH.
+# Skipped when _ZPROJ_DEFER_ATTACH is set (used by cmd_open to batch-launch
+# all worktree windows before attaching once at the end).
 # $1 = session name
 _tmux_attach_or_switch() {
   local session="$1"
+  if [[ -n "${_ZPROJ_DEFER_ATTACH:-}" ]]; then
+    return 0
+  fi
   if [[ -z "${ZPROJ_TEST_NO_ATTACH:-}" ]]; then
     if [[ -n "${TMUX:-}" ]]; then
       tmux switch-client -t "$session"
@@ -269,6 +274,13 @@ _resolve_editor() {
 # Print "s" if $1 != 1, else print nothing. Usage: "note$(_plural "$count")"
 _plural() { [[ "${1:-0}" == "1" ]] && echo "" || echo "s"; }
 
+# Derive a safe tmux session name from a directory name.
+# tmux uses '.' as a session:window.pane separator and ':' as a session:window
+# separator in its target syntax, so either character in a project directory
+# name causes every -t argument to be misparsed.  Replace both with '-'.
+# Usage: session_name="$(_tmux_session_name "$dir")"
+_tmux_session_name() { tr '.:'  '--' <<< "$1"; }
+
 # Return a human-readable label for which config source resolved the editor.
 # $1 = resolved editor binary name (first word of the resolved command)
 # Prints one of: "\$ZPROJ_EDITOR", "\$EDITOR", "default"
@@ -302,10 +314,21 @@ _repo_preferred_cursor() {
   return 1
 }
 
+# Common directories where coding agents are installed.  Checked as a
+# fallback when the agent binary is not in the current PATH — this covers
+# post-restart environments where PATH is incomplete (e.g. Homebrew not
+# yet in PATH when tmux server starts before the shell profile runs).
+readonly _AGENT_FALLBACK_DIRS=(
+  /opt/homebrew/bin
+  /usr/local/bin
+  "$HOME/.local/bin"
+)
+
 # Resolve the coding agent command to use in pane 1.
 # $1 (optional): worktree directory — when provided, repo-specific markers
 # are checked before the global _KNOWN_AGENTS walk.
-# Resolution order: $CODING_AGENT → repo-preferred → auto-discover → empty
+# Resolution order: $CODING_AGENT → repo-preferred → auto-discover (PATH
+#                   then fallback dirs) → empty string (graceful no-op)
 # Prints the resolved command string to stdout, or empty string if none found.
 _resolve_ai() {
   local dir="${1:-}"
@@ -328,13 +351,29 @@ _resolve_ai() {
     return 0
   fi
 
-  # Auto-discover from known terminal coding agents
+  # Auto-discover from known terminal coding agents — search PATH first
   local agent
   for agent in "${_KNOWN_AGENTS[@]}"; do
     if command -v "$agent" &>/dev/null; then
       echo "$agent"
       return 0
     fi
+  done
+
+  # Fallback: check well-known installation directories that may not be
+  # in the current PATH (e.g. after a system restart, brew upgrade, etc.).
+  # Preserves the same priority order as _KNOWN_AGENTS.
+  local dir candidate
+  for agent in "${_KNOWN_AGENTS[@]}"; do
+    for dir in "${_AGENT_FALLBACK_DIRS[@]}"; do
+      candidate="$dir/$agent"
+      if [[ -x "$candidate" ]]; then
+        warn "Found '${agent}' at ${candidate} (not in PATH)."
+        warn "Add '${dir}' to your PATH for reliable auto-discovery."
+        echo "$candidate"
+        return 0
+      fi
+    done
   done
 
   # Nothing found — graceful no-op
@@ -594,7 +633,7 @@ resolve_project_dir() {
     exit 1
   fi
 
-  SESSION_NAME="$(basename "$PARENT_DIR")"
+  SESSION_NAME="$(_tmux_session_name "$(basename "$PARENT_DIR")")"
   WINDOW_NAME="$WORKTREE_NAME"
 }
 
@@ -1470,7 +1509,7 @@ cmd_list() {
   [[ ! -d "$root/$BARE_DIR" ]] && die "No bare repo found. Run from a worktree root or specify a path."
 
   local root_name
-  root_name="$(basename "$root")"
+  root_name="$(_tmux_session_name "$(basename "$root")")"
 
   # Get list of tmux windows for this session (if session exists)
   local -a tmux_windows=()
@@ -1604,7 +1643,7 @@ cmd_open() {
   check_session_deps
 
   local session_name
-  session_name="$(basename "$root")"
+  session_name="$(_tmux_session_name "$(basename "$root")")"
 
   # Session already exists — just attach/switch
   if tmux has-session -t "$session_name" 2>/dev/null; then
@@ -1613,9 +1652,8 @@ cmd_open() {
     return
   fi
 
-  # Find the first worktree to use as the initial window (prefer main/master).
-  # Inlined — a callback via variable name cannot write to `first_wt` here.
-  local first_wt=""
+  # Collect all non-bare worktree names.
+  local -a all_wts=()
   local _op_path="" _op_branch=""
   while IFS= read -r _line; do
     if   [[ "$_line" == "worktree "* ]]; then _op_path="${_line#worktree }"
@@ -1623,28 +1661,83 @@ cmd_open() {
     elif [[ "$_line" == "branch "* ]];   then
       _op_branch="${_line#branch }"; _op_branch="${_op_branch#refs/heads/}"
     elif [[ "$_line" == "bare" ]];       then _op_branch="(bare)"
+    elif [[ "$_line" == "detached" ]];   then _op_branch=""
     elif [[ -z "$_line" && -n "$_op_path" ]]; then
-      if [[ "$_op_branch" != "(bare)" ]]; then
-        local _op_name; _op_name="$(basename "$_op_path")"
-        if [[ "$_op_name" == "main" || "$_op_name" == "master" ]]; then
-          first_wt="$_op_name"
-        fi
-        [[ -z "$first_wt" ]] && first_wt="$_op_name"
+      if [[ "$_op_branch" != "(bare)" && -d "$_op_path" ]]; then
+        all_wts+=("$(basename "$_op_path")")
       fi
       _op_path="" _op_branch=""
     fi
   done < <(git -C "$root" worktree list --porcelain 2>/dev/null)
-  if [[ -n "$_op_path" && "$_op_branch" != "(bare)" ]]; then
-    local _op_name; _op_name="$(basename "$_op_path")"
-    [[ "$_op_name" == "main" || "$_op_name" == "master" ]] && first_wt="$_op_name"
-    [[ -z "$first_wt" ]] && first_wt="$_op_name"
+  # Handle last entry (porcelain output may not end with a blank line)
+  if [[ -n "$_op_path" && "$_op_branch" != "(bare)" && -d "$_op_path" ]]; then
+    all_wts+=("$(basename "$_op_path")")
   fi
 
-  if [[ -z "$first_wt" ]]; then
+  if [[ ${#all_wts[@]} -eq 0 ]]; then
     die "No worktrees found. Create one first:\n  ${CYAN}$SCRIPT_NAME main${RESET}"
   fi
 
+  # Sort worktrees: main/master first (creates the tmux session), then
+  # remaining worktrees ordered by modification time (most recent first)
+  # so the most actively-used branches appear as the leftmost windows.
+  local first_wt=""
+  local -a other_wts=()
+  local _wt
+  for _wt in "${all_wts[@]}"; do
+    if [[ "$_wt" == "main" || "$_wt" == "master" ]]; then
+      [[ -n "$first_wt" ]] && other_wts+=("$first_wt")
+      first_wt="$_wt"
+    else
+      other_wts+=("$_wt")
+    fi
+  done
+  # If no main/master, promote the first collected worktree
+  if [[ -z "$first_wt" && ${#other_wts[@]} -gt 0 ]]; then
+    first_wt="${other_wts[0]}"
+    other_wts=("${other_wts[@]:1}")
+  fi
+
+  # Sort other_wts by directory mtime (most recent first).
+  # Use stat -f %m (macOS) with sort -rn, falling back to ls -t.
+  if [[ ${#other_wts[@]} -gt 1 ]]; then
+    local -a _sorted_wts=()
+    local _sw
+    while IFS= read -r _sw; do
+      [[ -n "$_sw" ]] && _sorted_wts+=("$_sw")
+    done < <(
+      for _wt in "${other_wts[@]}"; do
+        local _d="$root/$_wt"
+        local _mtime=0
+        if [[ -d "$_d" ]]; then
+          # macOS stat: -f %m gives epoch seconds
+          _mtime="$(stat -f %m "$_d" 2>/dev/null)" || \
+          _mtime="$(stat -c %Y "$_d" 2>/dev/null)" || _mtime=0
+        fi
+        printf '%s\t%s\n' "$_mtime" "$_wt"
+      done | sort -t$'\t' -k1,1rn | cut -f2
+    )
+    if [[ ${#_sorted_wts[@]} -gt 0 ]]; then
+      other_wts=("${_sorted_wts[@]}")
+    fi
+  fi
+
+  # Defer attach/switch during the batch launch so that all windows are
+  # created before the terminal is handed to tmux.  Without this, the first
+  # cmd_launch call would block on `tmux attach` (outside tmux) and the
+  # remaining worktrees would never get windows.
+  _ZPROJ_DEFER_ATTACH=1
+
   cmd_launch "$first_wt"
+  local _ow
+  for _ow in "${other_wts[@]+"${other_wts[@]}"}"; do
+    cmd_launch "$_ow"
+  done
+
+  unset _ZPROJ_DEFER_ATTACH
+
+  # Now attach/switch once — all windows are ready.
+  _tmux_attach_or_switch "$session_name"
 }
 
 # ─── Default action (upsert + launch) ────────────────────────────────────────
@@ -1891,7 +1984,10 @@ EOF
 # No slash command needed; works with any coding agent.
 _REVIEW_DISPATCH_PREAMBLE="I have completed a review pass on your recent changes. \
 Below are my directed notes — implement every item exactly as described. \
-Do not ask for clarification; implement all items as written.\n\n\
+If you cannot do exactly as described, ask me for help rather than improvising. \
+Line numbers reflect the state of the files at review time and may have shifted; \
+each note includes the reviewed line's content as a blockquote to help you locate \
+the correct position.\n\n\
 ---\n\n"
 
 # Resolve a pane target for use with send-keys / paste-buffer.
@@ -1986,7 +2082,7 @@ _review_find_session() {
     return 1
   fi
 
-  SESSION_NAME="$(basename "$_REVIEW_REPO_ROOT")"
+  SESSION_NAME="$(_tmux_session_name "$(basename "$_REVIEW_REPO_ROOT")")"
   WINDOW_NAME="$(basename "$_REVIEW_WT_ROOT")"
   return 0
 }
@@ -2417,11 +2513,121 @@ _integrate_build_prompt() {
   review_path_abs="$("$zproj_path" review path --abs 2>/dev/null)" \
     || review_path_abs="(run from inside a worktree)"
 
-  # Embed the reference Neovim implementation verbatim.
-  # Look for it relative to $HOME rather than a hardcoded user path.
-  local diffview_lua_path="${HOME}/.config/nvim/lua/plugins/diffview.lua"
-  diffview_lua_contents="$(cat "$diffview_lua_path" 2>/dev/null \
-    || echo "(reference file not found at \$HOME/.config/nvim/lua/plugins/diffview.lua)")"
+  # Embed the reference Neovim+diffview.nvim implementation as a literal
+  # heredoc bundled in the script — not read from the user's live config,
+  # which may not exist (the user may not use Neovim at all).
+  #
+  # The implementation is split across two files:
+  #   lua/config/keymaps.lua     — all four review bindings as permanent globals
+  #   lua/plugins/diffview.lua   — diffview plugin spec only (no review hooks)
+  keymaps_lua_contents="$(cat <<'KEYMAPS_LUA'
+-- lua/config/keymaps.lua
+
+vim.keymap.set("n", "<leader>rn", function()
+  local file = vim.fn.expand("%:p")
+  local line = vim.fn.line(".")
+  local line_text = vim.fn.getline(".")
+  vim.ui.input({ prompt = "Note: " }, function(comment)
+    if not comment or comment == "" then return end
+    local review_file = vim.fn.system("zproj review path --abs 2>/dev/null"):match("^([^\n]*)")
+    if vim.v.shell_error ~= 0 or not review_file or review_file == "" then
+      vim.notify("zproj review path failed — are you in a zproj worktree?", vim.log.levels.ERROR)
+      return
+    end
+    vim.fn.mkdir(vim.fn.fnamemodify(review_file, ":h"), "p")
+    local timestamp = os.date("%Y-%m-%d %H:%M")
+    local entry = string.format("### `%s` line %d -- %s\n> %s\n\n%s\n\n", file, line, timestamp, line_text, comment)
+    local f = io.open(review_file, "a")
+    if f then
+      f:write(entry)
+      f:close()
+      vim.notify("Note added: " .. file .. ":" .. line)
+    else
+      vim.notify("Could not open review file: " .. review_file, vim.log.levels.ERROR)
+    end
+  end)
+end, { desc = "Add review note" })
+
+vim.keymap.set("n", "<leader>rv", function()
+  local review_file = vim.fn.system("zproj review path --abs 2>/dev/null"):match("^([^\n]*)")
+  if vim.v.shell_error ~= 0 or not review_file or review_file == "" or vim.fn.filereadable(review_file) == 0 then
+    vim.notify("No review notes yet.", vim.log.levels.WARN)
+    return
+  end
+  vim.cmd("split " .. vim.fn.fnameescape(review_file))
+end, { desc = "View review notes" })
+
+vim.keymap.set("n", "<leader>rd", function()
+  local result = vim.fn.system("zproj review dispatch 2>&1")
+  local ok = vim.v.shell_error == 0
+  if ok then
+    vim.notify("Dispatched to coding agent.")
+  else
+    vim.notify("Dispatch failed: " .. result, vim.log.levels.ERROR)
+  end
+end, { desc = "Dispatch review notes to coding agent" })
+
+vim.keymap.set("n", "<leader>rc", function()
+  local result = vim.fn.system("zproj review clear 2>&1")
+  local ok = vim.v.shell_error == 0
+  if ok then
+    local review_file = vim.fn.system("zproj review path --abs 2>/dev/null"):match("^([^\n]*)")
+    if review_file and review_file ~= "" then
+      local bufnr = vim.fn.bufnr(review_file)
+      if bufnr ~= -1 then
+        vim.cmd("bwipeout! " .. bufnr)
+      end
+    end
+    vim.notify("Review notes cleared.")
+  else
+    vim.notify("Clear failed: " .. result, vim.log.levels.ERROR)
+  end
+end, { desc = "Clear review notes" })
+KEYMAPS_LUA
+)"
+
+  diffview_lua_contents="$(cat <<'DIFFVIEW_LUA'
+-- lua/plugins/diffview.lua
+
+return {
+  {
+    "sindrets/diffview.nvim",
+    lazy = false,
+    dependencies = { "nvim-tree/nvim-web-devicons" },
+    opts = {
+      hooks = {
+        diff_buf_read = function(bufnr, _ctx)
+          vim.bo[bufnr].modifiable = false
+        end,
+      },
+    },
+    keys = {
+      {
+        "<leader>df",
+        function()
+          local file = vim.fn.expand("%:~:.")
+          if file ~= "" then
+            vim.cmd("DiffviewOpen HEAD -- " .. vim.fn.fnameescape(file))
+            vim.cmd("DiffviewToggleFiles")
+          end
+        end,
+        desc = "Diffview: current file",
+      },
+      {
+        "<leader>dq",
+        "<cmd>DiffviewClose<cr>",
+        desc = "Diffview: close",
+      },
+      {
+        "<leader>dh",
+        "<cmd>DiffviewFileHistory %<cr>",
+        desc = "Diffview: file history",
+      },
+    },
+  },
+}
+DIFFVIEW_LUA
+)"
 
   cat <<PROMPT
 # zproj Editor Integration Task
@@ -2546,24 +2752,50 @@ The four editor actions that must be bound are:
 
 ## Reference implementation (Neovim + diffview.nvim)
 
-This is a complete, working implementation from a known zproj installation
-using Neovim. Use it as a concrete example of what "done" looks like — not
-as a constraint. If the target editor is also Neovim, verify whether this
+This is a complete, working implementation for **Neovim with the diffview.nvim
+plugin**. It is provided as a concrete illustration of the pattern — not as a
+constraint or assumption about the user's editor.
+
+**If the user's editor is Neovim with diffview.nvim:** check whether this
 implementation (or something equivalent) is already present before adding
-anything. If the target editor is different, adapt the approach to its idioms.
+anything.
+
+**If the user's editor is anything else:** ignore this code entirely and
+implement the four actions using that editor's native idioms. The only
+invariants that must hold regardless of editor are:
+- The file path recorded in each note must be absolute
+- The review notes path must be obtained at runtime via \`zproj review path --abs\`
+- The note entry format must be exactly: \`### \`<abs-file>\` line <n> -- <YYYY-MM-DD HH:MM>\`
+
+The implementation is split across two files. **\`lua/config/keymaps.lua\`**
+holds all four review bindings as permanent global keymaps, available in any
+buffer at all times. This is critical: none of the review bindings should be
+registered inside a diffview \`view_opened\` hook, because that hook registers
+them as global keymaps that \`view_closed\` then deletes entirely — leaving no
+bindings after diffview closes.
+
+**\`lua/plugins/diffview.lua\`** holds only the diffview plugin spec and its
+\`diff_buf_read\` hook. It contains no review-related keymaps.
+
+\`\`\`lua
+${keymaps_lua_contents}
+\`\`\`
 
 \`\`\`lua
 ${diffview_lua_contents}
 \`\`\`
 
 Key observations from this implementation:
+- File path is recorded as absolute (\`vim.fn.expand("%:p")\`), never relative
 - The review notes path is obtained via \`zproj review path --abs\` (shelled
   out), never hardcoded
-- \`<leader>rn\` prompts interactively, captures file + line, appends entry
-- \`<leader>rv\` opens the file in a split for inspection
+- All four bindings are permanent global keymaps in \`keymaps.lua\` — available
+  in any buffer, regardless of whether diffview is open
+- \`<leader>rn\` checks both \`vim.v.shell_error\` and the empty-string to detect
+  \`zproj\` failures robustly
+- \`<leader>rv\` opens the notes file in a split for inspection
 - \`<leader>rd\` calls \`zproj review dispatch\` — one line, no tmux knowledge
 - \`<leader>rc\` calls \`zproj review clear\`, then wipes the buffer if open
-- The dispatch keymap closes Diffview after dispatching (editor-specific cleanup)
 
 ---
 
@@ -2780,57 +3012,53 @@ _integrate_install_skills() {
 }
 
 cmd_integrate() {
-  local plan_only=false skills_only=false
+  local plan_only=false only_components=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-    --plan)         plan_only=true ;;
-    --skills-only)  skills_only=true ;;
-    --help|-h)      usage_integrate; exit 0 ;;
+    --plan)
+      plan_only=true ;;
+    --only)
+      shift
+      [[ $# -eq 0 ]] && die "--only requires a comma-separated list: skills, rules, editor"
+      only_components="$1"
+      ;;
+    --skills-only)
+      # Deprecated alias for --only skills,rules
+      only_components="skills,rules"
+      ;;
+    --help|-h)
+      usage_integrate; exit 0 ;;
     -*) die "Unknown option: $1." ;;
     *)  die "Unexpected argument: $1." ;;
     esac
     shift
   done
 
-  # ── Skills-only ──────────────────────────────────────────────────────────
-
-  if $skills_only; then
-    echo ""
-    echo -e "${BOLD}zproj integrate --skills-only${RESET}"
-    echo ""
-    if $plan_only; then
-      echo -e "${BOLD}Dry run — no changes will be made:${RESET}"
-      echo ""
-      echo -e "${BOLD}Tools:${RESET}"
-      _integrate_install_tools true
-      echo ""
-      echo -e "${BOLD}Skills:${RESET}"
-      _integrate_install_skills true
-      echo ""
-      echo -e "${BOLD}Instructions:${RESET}"
-      _integrate_install_instructions true
-    else
-      step "Installing tools..."
-      echo ""
-      _integrate_install_tools false
-      echo ""
-      step "Installing skills..."
-      echo ""
-      _integrate_install_skills false
-      echo ""
-      step "Installing instructions..."
-      echo ""
-      _integrate_install_instructions false
-    fi
-    return 0
+  # Validate --only components
+  local do_skills=true do_rules=true do_editor=true
+  if [[ -n "$only_components" ]]; then
+    do_skills=false; do_rules=false; do_editor=false
+    IFS=',' read -ra _only_parts <<< "$only_components"
+    local _part
+    for _part in "${_only_parts[@]}"; do
+      _part="${_part// /}"   # strip spaces
+      case "$_part" in
+        skills) do_skills=true ;;
+        rules)  do_rules=true  ;;
+        editor) do_editor=true ;;
+        *) die "Unknown component '${_part}' in --only. Valid values: skills, rules, editor" ;;
+      esac
+    done
   fi
 
-  # ── Plan only (editor + tools + skills + instructions preview) ────────────
+  # ── Plan only ────────────────────────────────────────────────────────────
 
   if $plan_only; then
-    _integrate_build_prompt
-    echo ""
+    if $do_editor; then
+      _integrate_build_prompt
+      echo ""
+    fi
     echo "## Tools, Skills & Instructions"
     echo ""
     echo -e "${BOLD}Dry run — no changes will be made:${RESET}"
@@ -2838,50 +3066,67 @@ cmd_integrate() {
     echo -e "${BOLD}Tools:${RESET}"
     _integrate_install_tools true
     echo ""
-    echo -e "${BOLD}Skills:${RESET}"
-    _integrate_install_skills true || true
-    echo ""
-    echo -e "${BOLD}Instructions:${RESET}"
-    _integrate_install_instructions true || true
+    if $do_skills; then
+      echo -e "${BOLD}Skills:${RESET}"
+      _integrate_install_skills true || true
+      echo ""
+    fi
+    if $do_rules; then
+      echo -e "${BOLD}Instructions:${RESET}"
+      _integrate_install_instructions true || true
+    fi
     return 0
   fi
 
-  # ── Full integrate: install tools + skills + instructions, hand off editor ─
+  # ── Live run ─────────────────────────────────────────────────────────────
 
-  check_session_deps
+  # Editor integration requires a coding agent and tmux session
+  if $do_editor; then
+    check_session_deps
+  fi
 
-  local editor ai
-  editor="$(_resolve_editor)"
-  ai="$(_resolve_ai)"
-  local ai_binary="${ai%% *}"
+  local editor ai ai_binary
+  editor="$(_resolve_editor 2>/dev/null)" || editor=""
+  ai="$(_resolve_ai 2>/dev/null)" || ai=""
+  ai_binary="${ai%% *}"
 
   echo ""
-  echo -e "${BOLD}zproj integrate${RESET}"
-  echo -e "  Editor:  ${CYAN}${editor}${RESET}"
+  if $do_editor; then
+    echo -e "${BOLD}zproj integrate${RESET}"
+  else
+    echo -e "${BOLD}zproj integrate --only ${only_components}${RESET}"
+  fi
+  $do_editor && echo -e "  Editor:  ${CYAN}${editor}${RESET}"
   echo -e "  Agent:   ${CYAN}${ai_binary:-none}${RESET}"
   echo ""
 
-  if [[ -z "$ai_binary" ]]; then
+  if $do_editor && [[ -z "$ai_binary" ]]; then
     die "No coding agent found. Install one (opencode, claude, etc.) or set \$CODING_AGENT."
   fi
 
-  # Install tools directly
+  # Install tools directly (always — they are prerequisites for skills/rules)
   step "Installing tools..."
   echo ""
   _integrate_install_tools false
   echo ""
 
-  # Install skills directly — no agent needed
-  step "Installing skills..."
-  echo ""
-  _integrate_install_skills false || true
-  echo ""
+  if $do_skills; then
+    step "Installing skills..."
+    echo ""
+    _integrate_install_skills false || true
+    echo ""
+  fi
 
-  # Install global instructions rules
-  step "Installing instructions..."
-  echo ""
-  _integrate_install_instructions false || true
-  echo ""
+  if $do_rules; then
+    step "Installing instructions..."
+    echo ""
+    _integrate_install_instructions false || true
+    echo ""
+  fi
+
+  if ! $do_editor; then
+    return 0
+  fi
 
   # Build and hand off the editor integration prompt to the agent
   step "Building editor integration plan..."
@@ -2941,7 +3186,7 @@ cmd_integrate() {
 usage_integrate() {
   cat <<EOF
 
-${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan] [--skills-only]
+${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan] [--only <components>]
 
   Installs ck and cqs if missing, copies bundled skill files, ensures global
   instruction rules are present, then asks your coding agent to integrate your
@@ -2965,10 +3210,13 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan] [--skills-only]
     5. Explain how to test the result
 
 ${BOLD}Options:${RESET}
-  --plan          Dry run: show what tools would be installed, what skills
-                  would be copied, and print the editor prompt. Nothing runs.
-  --skills-only   Install tools and skills only — skip editor/tmux integration.
-                  With --plan: dry run of tools and skills only.
+  --plan                   Dry run: show what tools would be installed, what
+                           skills would be copied, and print the editor prompt.
+                           Nothing runs.
+  --only <components>      Run only the specified components. Comma-separated
+                           list of: skills, rules, editor
+                           Example: --only skills,rules
+  --skills-only            Deprecated alias for --only skills,rules
 
 ${BOLD}Tool installation:${RESET}
   ck:   cargo install ck-search               (preferred)
@@ -2995,10 +3243,11 @@ ${BOLD}Environment:${RESET}
                           agent starts slowly.
 
 ${BOLD}Examples:${RESET}
-  $SCRIPT_NAME integrate                      ${DIM}# install skills + editor integration${RESET}
-  $SCRIPT_NAME integrate --skills-only        ${DIM}# install skills only${RESET}
-  $SCRIPT_NAME integrate --plan               ${DIM}# preview everything, write nothing${RESET}
-  $SCRIPT_NAME integrate --skills-only --plan ${DIM}# preview skills only${RESET}
+  $SCRIPT_NAME integrate                        ${DIM}# install everything + editor integration${RESET}
+  $SCRIPT_NAME integrate --only skills,rules    ${DIM}# install skills and rules only${RESET}
+  $SCRIPT_NAME integrate --only editor          ${DIM}# editor integration only${RESET}
+  $SCRIPT_NAME integrate --plan                 ${DIM}# preview everything, write nothing${RESET}
+  $SCRIPT_NAME integrate --only skills --plan   ${DIM}# preview skills only${RESET}
 
 EOF
 }
@@ -3382,11 +3631,27 @@ STUB
 
   _section "A5 — agent: graceful no-op when nothing installed"
   local a5 a5_warn
-  # Temporarily shadow PATH with only /usr/bin so no agents are found
-  a5="$(CODING_AGENT="" PATH="/usr/bin:/bin" _resolve_ai 2>/dev/null)"
-  a5_warn="$(CODING_AGENT="" PATH="/usr/bin:/bin" _resolve_ai 2>&1 1>/dev/null)" || true
+  # Shadow PATH and use an empty fallback dir so no agents are found.
+  local a5_empty_dir a5_script
+  a5_empty_dir="$(mktemp -d)"
+  a5_script="$(mktemp)"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    echo "RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; DIM=''; RESET=''"
+    echo "die() { echo \"error: \$*\" >&2; exit 1; }"
+    echo "warn() { echo \"warn: \$*\" >&2; }"
+    echo "_KNOWN_AGENTS=(opencode claude codex amp aider goose gemini)"
+    echo "_AGENT_FALLBACK_DIRS=(\"$a5_empty_dir\")"
+    sed -n '/^_resolve_ai()/,/^}/p' "$0"
+    echo 'CODING_AGENT="" _resolve_ai'
+  } > "$a5_script"
+  chmod +x "$a5_script"
+  a5="$(PATH="/usr/bin:/bin" "$BASH" "$a5_script" 2>/dev/null)" || true
+  a5_warn="$(PATH="/usr/bin:/bin" "$BASH" "$a5_script" 2>&1 1>/dev/null)" || true
   _t_check "returns empty string (no die)"   test -z "$a5"
   _t_grep  "prints warning about no agent"   "No coding agent"  echo "$a5_warn"
+  rm -rf "$a5_empty_dir" "$a5_script" || true
 
   _section "A6 — --env runs without error"
   local env_exit
@@ -3398,6 +3663,61 @@ STUB
   env_out="$(CODING_AGENT=opencode cmd_env 2>/dev/null)"
   _t_grep "--env shows agent name"  "opencode"       echo "$env_out"
   _t_grep "--env shows source tag"  "CODING_AGENT"   echo "$env_out"
+
+  _section "A8 — agent: fallback dirs find agent not in PATH"
+  # Create a fake agent binary in a temp dir (simulating /opt/homebrew/bin)
+  # and verify _resolve_ai finds it via fallback when PATH doesn't include it.
+  local a8_fallback_dir a8_script
+  a8_fallback_dir="$(mktemp -d)"
+  printf '#!/bin/sh\necho "fake opencode"\n' > "$a8_fallback_dir/opencode"
+  chmod +x "$a8_fallback_dir/opencode"
+  a8_script="$(mktemp)"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    # Stub colour/output helpers
+    echo "RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; DIM=''; RESET=''"
+    echo "die() { echo \"error: \$*\" >&2; exit 1; }"
+    echo "warn() { echo \"warn: \$*\" >&2; }"
+    echo "_KNOWN_AGENTS=(opencode claude codex amp aider goose gemini)"
+    echo "_AGENT_FALLBACK_DIRS=(\"$a8_fallback_dir\")"
+    # Extract _resolve_ai
+    sed -n '/^_resolve_ai()/,/^}/p' "$0"
+    echo 'CODING_AGENT="" _resolve_ai'
+  } > "$a8_script"
+  chmod +x "$a8_script"
+  local a8_result a8_warn
+  a8_result="$(PATH="/usr/bin:/bin" "$BASH" "$a8_script" 2>/dev/null)" || true
+  a8_warn="$(PATH="/usr/bin:/bin" "$BASH" "$a8_script" 2>&1 1>/dev/null)" || true
+  _t_check "A8: finds opencode via fallback dir"    test "$a8_result" = "$a8_fallback_dir/opencode"
+  _t_grep  "A8: warns about not in PATH"            "not in PATH"  echo "$a8_warn"
+  rm -rf "$a8_fallback_dir" "$a8_script" || true
+
+  _section "A9 — agent: fallback respects priority order (opencode before claude)"
+  # Both opencode and claude exist in fallback dir; opencode should win.
+  local a9_fallback_dir a9_script
+  a9_fallback_dir="$(mktemp -d)"
+  printf '#!/bin/sh\necho "fake opencode"\n' > "$a9_fallback_dir/opencode"
+  printf '#!/bin/sh\necho "fake claude"\n' > "$a9_fallback_dir/claude"
+  chmod +x "$a9_fallback_dir/opencode" "$a9_fallback_dir/claude"
+  a9_script="$(mktemp)"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    echo "RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; DIM=''; RESET=''"
+    echo "die() { echo \"error: \$*\" >&2; exit 1; }"
+    echo "warn() { echo \"warn: \$*\" >&2; }"
+    echo "_KNOWN_AGENTS=(opencode claude codex amp aider goose gemini)"
+    echo "_AGENT_FALLBACK_DIRS=(\"$a9_fallback_dir\")"
+    sed -n '/^_resolve_ai()/,/^}/p' "$0"
+    echo 'CODING_AGENT="" _resolve_ai'
+  } > "$a9_script"
+  chmod +x "$a9_script"
+  local a9_result
+  a9_result="$(PATH="/usr/bin:/bin" "$BASH" "$a9_script" 2>/dev/null)" || true
+  _t_check "A9: opencode wins over claude in fallback" \
+    test "$a9_result" = "$a9_fallback_dir/opencode"
+  rm -rf "$a9_fallback_dir" "$a9_script" || true
 
   fi  # end: command -v opencode
 
@@ -3793,6 +4113,171 @@ NOTES
 
   tmux kill-session -t "$open_session" 2>/dev/null || true
 
+  # ── T9: cmd_open launches windows for ALL worktrees ──────────────────────
+
+  _section "T9 — cmd_open: launches a window for every worktree"
+
+  # Create two additional worktrees alongside main
+  (cd "$lt_root" && "$BASH" "$0" create feature-a 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$0" create feature-b 2>/dev/null) || true
+
+  _t_check "T9: feature-a/ exists"  test -d "$lt_root/feature-a"
+  _t_check "T9: feature-b/ exists"  test -d "$lt_root/feature-b"
+
+  # Run cmd_open — should create a session with windows for all 3 worktrees
+  local t9_session
+  t9_session="$(basename "$lt_root")"
+  # Ensure no pre-existing session
+  tmux kill-session -t "$t9_session" 2>/dev/null || true
+
+  local t9_out
+  t9_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1 || true)"
+
+  # Verify the session was created
+  _t_check "T9: session exists" \
+    tmux has-session -t "$t9_session"
+
+  # List all window names in the session
+  local t9_windows
+  t9_windows="$(tmux list-windows -t "$t9_session" -F '#{window_name}' 2>/dev/null)"
+
+  _t_grep  "T9: main window exists"      "^main$"       echo "$t9_windows"
+  _t_grep  "T9: feature-a window exists"  "^feature-a$"  echo "$t9_windows"
+  _t_grep  "T9: feature-b window exists"  "^feature-b$"  echo "$t9_windows"
+
+  # Verify we have exactly 3 windows (not more, not fewer)
+  local t9_count
+  t9_count="$(echo "$t9_windows" | wc -l | tr -d ' ')"
+  _t_check "T9: exactly 3 windows created" test "$t9_count" -eq 3
+
+  tmux kill-session -t "$t9_session" 2>/dev/null || true
+
+  # Clean up the extra worktrees
+  (cd "$lt_root" && "$BASH" "$0" delete feature-a 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$0" delete feature-b 2>/dev/null) || true
+
+  # ── T10: cmd_open defers attach (does not block after first window) ──────
+
+  _section "T10 — cmd_open: defers attach until all windows are created"
+
+  # Recreate worktrees for this test
+  (cd "$lt_root" && "$BASH" "$0" create wt-alpha 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$0" create wt-beta 2>/dev/null) || true
+
+  local t10_session
+  t10_session="$(basename "$lt_root")"
+  tmux kill-session -t "$t10_session" 2>/dev/null || true
+
+  # Run cmd_open with TMUX="" (simulating outside-tmux invocation).
+  # If _ZPROJ_DEFER_ATTACH works correctly, all windows are created before
+  # any attach call.  ZPROJ_TEST_NO_ATTACH suppresses the final attach so
+  # the test doesn't block, but the intermediate launches must NOT attach
+  # (that's the bug this tests).
+  local t10_out
+  t10_out="$(cd "$lt_root" && TMUX="" ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1 || true)"
+
+  local t10_windows
+  t10_windows="$(tmux list-windows -t "$t10_session" -F '#{window_name}' 2>/dev/null)"
+
+  _t_grep  "T10: main window exists"      "^main$"       echo "$t10_windows"
+  _t_grep  "T10: wt-alpha window exists"   "^wt-alpha$"   echo "$t10_windows"
+  _t_grep  "T10: wt-beta window exists"    "^wt-beta$"    echo "$t10_windows"
+
+  local t10_count
+  t10_count="$(echo "$t10_windows" | wc -l | tr -d ' ')"
+  _t_check "T10: exactly 3 windows created" test "$t10_count" -eq 3
+
+  tmux kill-session -t "$t10_session" 2>/dev/null || true
+  (cd "$lt_root" && "$BASH" "$0" delete wt-alpha 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$0" delete wt-beta 2>/dev/null) || true
+
+  # ── T11: cmd_open orders worktrees by mtime (most recent first) ──────────
+
+  _section "T11 — cmd_open: orders non-main worktrees by mtime (recent first)"
+
+  (cd "$lt_root" && "$BASH" "$0" create wt-old 2>/dev/null) || true
+  sleep 1
+  (cd "$lt_root" && "$BASH" "$0" create wt-new 2>/dev/null) || true
+  # Touch wt-new to ensure its mtime is newer
+  touch "$lt_root/wt-new" 2>/dev/null || true
+
+  local t11_session
+  t11_session="$(basename "$lt_root")"
+  tmux kill-session -t "$t11_session" 2>/dev/null || true
+
+  local t11_out
+  t11_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1 || true)"
+
+  # Windows are listed in creation order (which reflects launch order).
+  # main must be first; wt-new (more recent mtime) before wt-old.
+  local t11_windows
+  t11_windows="$(tmux list-windows -t "$t11_session" -F '#{window_name}' 2>/dev/null)"
+
+  # Extract window positions (1-indexed)
+  local t11_main_pos t11_new_pos t11_old_pos
+  t11_main_pos="$(echo "$t11_windows" | grep -n '^main$' | head -1 | cut -d: -f1)" || t11_main_pos=0
+  t11_new_pos="$(echo "$t11_windows" | grep -n '^wt-new$' | head -1 | cut -d: -f1)" || t11_new_pos=0
+  t11_old_pos="$(echo "$t11_windows" | grep -n '^wt-old$' | head -1 | cut -d: -f1)" || t11_old_pos=0
+
+  _t_check "T11: main is first window"         test "$t11_main_pos" -eq 1
+  _t_check "T11: wt-new comes before wt-old"   test "$t11_new_pos" -lt "$t11_old_pos"
+
+  tmux kill-session -t "$t11_session" 2>/dev/null || true
+  (cd "$lt_root" && "$BASH" "$0" delete wt-old 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$0" delete wt-new 2>/dev/null) || true
+
+  # ── T12: cmd_open skips worktrees whose directory doesn't exist ──────────
+
+  _section "T12 — cmd_open: skips registered worktrees with no directory on disk"
+
+  # Create two additional worktrees alongside main
+  (cd "$lt_root" && "$BASH" "$0" create wt-present 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$0" create wt-ghost 2>/dev/null) || true
+
+  _t_check "T12: wt-present/ exists"  test -d "$lt_root/wt-present"
+  _t_check "T12: wt-ghost/ exists"    test -d "$lt_root/wt-ghost"
+
+  # Remove the directory WITHOUT git worktree remove — leaves it registered
+  # in git but with no directory on disk (the "non-materialized" case).
+  rm -rf "$lt_root/wt-ghost"
+  _t_check "T12: wt-ghost/ removed from disk"  test ! -d "$lt_root/wt-ghost"
+
+  # Verify git still lists wt-ghost as a registered worktree
+  _t_grep "T12: wt-ghost still in git worktree list" \
+    "wt-ghost" git -C "$lt_root" worktree list
+
+  local t12_session
+  t12_session="$(basename "$lt_root")"
+  tmux kill-session -t "$t12_session" 2>/dev/null || true
+
+  # Run cmd_open — should succeed and NOT error about wt-ghost
+  local t12_out t12_exit
+  t12_exit=0
+  t12_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1)" || t12_exit=$?
+
+  _t_check "T12: cmd_open exits successfully" test "$t12_exit" -eq 0
+  _t_check "T12: no error about wt-ghost" \
+    bash -c '! echo "$1" | grep -q "does not exist"' -- "$t12_out"
+
+  # Verify windows were created only for materialized worktrees
+  local t12_windows
+  t12_windows="$(tmux list-windows -t "$t12_session" -F '#{window_name}' 2>/dev/null)"
+
+  _t_grep  "T12: main window exists"        "^main$"        echo "$t12_windows"
+  _t_grep  "T12: wt-present window exists"   "^wt-present$"  echo "$t12_windows"
+  _t_check "T12: no wt-ghost window" \
+    bash -c '! echo "$1" | grep -qx "wt-ghost"' -- "$t12_windows"
+
+  # Verify exactly 2 windows (main + wt-present, NOT wt-ghost)
+  local t12_count
+  t12_count="$(echo "$t12_windows" | wc -l | tr -d ' ')"
+  _t_check "T12: exactly 2 windows created" test "$t12_count" -eq 2
+
+  tmux kill-session -t "$t12_session" 2>/dev/null || true
+  (cd "$lt_root" && "$BASH" "$0" delete wt-present 2>/dev/null) || true
+  # Prune the ghost worktree from git's registry
+  git -C "$lt_root" worktree prune 2>/dev/null || true
+
   fi  # end: command -v tmux
 
   # ── Section: regression tests for previously-fixed bugs ─────────────────
@@ -3964,6 +4449,99 @@ NOTES
   _t_check "B10b: main/ created in spaced path"   test -d "$b10b_dir/main"
   _t_check "B10b: README.md moved into main/"     test -f "$b10b_dir/main/README.md"
   rm -rf "$(dirname "$b10b_dir")" || true
+
+  # ── Section: TM — tmux session name sanitisation ─────────────────────────
+  # Bug: '.' and ':' in a project directory name are tmux target-syntax
+  # separators (session:window.pane). Using them raw in -t arguments causes
+  # every tmux call to fail with "can't find pane: <suffix>".
+  # Fix: replace both characters with '-' when deriving SESSION_NAME.
+
+  _section "TM1 — session name: period sanitised to hyphen"
+  _t_check "TM1: period replaced with hyphen" \
+    test "$(_tmux_session_name "clank.sh")" = "clank-sh"
+
+  _section "TM2 — session name: colon sanitised to hyphen"
+  _t_check "TM2: colon replaced with hyphen" \
+    test "$(_tmux_session_name "foo:bar")" = "foo-bar"
+
+  _section "TM3 — session name: mixed dots and colons sanitised"
+  _t_check "TM3: all separators replaced" \
+    test "$(_tmux_session_name "a.b:c.d")" = "a-b-c-d"
+
+  _section "TM4 — session name: plain names pass through unchanged"
+  _t_check "TM4: plain name unchanged" \
+    test "$(_tmux_session_name "my-project")" = "my-project"
+
+  if command -v tmux &>/dev/null; then
+
+  _section "TM5 — launch: dotted project directory opens tmux session"
+  # init a bare worktree in a directory whose name contains a period,
+  # then launch and verify the session was created with a sanitised name.
+  local tm5_parent tm5_root tm5_session
+  tm5_parent="$(mktemp -d)"
+  tm5_root="${tm5_parent}/clank.sh"
+  tm5_session="clank-sh"   # expected sanitised name
+
+  ( "$BASH" "$0" init "$tm5_root" &>/dev/null ) || true
+  _t_check "TM5: bare repo created" test -d "$tm5_root/.bare"
+
+  (cd "$tm5_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" launch main &>/dev/null) || true
+
+  _t_check "TM5: tmux session exists with sanitised name" \
+    tmux has-session -t "$tm5_session"
+
+  # Verify the raw dotted name was NOT used (it would have been stored as
+  # clank_sh by tmux, which is distinct from clank-sh).
+  _t_check "TM5: raw dotted name not used as session" \
+    bash -c '! tmux has-session -t "clank_sh" 2>/dev/null'
+
+  tmux kill-session -t "$tm5_session" 2>/dev/null || true
+  rm -rf "$tm5_parent" || true
+
+  _section "TM6 — review dispatch: dotted project dir session found correctly"
+  # Create a bare worktree in a dotted directory, create a live tmux session
+  # with the sanitised name, write review notes, and verify dispatch finds it.
+  local tm6_parent tm6_root tm6_wt tm6_session
+  tm6_parent="$(mktemp -d)"
+  tm6_root="${tm6_parent}/my.proj"
+  tm6_session="my-proj"
+  tm6_wt="${tm6_root}/main"
+
+  ( "$BASH" "$0" init "$tm6_root" &>/dev/null ) || true
+
+  tmux new-session -d -s "$tm6_session" -n "main" -c "$tm6_wt" -x 220 -y 50 2>/dev/null || true
+  local tm6_pane
+  tm6_pane="$(tmux list-panes -t "$tm6_session:main" -F '#{pane_id}' | head -1)"
+  tmux send-keys -t "$tm6_pane" "cat" Enter 2>/dev/null || true
+
+  mkdir -p "$tm6_wt/.agents/plans" || true
+  printf "### \`src/X.scala\` line 1 -- 2026-01-01 00:00\nFix it.\n\n" \
+    > "$tm6_wt/.agents/plans/review-notes.md"
+
+  local tm6_dispatch_exit
+  tm6_dispatch_exit="$( (cd "$tm6_wt" && "$BASH" "$0" review dispatch &>/dev/null); echo $? )"
+  sleep 0.3
+
+  local tm6_content
+  tm6_content="$(tmux capture-pane -t "$tm6_pane" -p 2>/dev/null)"
+
+  _t_check "TM6: dispatch exits 0"                   test "$tm6_dispatch_exit" -eq 0
+  _t_grep  "TM6: pane received handoff message"      "zproj-review-"  echo "$tm6_content"
+  _t_check "TM6: notes file deleted after dispatch"  \
+    test ! -f "$tm6_wt/.agents/plans/review-notes.md"
+
+  tmux kill-session -t "$tm6_session" 2>/dev/null || true
+  rm -rf "$tm6_parent" || true
+
+  else
+    _t_skip "TM5: tmux not installed"
+    _t_skip "TM5: (skipped)"
+    _t_skip "TM5: (skipped)"
+    _t_skip "TM6: tmux not installed"
+    _t_skip "TM6: (skipped)"
+    _t_skip "TM6: (skipped)"
+    _t_skip "TM6: (skipped)"
+  fi
 
   # ── Section: S3 — upgrade rollback restores repo ─────────────────────────
   # Bug: &&/|| precedence in step 9 rollback could silently swallow mv failures.
@@ -4673,6 +5251,100 @@ NOTES
   _t_check "SK8: no editor section in output" \
     bash -c '! echo "$1" | grep -q "zproj review dispatch"' -- "$sk8_out"
   rm -rf "$sk8_src" "$sk8_home" || true
+
+  _section "OL1 — integrate --only skills,rules --plan: shows skills+rules, no editor prompt"
+  local ol1_src ol1_home ol1_out
+  ol1_src="$(mktemp -d)"
+  ol1_home="$(mktemp -d)"
+  mkdir -p "$ol1_src/skills/mytool"
+  printf '%s\n' '---' 'name: mytool' 'description: test' '---' '# Mytool' \
+    > "$ol1_src/skills/mytool/SKILL.md"
+  cp "$0" "$ol1_src/zproj"
+  ol1_out="$(CODING_AGENT=opencode HOME="$ol1_home" "$BASH" "$ol1_src/zproj" \
+    integrate --only skills,rules --plan 2>/dev/null)" || true
+  _t_grep  "OL1: shows skills section"        "Skills"              echo "$ol1_out"
+  _t_grep  "OL1: shows instructions section"  "Instructions"        echo "$ol1_out"
+  _t_check "OL1: no editor prompt in output" \
+    bash -c '! echo "$1" | grep -q "zproj review dispatch"' -- "$ol1_out"
+  rm -rf "$ol1_src" "$ol1_home" || true
+
+  _section "OL2 — integrate --only skills --plan: shows skills, no rules, no editor prompt"
+  local ol2_src ol2_home ol2_out
+  ol2_src="$(mktemp -d)"
+  ol2_home="$(mktemp -d)"
+  mkdir -p "$ol2_src/skills/mytool"
+  printf '%s\n' '---' 'name: mytool' 'description: test' '---' '# Mytool' \
+    > "$ol2_src/skills/mytool/SKILL.md"
+  cp "$0" "$ol2_src/zproj"
+  ol2_out="$(CODING_AGENT=opencode HOME="$ol2_home" "$BASH" "$ol2_src/zproj" \
+    integrate --only skills --plan 2>/dev/null)" || true
+  _t_grep  "OL2: shows skills section"          "Skills"              echo "$ol2_out"
+  _t_check "OL2: no instructions section" \
+    bash -c '! echo "$1" | grep -q "^Instructions:"' -- "$ol2_out"
+  _t_check "OL2: no editor prompt in output" \
+    bash -c '! echo "$1" | grep -q "zproj review dispatch"' -- "$ol2_out"
+  rm -rf "$ol2_src" "$ol2_home" || true
+
+  _section "OL3 — integrate --only rules --plan: shows rules, no skills, no editor prompt"
+  local ol3_src ol3_home ol3_out
+  ol3_src="$(mktemp -d)"
+  ol3_home="$(mktemp -d)"
+  mkdir -p "$ol3_src/skills/mytool"
+  printf '%s\n' '---' 'name: mytool' 'description: test' '---' '# Mytool' \
+    > "$ol3_src/skills/mytool/SKILL.md"
+  cp "$0" "$ol3_src/zproj"
+  ol3_out="$(CODING_AGENT=opencode HOME="$ol3_home" "$BASH" "$ol3_src/zproj" \
+    integrate --only rules --plan 2>/dev/null)" || true
+  _t_grep  "OL3: shows instructions section"    "Instructions"        echo "$ol3_out"
+  _t_check "OL3: no skills section" \
+    bash -c '! echo "$1" | grep -q "^Skills:"' -- "$ol3_out"
+  _t_check "OL3: no editor prompt in output" \
+    bash -c '! echo "$1" | grep -q "zproj review dispatch"' -- "$ol3_out"
+  rm -rf "$ol3_src" "$ol3_home" || true
+
+  _section "OL4 — integrate --only editor --plan: shows editor prompt, no skills/rules sections"
+  local ol4_out
+  ol4_out="$(CODING_AGENT=opencode "$BASH" "$0" integrate --only editor --plan 2>/dev/null)" || true
+  _t_grep  "OL4: contains editor prompt"   "zproj review dispatch"  echo "$ol4_out"
+  _t_check "OL4: no skills section" \
+    bash -c '! echo "$1" | grep -q "^Skills:"' -- "$ol4_out"
+  _t_check "OL4: no instructions section" \
+    bash -c '! echo "$1" | grep -q "^Instructions:"' -- "$ol4_out"
+
+  _section "OL5 — integrate --only with unknown component: exits non-zero"
+  local ol5_exit
+  ol5_exit="$(_zproj_exit integrate --only badvalue --plan)"
+  _t_check "OL5: exits non-zero for unknown component" test "$ol5_exit" -ne 0
+
+  _section "OL6 — integrate --skills-only --plan: deprecated alias behaves like --only skills,rules"
+  local ol6_src ol6_home ol6_out
+  ol6_src="$(mktemp -d)"
+  ol6_home="$(mktemp -d)"
+  mkdir -p "$ol6_src/skills/mytool"
+  printf '%s\n' '---' 'name: mytool' 'description: test' '---' '# Mytool' \
+    > "$ol6_src/skills/mytool/SKILL.md"
+  cp "$0" "$ol6_src/zproj"
+  ol6_out="$(CODING_AGENT=opencode HOME="$ol6_home" "$BASH" "$ol6_src/zproj" \
+    integrate --skills-only --plan 2>/dev/null)" || true
+  _t_grep  "OL6: shows skills section"       "Skills"      echo "$ol6_out"
+  _t_grep  "OL6: shows instructions section" "Instructions" echo "$ol6_out"
+  _t_check "OL6: no editor prompt in output" \
+    bash -c '! echo "$1" | grep -q "zproj review dispatch"' -- "$ol6_out"
+  rm -rf "$ol6_src" "$ol6_home" || true
+
+  _section "OL7 — integrate --only skills,rules: installs skills to disk, no editor"
+  local ol7_src ol7_home ol7_target
+  ol7_src="$(mktemp -d)"
+  ol7_home="$(mktemp -d)"
+  ol7_target="${ol7_home}/.config/opencode/skills"
+  mkdir -p "$ol7_src/skills/mytool"
+  printf '%s\n' '---' 'name: mytool' 'description: test' '---' '# Mytool' \
+    > "$ol7_src/skills/mytool/SKILL.md"
+  cp "$0" "$ol7_src/zproj"
+  CODING_AGENT=opencode HOME="$ol7_home" "$BASH" "$ol7_src/zproj" \
+    integrate --only skills,rules &>/dev/null || true
+  _t_check "OL7: SKILL.md installed to disk" test -f "${ol7_target}/mytool/SKILL.md"
+  rm -rf "$ol7_src" "$ol7_home" || true
 
   # ── Section: IN — global instructions file mapping ───────────────────────
 
