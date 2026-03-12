@@ -1626,14 +1626,14 @@ cmd_open() {
     elif [[ "$_line" == "bare" ]];       then _op_branch="(bare)"
     elif [[ "$_line" == "detached" ]];   then _op_branch=""
     elif [[ -z "$_line" && -n "$_op_path" ]]; then
-      if [[ "$_op_branch" != "(bare)" ]]; then
+      if [[ "$_op_branch" != "(bare)" && -d "$_op_path" ]]; then
         all_wts+=("$(basename "$_op_path")")
       fi
       _op_path="" _op_branch=""
     fi
   done < <(git -C "$root" worktree list --porcelain 2>/dev/null)
   # Handle last entry (porcelain output may not end with a blank line)
-  if [[ -n "$_op_path" && "$_op_branch" != "(bare)" ]]; then
+  if [[ -n "$_op_path" && "$_op_branch" != "(bare)" && -d "$_op_path" ]]; then
     all_wts+=("$(basename "$_op_path")")
   fi
 
@@ -4105,6 +4105,58 @@ NOTES
   tmux kill-session -t "$t11_session" 2>/dev/null || true
   (cd "$lt_root" && "$BASH" "$0" delete wt-old 2>/dev/null) || true
   (cd "$lt_root" && "$BASH" "$0" delete wt-new 2>/dev/null) || true
+
+  # ── T12: cmd_open skips worktrees whose directory doesn't exist ──────────
+
+  _section "T12 — cmd_open: skips registered worktrees with no directory on disk"
+
+  # Create two additional worktrees alongside main
+  (cd "$lt_root" && "$BASH" "$0" create wt-present 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$0" create wt-ghost 2>/dev/null) || true
+
+  _t_check "T12: wt-present/ exists"  test -d "$lt_root/wt-present"
+  _t_check "T12: wt-ghost/ exists"    test -d "$lt_root/wt-ghost"
+
+  # Remove the directory WITHOUT git worktree remove — leaves it registered
+  # in git but with no directory on disk (the "non-materialized" case).
+  rm -rf "$lt_root/wt-ghost"
+  _t_check "T12: wt-ghost/ removed from disk"  test ! -d "$lt_root/wt-ghost"
+
+  # Verify git still lists wt-ghost as a registered worktree
+  _t_grep "T12: wt-ghost still in git worktree list" \
+    "wt-ghost" git -C "$lt_root" worktree list
+
+  local t12_session
+  t12_session="$(basename "$lt_root")"
+  tmux kill-session -t "$t12_session" 2>/dev/null || true
+
+  # Run cmd_open — should succeed and NOT error about wt-ghost
+  local t12_out t12_exit
+  t12_exit=0
+  t12_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1)" || t12_exit=$?
+
+  _t_check "T12: cmd_open exits successfully" test "$t12_exit" -eq 0
+  _t_check "T12: no error about wt-ghost" \
+    bash -c '! echo "$1" | grep -q "does not exist"' -- "$t12_out"
+
+  # Verify windows were created only for materialized worktrees
+  local t12_windows
+  t12_windows="$(tmux list-windows -t "$t12_session" -F '#{window_name}' 2>/dev/null)"
+
+  _t_grep  "T12: main window exists"        "^main$"        echo "$t12_windows"
+  _t_grep  "T12: wt-present window exists"   "^wt-present$"  echo "$t12_windows"
+  _t_check "T12: no wt-ghost window" \
+    bash -c '! echo "$1" | grep -qx "wt-ghost"' -- "$t12_windows"
+
+  # Verify exactly 2 windows (main + wt-present, NOT wt-ghost)
+  local t12_count
+  t12_count="$(echo "$t12_windows" | wc -l | tr -d ' ')"
+  _t_check "T12: exactly 2 windows created" test "$t12_count" -eq 2
+
+  tmux kill-session -t "$t12_session" 2>/dev/null || true
+  (cd "$lt_root" && "$BASH" "$0" delete wt-present 2>/dev/null) || true
+  # Prune the ghost worktree from git's registry
+  git -C "$lt_root" worktree prune 2>/dev/null || true
 
   fi  # end: command -v tmux
 
