@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.9.6"
+readonly VERSION="4.10.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -73,9 +73,14 @@ _hint_next_steps() {
 }
 
 # Switch to or attach a tmux session, respecting ZPROJ_TEST_NO_ATTACH.
+# Skipped when _ZPROJ_DEFER_ATTACH is set (used by cmd_open to batch-launch
+# all worktree windows before attaching once at the end).
 # $1 = session name
 _tmux_attach_or_switch() {
   local session="$1"
+  if [[ -n "${_ZPROJ_DEFER_ATTACH:-}" ]]; then
+    return 0
+  fi
   if [[ -z "${ZPROJ_TEST_NO_ATTACH:-}" ]]; then
     if [[ -n "${TMUX:-}" ]]; then
       tmux switch-client -t "$session"
@@ -286,8 +291,19 @@ _resolve_editor_source() {
   fi
 }
 
+# Common directories where coding agents are installed.  Checked as a
+# fallback when the agent binary is not in the current PATH — this covers
+# post-restart environments where PATH is incomplete (e.g. Homebrew not
+# yet in PATH when tmux server starts before the shell profile runs).
+readonly _AGENT_FALLBACK_DIRS=(
+  /opt/homebrew/bin
+  /usr/local/bin
+  "$HOME/.local/bin"
+)
+
 # Resolve the coding agent command to use in pane 1.
-# Resolution order: $CODING_AGENT → auto-discover → empty string (graceful no-op)
+# Resolution order: $CODING_AGENT → auto-discover (PATH then fallback dirs)
+#                   → empty string (graceful no-op)
 # Prints the resolved command string to stdout, or empty string if none found.
 _resolve_ai() {
   # Explicit override — must exist as a command
@@ -301,13 +317,29 @@ _resolve_ai() {
     fi
   fi
 
-  # Auto-discover from known terminal coding agents
+  # Auto-discover from known terminal coding agents — search PATH first
   local agent
   for agent in "${_KNOWN_AGENTS[@]}"; do
     if command -v "$agent" &>/dev/null; then
       echo "$agent"
       return 0
     fi
+  done
+
+  # Fallback: check well-known installation directories that may not be
+  # in the current PATH (e.g. after a system restart, brew upgrade, etc.).
+  # Preserves the same priority order as _KNOWN_AGENTS.
+  local dir candidate
+  for agent in "${_KNOWN_AGENTS[@]}"; do
+    for dir in "${_AGENT_FALLBACK_DIRS[@]}"; do
+      candidate="$dir/$agent"
+      if [[ -x "$candidate" ]]; then
+        warn "Found '${agent}' at ${candidate} (not in PATH)."
+        warn "Add '${dir}' to your PATH for reliable auto-discovery."
+        echo "$candidate"
+        return 0
+      fi
+    done
   done
 
   # Nothing found — graceful no-op
@@ -1583,10 +1615,8 @@ cmd_open() {
     return
   fi
 
-  # Collect all worktree names, preferring main/master as the first one
-  # launched (it creates the tmux session; subsequent launches add windows).
-  local first_wt=""
-  local -a other_wts=()
+  # Collect all non-bare worktree names.
+  local -a all_wts=()
   local _op_path="" _op_branch=""
   while IFS= read -r _line; do
     if   [[ "$_line" == "worktree "* ]]; then _op_path="${_line#worktree }"
@@ -1594,46 +1624,83 @@ cmd_open() {
     elif [[ "$_line" == "branch "* ]];   then
       _op_branch="${_line#branch }"; _op_branch="${_op_branch#refs/heads/}"
     elif [[ "$_line" == "bare" ]];       then _op_branch="(bare)"
+    elif [[ "$_line" == "detached" ]];   then _op_branch=""
     elif [[ -z "$_line" && -n "$_op_path" ]]; then
       if [[ "$_op_branch" != "(bare)" ]]; then
-        local _op_name; _op_name="$(basename "$_op_path")"
-        if [[ "$_op_name" == "main" || "$_op_name" == "master" ]]; then
-          # main/master always goes first; demote any previous first_wt
-          [[ -n "$first_wt" ]] && other_wts+=("$first_wt")
-          first_wt="$_op_name"
-        elif [[ -z "$first_wt" ]]; then
-          first_wt="$_op_name"
-        else
-          other_wts+=("$_op_name")
-        fi
+        all_wts+=("$(basename "$_op_path")")
       fi
       _op_path="" _op_branch=""
     fi
   done < <(git -C "$root" worktree list --porcelain 2>/dev/null)
   # Handle last entry (porcelain output may not end with a blank line)
   if [[ -n "$_op_path" && "$_op_branch" != "(bare)" ]]; then
-    local _op_name; _op_name="$(basename "$_op_path")"
-    if [[ "$_op_name" == "main" || "$_op_name" == "master" ]]; then
-      [[ -n "$first_wt" ]] && other_wts+=("$first_wt")
-      first_wt="$_op_name"
-    elif [[ -z "$first_wt" ]]; then
-      first_wt="$_op_name"
-    else
-      other_wts+=("$_op_name")
-    fi
+    all_wts+=("$(basename "$_op_path")")
   fi
 
-  if [[ -z "$first_wt" ]]; then
+  if [[ ${#all_wts[@]} -eq 0 ]]; then
     die "No worktrees found. Create one first:\n  ${CYAN}$SCRIPT_NAME main${RESET}"
   fi
 
-  # Launch the first worktree (creates the tmux session), then all others
-  # (each adds a window to the existing session).
+  # Sort worktrees: main/master first (creates the tmux session), then
+  # remaining worktrees ordered by modification time (most recent first)
+  # so the most actively-used branches appear as the leftmost windows.
+  local first_wt=""
+  local -a other_wts=()
+  local _wt
+  for _wt in "${all_wts[@]}"; do
+    if [[ "$_wt" == "main" || "$_wt" == "master" ]]; then
+      [[ -n "$first_wt" ]] && other_wts+=("$first_wt")
+      first_wt="$_wt"
+    else
+      other_wts+=("$_wt")
+    fi
+  done
+  # If no main/master, promote the first collected worktree
+  if [[ -z "$first_wt" && ${#other_wts[@]} -gt 0 ]]; then
+    first_wt="${other_wts[0]}"
+    other_wts=("${other_wts[@]:1}")
+  fi
+
+  # Sort other_wts by directory mtime (most recent first).
+  # Use stat -f %m (macOS) with sort -rn, falling back to ls -t.
+  if [[ ${#other_wts[@]} -gt 1 ]]; then
+    local -a _sorted_wts=()
+    local _sw
+    while IFS= read -r _sw; do
+      [[ -n "$_sw" ]] && _sorted_wts+=("$_sw")
+    done < <(
+      for _wt in "${other_wts[@]}"; do
+        local _d="$root/$_wt"
+        local _mtime=0
+        if [[ -d "$_d" ]]; then
+          # macOS stat: -f %m gives epoch seconds
+          _mtime="$(stat -f %m "$_d" 2>/dev/null)" || \
+          _mtime="$(stat -c %Y "$_d" 2>/dev/null)" || _mtime=0
+        fi
+        printf '%s\t%s\n' "$_mtime" "$_wt"
+      done | sort -t$'\t' -k1,1rn | cut -f2
+    )
+    if [[ ${#_sorted_wts[@]} -gt 0 ]]; then
+      other_wts=("${_sorted_wts[@]}")
+    fi
+  fi
+
+  # Defer attach/switch during the batch launch so that all windows are
+  # created before the terminal is handed to tmux.  Without this, the first
+  # cmd_launch call would block on `tmux attach` (outside tmux) and the
+  # remaining worktrees would never get windows.
+  _ZPROJ_DEFER_ATTACH=1
+
   cmd_launch "$first_wt"
   local _ow
   for _ow in "${other_wts[@]+"${other_wts[@]}"}"; do
     cmd_launch "$_ow"
   done
+
+  unset _ZPROJ_DEFER_ATTACH
+
+  # Now attach/switch once — all windows are ready.
+  _tmux_attach_or_switch "$session_name"
 }
 
 # ─── Default action (upsert + launch) ────────────────────────────────────────
@@ -3521,11 +3588,27 @@ STUB
 
   _section "A5 — agent: graceful no-op when nothing installed"
   local a5 a5_warn
-  # Temporarily shadow PATH with only /usr/bin so no agents are found
-  a5="$(CODING_AGENT="" PATH="/usr/bin:/bin" _resolve_ai 2>/dev/null)"
-  a5_warn="$(CODING_AGENT="" PATH="/usr/bin:/bin" _resolve_ai 2>&1 1>/dev/null)" || true
+  # Shadow PATH and use an empty fallback dir so no agents are found.
+  local a5_empty_dir a5_script
+  a5_empty_dir="$(mktemp -d)"
+  a5_script="$(mktemp)"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    echo "RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; DIM=''; RESET=''"
+    echo "die() { echo \"error: \$*\" >&2; exit 1; }"
+    echo "warn() { echo \"warn: \$*\" >&2; }"
+    echo "_KNOWN_AGENTS=(opencode claude codex amp aider goose gemini)"
+    echo "_AGENT_FALLBACK_DIRS=(\"$a5_empty_dir\")"
+    sed -n '/^_resolve_ai()/,/^}/p' "$0"
+    echo 'CODING_AGENT="" _resolve_ai'
+  } > "$a5_script"
+  chmod +x "$a5_script"
+  a5="$(PATH="/usr/bin:/bin" "$BASH" "$a5_script" 2>/dev/null)" || true
+  a5_warn="$(PATH="/usr/bin:/bin" "$BASH" "$a5_script" 2>&1 1>/dev/null)" || true
   _t_check "returns empty string (no die)"   test -z "$a5"
   _t_grep  "prints warning about no agent"   "No coding agent"  echo "$a5_warn"
+  rm -rf "$a5_empty_dir" "$a5_script" || true
 
   _section "A6 — --env runs without error"
   local env_exit
@@ -3537,6 +3620,61 @@ STUB
   env_out="$(CODING_AGENT=opencode cmd_env 2>/dev/null)"
   _t_grep "--env shows agent name"  "opencode"       echo "$env_out"
   _t_grep "--env shows source tag"  "CODING_AGENT"   echo "$env_out"
+
+  _section "A8 — agent: fallback dirs find agent not in PATH"
+  # Create a fake agent binary in a temp dir (simulating /opt/homebrew/bin)
+  # and verify _resolve_ai finds it via fallback when PATH doesn't include it.
+  local a8_fallback_dir a8_script
+  a8_fallback_dir="$(mktemp -d)"
+  printf '#!/bin/sh\necho "fake opencode"\n' > "$a8_fallback_dir/opencode"
+  chmod +x "$a8_fallback_dir/opencode"
+  a8_script="$(mktemp)"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    # Stub colour/output helpers
+    echo "RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; DIM=''; RESET=''"
+    echo "die() { echo \"error: \$*\" >&2; exit 1; }"
+    echo "warn() { echo \"warn: \$*\" >&2; }"
+    echo "_KNOWN_AGENTS=(opencode claude codex amp aider goose gemini)"
+    echo "_AGENT_FALLBACK_DIRS=(\"$a8_fallback_dir\")"
+    # Extract _resolve_ai
+    sed -n '/^_resolve_ai()/,/^}/p' "$0"
+    echo 'CODING_AGENT="" _resolve_ai'
+  } > "$a8_script"
+  chmod +x "$a8_script"
+  local a8_result a8_warn
+  a8_result="$(PATH="/usr/bin:/bin" "$BASH" "$a8_script" 2>/dev/null)" || true
+  a8_warn="$(PATH="/usr/bin:/bin" "$BASH" "$a8_script" 2>&1 1>/dev/null)" || true
+  _t_check "A8: finds opencode via fallback dir"    test "$a8_result" = "$a8_fallback_dir/opencode"
+  _t_grep  "A8: warns about not in PATH"            "not in PATH"  echo "$a8_warn"
+  rm -rf "$a8_fallback_dir" "$a8_script" || true
+
+  _section "A9 — agent: fallback respects priority order (opencode before claude)"
+  # Both opencode and claude exist in fallback dir; opencode should win.
+  local a9_fallback_dir a9_script
+  a9_fallback_dir="$(mktemp -d)"
+  printf '#!/bin/sh\necho "fake opencode"\n' > "$a9_fallback_dir/opencode"
+  printf '#!/bin/sh\necho "fake claude"\n' > "$a9_fallback_dir/claude"
+  chmod +x "$a9_fallback_dir/opencode" "$a9_fallback_dir/claude"
+  a9_script="$(mktemp)"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    echo "RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; DIM=''; RESET=''"
+    echo "die() { echo \"error: \$*\" >&2; exit 1; }"
+    echo "warn() { echo \"warn: \$*\" >&2; }"
+    echo "_KNOWN_AGENTS=(opencode claude codex amp aider goose gemini)"
+    echo "_AGENT_FALLBACK_DIRS=(\"$a9_fallback_dir\")"
+    sed -n '/^_resolve_ai()/,/^}/p' "$0"
+    echo 'CODING_AGENT="" _resolve_ai'
+  } > "$a9_script"
+  chmod +x "$a9_script"
+  local a9_result
+  a9_result="$(PATH="/usr/bin:/bin" "$BASH" "$a9_script" 2>/dev/null)" || true
+  _t_check "A9: opencode wins over claude in fallback" \
+    test "$a9_result" = "$a9_fallback_dir/opencode"
+  rm -rf "$a9_fallback_dir" "$a9_script" || true
 
   fi  # end: command -v opencode
 
@@ -3897,6 +4035,76 @@ NOTES
   # Clean up the extra worktrees
   (cd "$lt_root" && "$BASH" "$0" delete feature-a 2>/dev/null) || true
   (cd "$lt_root" && "$BASH" "$0" delete feature-b 2>/dev/null) || true
+
+  # ── T10: cmd_open defers attach (does not block after first window) ──────
+
+  _section "T10 — cmd_open: defers attach until all windows are created"
+
+  # Recreate worktrees for this test
+  (cd "$lt_root" && "$BASH" "$0" create wt-alpha 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$0" create wt-beta 2>/dev/null) || true
+
+  local t10_session
+  t10_session="$(basename "$lt_root")"
+  tmux kill-session -t "$t10_session" 2>/dev/null || true
+
+  # Run cmd_open with TMUX="" (simulating outside-tmux invocation).
+  # If _ZPROJ_DEFER_ATTACH works correctly, all windows are created before
+  # any attach call.  ZPROJ_TEST_NO_ATTACH suppresses the final attach so
+  # the test doesn't block, but the intermediate launches must NOT attach
+  # (that's the bug this tests).
+  local t10_out
+  t10_out="$(cd "$lt_root" && TMUX="" ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1 || true)"
+
+  local t10_windows
+  t10_windows="$(tmux list-windows -t "$t10_session" -F '#{window_name}' 2>/dev/null)"
+
+  _t_grep  "T10: main window exists"      "^main$"       echo "$t10_windows"
+  _t_grep  "T10: wt-alpha window exists"   "^wt-alpha$"   echo "$t10_windows"
+  _t_grep  "T10: wt-beta window exists"    "^wt-beta$"    echo "$t10_windows"
+
+  local t10_count
+  t10_count="$(echo "$t10_windows" | wc -l | tr -d ' ')"
+  _t_check "T10: exactly 3 windows created" test "$t10_count" -eq 3
+
+  tmux kill-session -t "$t10_session" 2>/dev/null || true
+  (cd "$lt_root" && "$BASH" "$0" delete wt-alpha 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$0" delete wt-beta 2>/dev/null) || true
+
+  # ── T11: cmd_open orders worktrees by mtime (most recent first) ──────────
+
+  _section "T11 — cmd_open: orders non-main worktrees by mtime (recent first)"
+
+  (cd "$lt_root" && "$BASH" "$0" create wt-old 2>/dev/null) || true
+  sleep 1
+  (cd "$lt_root" && "$BASH" "$0" create wt-new 2>/dev/null) || true
+  # Touch wt-new to ensure its mtime is newer
+  touch "$lt_root/wt-new" 2>/dev/null || true
+
+  local t11_session
+  t11_session="$(basename "$lt_root")"
+  tmux kill-session -t "$t11_session" 2>/dev/null || true
+
+  local t11_out
+  t11_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1 || true)"
+
+  # Windows are listed in creation order (which reflects launch order).
+  # main must be first; wt-new (more recent mtime) before wt-old.
+  local t11_windows
+  t11_windows="$(tmux list-windows -t "$t11_session" -F '#{window_name}' 2>/dev/null)"
+
+  # Extract window positions (1-indexed)
+  local t11_main_pos t11_new_pos t11_old_pos
+  t11_main_pos="$(echo "$t11_windows" | grep -n '^main$' | head -1 | cut -d: -f1)" || t11_main_pos=0
+  t11_new_pos="$(echo "$t11_windows" | grep -n '^wt-new$' | head -1 | cut -d: -f1)" || t11_new_pos=0
+  t11_old_pos="$(echo "$t11_windows" | grep -n '^wt-old$' | head -1 | cut -d: -f1)" || t11_old_pos=0
+
+  _t_check "T11: main is first window"         test "$t11_main_pos" -eq 1
+  _t_check "T11: wt-new comes before wt-old"   test "$t11_new_pos" -lt "$t11_old_pos"
+
+  tmux kill-session -t "$t11_session" 2>/dev/null || true
+  (cd "$lt_root" && "$BASH" "$0" delete wt-old 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$0" delete wt-new 2>/dev/null) || true
 
   fi  # end: command -v tmux
 
