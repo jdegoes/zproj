@@ -20,6 +20,7 @@ zproj --help       # all subcommands
 Before every commit:
 1. Bump `readonly VERSION=` — patch (x.y.Z) for fixes, minor (x.Y.0) for features
 2. Run `zproj --test` — done when output says `All N tests passed (0 skipped)`
+3. Update `README.md` to reflect any user-facing changes (new commands, changed options, modified behaviour)
 
 ## Code Conventions
 
@@ -92,6 +93,16 @@ Most tmux behaviours *can* be tested via `tmux list-panes`, `tmux list-windows`,
 3. Add tests in P/V/RC/D sections
 4. Run `zproj --test`
 
+### Shipping a change ("ship it")
+
+1. Bump `VERSION` if not already bumped
+2. Run `zproj --test`, fix failures
+3. Update `README.md` for user-facing changes
+4. Verify `AGENTS.md` is factually correct
+5. `git add && git commit` with clear message
+6. `git push` and open PR with good description
+7. Fix CI failures, address valid feedback
+
 ## Do Not
 
 - Create additional source files
@@ -99,7 +110,7 @@ Most tmux behaviours *can* be tested via `tmux list-panes`, `tmux list-windows`,
 - Use `die` inside a function that needs cleanup — use `_err` + `return 1`
 - Edit `zproj` via a symlink — edit in the worktree directory
 - Add comments restating what code does — only explain *why*
-- Modify `README.md`, `skills/`, or `rules/` unless asked
+- Modify `skills/` or `rules/` unless asked
 
 ## When Stuck
 
