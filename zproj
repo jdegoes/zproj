@@ -2765,48 +2765,6 @@ PROMPT
 # Install ck and cqs if not already present.
 # With dry_run=true: prints what would be run without executing anything.
 # Picks the best available installer: npm preferred for ck, cargo for cqs.
-_integrate_install_tools() {
-  local dry_run="${1:-false}"
-  local has_npm has_cargo
-  command -v npm   &>/dev/null && has_npm=true   || has_npm=false
-  command -v cargo &>/dev/null && has_cargo=true || has_cargo=false
-
-  # ── ck ──────────────────────────────────────────────────────────────────
-  if command -v ck &>/dev/null; then
-    dim "  [installed]  ck  ($(command -v ck))"
-  elif $has_cargo; then
-    if $dry_run; then
-      echo "  [would install]  ck   →  cargo install ck-search"
-    else
-      step "  Installing ck via cargo..."
-      cargo install ck-search
-    fi
-  elif $has_npm; then
-    if $dry_run; then
-      echo "  [would install]  ck   →  npm install -g @beaconbay/ck-search"
-    else
-      step "  Installing ck via npm..."
-      npm install -g @beaconbay/ck-search
-    fi
-  else
-    warn "  ck not installed — install cargo (rustup.rs) or npm, then run: cargo install ck-search"
-  fi
-
-  # ── cqs ─────────────────────────────────────────────────────────────────
-  if command -v cqs &>/dev/null; then
-    dim "  [installed]  cqs  ($(command -v cqs))"
-  elif $has_cargo; then
-    if $dry_run; then
-      echo "  [would install]  cqs  →  cargo install cqs"
-    else
-      step "  Installing cqs via cargo..."
-      cargo install cqs
-    fi
-  else
-    warn "  cqs not installed — install cargo (rustup.rs), then run: cargo install cqs"
-  fi
-}
-
 cmd_integrate() {
   local plan_only=false
 
@@ -2826,11 +2784,6 @@ cmd_integrate() {
 
   if $plan_only; then
     _integrate_build_prompt
-    echo ""
-    echo -e "${BOLD}Dry run — no changes will be made:${RESET}"
-    echo ""
-    echo -e "${BOLD}Tools:${RESET}"
-    _integrate_install_tools true
     return 0
   fi
 
@@ -2852,12 +2805,6 @@ cmd_integrate() {
   if [[ -z "$ai_binary" ]]; then
     die "No coding agent found. Install one (opencode, claude, etc.) or set \$CODING_AGENT."
   fi
-
-  # Install tools
-  step "Installing tools..."
-  echo ""
-  _integrate_install_tools false
-  echo ""
 
   # Build and hand off the editor integration prompt to the agent
   step "Building editor integration plan..."
@@ -2919,8 +2866,8 @@ usage_integrate() {
 
 ${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan]
 
-  Installs ck and cqs if missing, then asks your coding agent to integrate
-  your editor with the zproj review workflow.
+  Asks your coding agent to integrate your editor with the zproj review
+  workflow.
 
   The editor integration prompt is assembled from facts zproj already knows
   (editor binary, agent binary, review notes path, zproj version) and
@@ -2934,13 +2881,8 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan]
     5. Explain how to test the result
 
 ${BOLD}Options:${RESET}
-  --plan                   Dry run: show what tools would be installed and
-                           print the editor prompt. Nothing runs.
-
-${BOLD}Tool installation:${RESET}
-  ck:   cargo install ck-search               (preferred)
-        npm install -g @beaconbay/ck-search   (fallback if no cargo)
-  cqs:  cargo install cqs
+  --plan                   Dry run: print the editor prompt without launching
+                           the agent. Nothing runs.
 
 ${BOLD}Environment:${RESET}
   ZPROJ_INTEGRATE_DELAY   Seconds to wait for agent TUI before sending the
@@ -2948,8 +2890,8 @@ ${BOLD}Environment:${RESET}
                           agent starts slowly.
 
 ${BOLD}Examples:${RESET}
-  $SCRIPT_NAME integrate              ${DIM}# install tools + editor integration${RESET}
-  $SCRIPT_NAME integrate --plan       ${DIM}# preview everything, write nothing${RESET}
+  $SCRIPT_NAME integrate              ${DIM}# launch agent with editor integration prompt${RESET}
+  $SCRIPT_NAME integrate --plan       ${DIM}# print the prompt without launching${RESET}
 
 EOF
 }
@@ -4769,75 +4711,6 @@ NOTES
     bash -c 'test -d "'"$b6_dir"'/master" || test -d "'"$b6_dir"'/main"'
 
   # ── Section: SK — skills integration ────────────────────────────────────
-
-  # SK10–SK12: Use small temp scripts to test helper functions in isolation.
-  # We can't call internal functions directly from the test runner (set -e context),
-  # so each test writes a tiny wrapper script and runs it via $BASH.
-
-  _section "SK10 — _integrate_install_tools: cargo preferred when both cargo and npm present"
-  local sk10_dir sk10_script sk10_out
-  sk10_dir="$(mktemp -d)"
-  # Fake PATH: cargo + npm present, ck + cqs absent
-  printf '#!/bin/sh\necho "1.0.0"\n' > "$sk10_dir/cargo"
-  printf '#!/bin/sh\necho "8.0.0"\n' > "$sk10_dir/npm"
-  chmod +x "$sk10_dir/cargo" "$sk10_dir/npm"
-  sk10_script="$sk10_dir/run"
-  {
-    echo "#!/usr/bin/env bash"
-    echo "dim() { :; }; step() { :; }; warn() { echo \"WARN: \$*\"; }"
-    sed -n '/^_integrate_install_tools()/,/^}/p' "$0"
-    echo 'PATH="'"$sk10_dir"'" _integrate_install_tools true'
-  } > "$sk10_script"
-  chmod +x "$sk10_script"
-  sk10_out="$("$BASH" "$sk10_script" 2>/dev/null)" || true
-  _t_grep "SK10: ck uses cargo (not npm)"         "cargo install ck-search"  echo "$sk10_out"
-  _t_grep "SK10: cqs uses cargo"                  "cargo install cqs"        echo "$sk10_out"
-  rm -rf "$sk10_dir" || true
-
-  _section "SK11 — _integrate_install_tools: falls back to npm for ck when no cargo"
-  local sk11_dir sk11_script sk11_out
-  sk11_dir="$(mktemp -d)"
-  # Fake PATH: npm present, cargo absent, ck + cqs absent
-  printf '#!/bin/sh\necho "8.0.0"\n' > "$sk11_dir/npm"
-  chmod +x "$sk11_dir/npm"
-  sk11_script="$sk11_dir/run"
-  {
-    echo "#!/usr/bin/env bash"
-    echo "dim() { :; }; step() { :; }; warn() { echo \"WARN: \$*\"; }"
-    sed -n '/^_integrate_install_tools()/,/^}/p' "$0"
-    echo 'PATH="'"$sk11_dir"'" _integrate_install_tools true'
-  } > "$sk11_script"
-  chmod +x "$sk11_script"
-  sk11_out="$("$BASH" "$sk11_script" 2>/dev/null)" || true
-  _t_grep "SK11: ck falls back to npm"            "npm install.*ck-search"   echo "$sk11_out"
-  _t_grep "SK11: cqs warns (no cargo)"            "WARN.*cqs"                echo "$sk11_out"
-  rm -rf "$sk11_dir" || true
-
-  _section "SK12 — _integrate_install_tools: shows [installed] when tools already present"
-  local sk12_dir sk12_script sk12_out
-  sk12_dir="$(mktemp -d)"
-  # Fake PATH: ck and cqs both present
-  printf '#!/bin/sh\necho "ck 0.7"\n'  > "$sk12_dir/ck"
-  printf '#!/bin/sh\necho "cqs 0.19"\n' > "$sk12_dir/cqs"
-  chmod +x "$sk12_dir/ck" "$sk12_dir/cqs"
-  sk12_script="$sk12_dir/run"
-  {
-    echo "#!/usr/bin/env bash"
-    echo "dim() { echo \"DIM: \$*\"; }; step() { :; }; warn() { :; }"
-    sed -n '/^_integrate_install_tools()/,/^}/p' "$0"
-    echo 'PATH="'"$sk12_dir"':$PATH" _integrate_install_tools true'
-  } > "$sk12_script"
-  chmod +x "$sk12_script"
-  sk12_out="$("$BASH" "$sk12_script" 2>/dev/null)" || true
-  _t_grep "SK12: ck shows installed"  "installed.*ck"  echo "$sk12_out"
-  _t_grep "SK12: cqs shows installed" "installed.*cqs" echo "$sk12_out"
-  rm -rf "$sk12_dir" || true
-
-  _section "SK7 — integrate --plan: contains editor prompt and tools dry-run"
-  local sk7_out
-  sk7_out="$(CODING_AGENT=opencode "$BASH" "$0" integrate --plan 2>/dev/null)" || true
-  _t_grep "SK7: contains editor mission section" "zproj review"                           echo "$sk7_out"
-  _t_grep "SK7: contains tools section"          "installed\|would install"               echo "$sk7_out"
 
   _section "TX1 — _tmux_config_path: returns XDG when it exists"
   local tx1_home tx1_xdg tx1_script tx1_result

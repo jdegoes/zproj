@@ -19,8 +19,8 @@ branches, and windows are created and torn down together as a unit.
 A built-in review workflow lets you annotate lines during a diff review and
 dispatch the collected notes to your coding agent for implementation.
 
-`zproj integrate` bootstraps a new machine in one command: installs `ck` and
-`cqs` code search tools and asks your coding agent to wire up your editor.
+`zproj integrate` asks your coding agent to wire up your editor with the
+review workflow.
 
 ## Requirements
 
@@ -39,13 +39,6 @@ One of the following coding agents is auto-discovered (or set `$CODING_AGENT`):
 
 One of the following editors is auto-discovered (or set `$ZPROJ_EDITOR`):  
 `$EDITOR`, `nvim`, `vim`
-
-**Optional** (used by `zproj integrate` to install tools):
-
-| Tool | Purpose |
-|------|---------|
-| cargo | Install `ck` and `cqs` (preferred) |
-| npm | Install `ck` if cargo is absent |
 
 ## Installation
 
@@ -150,11 +143,7 @@ The notes file is deleted after the temp file is safely written.
 
 `zproj integrate` bootstraps a new machine in one step:
 
-1. **Installs `ck`** — semantic code search (`cargo install ck-search`, or
-   `npm install -g @beaconbay/ck-search` if cargo is absent)
-2. **Installs `cqs`** — code intelligence and call graph analysis
-   (`cargo install cqs`)
-3. **Asks your coding agent** to implement the review workflow in your editor
+1. **Asks your coding agent** to implement the review workflow in your editor
    (add note / view / dispatch / clear), using the Neovim reference
    implementation as a concrete example
 
@@ -175,7 +164,7 @@ zproj delete <worktree-dir> [--force]       Remove worktree, branch, and window
 zproj launch <worktree-dir>                 Start or switch to tmux window
 zproj list [dir]                            Show worktrees with status
 zproj review <subcommand>                   Manage review notes (path/view/dispatch/clear)
-zproj integrate [--plan]                    Install tools and editor integration
+zproj integrate [--plan]                    Editor integration via coding agent
 zproj --env                                 Show resolved editor and coding agent
 zproj --diagnostics                         Check environment for problems
 zproj --test                                Run the built-in test suite
