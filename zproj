@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.11.0"
+readonly VERSION="4.12.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -1248,6 +1248,320 @@ cmd_delete() {
   info "Removed ${BOLD}${WORKTREE_NAME}${RESET}"
 }
 
+cmd_fork() {
+  local source="" target=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --help | -h)
+      usage_fork
+      exit 0
+      ;;
+    -*) die "Unknown option: $1." ;;
+    *)
+      if [[ -z "$source" ]]; then
+        source="$1"
+      elif [[ -z "$target" ]]; then
+        target="$1"
+      else
+        die "Too many arguments."
+      fi
+      ;;
+    esac
+    shift
+  done
+
+  # One arg: CWD is source, arg is target
+  # Two args: first is source, second is target
+  if [[ -z "$source" ]]; then
+    die "Usage: $SCRIPT_NAME fork <new-worktree>\n       $SCRIPT_NAME fork <source> <new-worktree>"
+  fi
+  if [[ -z "$target" ]]; then
+    target="$source"
+    source=""
+  fi
+
+  check_session_deps
+
+  # Resolve source worktree
+  local source_dir source_branch
+  if [[ -z "$source" ]]; then
+    # CWD must be inside a worktree
+    if ! _review_locate; then
+      die "Not inside a zproj worktree. Specify the source explicitly:\n  ${CYAN}$SCRIPT_NAME fork <source> <new-worktree>${RESET}"
+    fi
+    source_dir="$_REVIEW_WT_ROOT"
+    resolve_project_dir "$source_dir"
+  else
+    resolve_project_dir "$source"
+    source_dir="$PROJECT_DIR"
+  fi
+
+  [[ ! -d "$source_dir" ]] && die "Source worktree '$(basename "$source_dir")' does not exist."
+
+  if ! _git_is_registered_worktree "$PARENT_DIR" "$source_dir"; then
+    die "'$(basename "$source_dir")' is not a registered git worktree."
+  fi
+
+  source_branch="$(git -C "$source_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" || \
+    die "Could not determine branch for source worktree."
+
+  # Warn if source has uncommitted changes
+  if _git_is_dirty "$source_dir"; then
+    warn "Source worktree '$(basename "$source_dir")' has uncommitted changes."
+    warn "Only committed state will be forked."
+  fi
+
+  # Resolve target — reuse PARENT_DIR from source resolution
+  local target_dir="$PARENT_DIR/$target"
+  local target_name="$target"
+
+  [[ -d "$target_dir" ]] && die "Worktree '$target_name' already exists."
+
+  if ! git check-ref-format --branch "$target_name" &>/dev/null; then
+    die "Invalid worktree/branch name: '$target_name'."
+  fi
+
+  # Get source HEAD
+  local source_head
+  source_head="$(git -C "$source_dir" rev-parse HEAD 2>/dev/null)" || \
+    die "Could not determine HEAD of source worktree."
+
+  echo -e "Forking ${BOLD}$(basename "$source_dir")${RESET} → ${BOLD}${target_name}${RESET} at ${CYAN}${source_head:0:8}${RESET}..."
+
+  (cd "$PARENT_DIR" && git worktree add "$target_name" -b "$target_name" "$source_head" --quiet) || \
+    die "Failed to create worktree. Does the branch '$target_name' already exist?"
+
+  # Copy upstream tracking from source if it has one
+  local upstream
+  upstream="$(git -C "$source_dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)" || true
+  if [[ -n "$upstream" ]]; then
+    git -C "$target_dir" branch --set-upstream-to="$upstream" "$target_name" --quiet 2>/dev/null || true
+  fi
+
+  info "Forked ${BOLD}$(basename "$source_dir")${RESET} → ${BOLD}${target_name}${RESET}"
+
+  # Launch the new worktree window (use absolute path so it works from any CWD)
+  cmd_launch "$target_dir"
+}
+
+cmd_join() {
+  local source="" target=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --help | -h)
+      usage_join
+      exit 0
+      ;;
+    -*) die "Unknown option: $1." ;;
+    *)
+      if [[ -z "$source" ]]; then
+        source="$1"
+      elif [[ -z "$target" ]]; then
+        target="$1"
+      else
+        die "Too many arguments."
+      fi
+      ;;
+    esac
+    shift
+  done
+
+  # One arg: CWD is source, arg is target
+  # Two args: first is source, second is target
+  if [[ -z "$source" ]]; then
+    die "Usage: $SCRIPT_NAME join <target-worktree>\n       $SCRIPT_NAME join <source> <target>"
+  fi
+  if [[ -z "$target" ]]; then
+    target="$source"
+    source=""
+  fi
+
+  check_session_deps
+
+  # Resolve source worktree
+  local source_dir source_name source_branch
+  if [[ -z "$source" ]]; then
+    if ! _review_locate; then
+      die "Not inside a zproj worktree. Specify the source explicitly:\n  ${CYAN}$SCRIPT_NAME join <source> <target>${RESET}"
+    fi
+    source_dir="$_REVIEW_WT_ROOT"
+    resolve_project_dir "$source_dir"
+  else
+    resolve_project_dir "$source"
+    source_dir="$PROJECT_DIR"
+  fi
+  source_name="$(basename "$source_dir")"
+
+  # Save PARENT_DIR before resolving target (resolve_project_dir overwrites globals)
+  local parent_dir="$PARENT_DIR"
+  local session_name="$SESSION_NAME"
+
+  [[ ! -d "$source_dir" ]] && die "Source worktree '$source_name' does not exist."
+  if ! _git_is_registered_worktree "$parent_dir" "$source_dir"; then
+    die "'$source_name' is not a registered git worktree."
+  fi
+
+  source_branch="$(git -C "$source_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" || \
+    die "Could not determine branch for source worktree."
+
+  # Resolve target worktree
+  resolve_project_dir "$target"
+  local target_dir="$PROJECT_DIR"
+  local target_name="$WORKTREE_NAME"
+
+  [[ ! -d "$target_dir" ]] && die "Target worktree '$target_name' does not exist."
+  if ! _git_is_registered_worktree "$parent_dir" "$target_dir"; then
+    die "'$target_name' is not a registered git worktree."
+  fi
+
+  [[ "$source_dir" == "$target_dir" ]] && die "Source and target are the same worktree."
+
+  local target_branch
+  target_branch="$(git -C "$target_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" || \
+    die "Could not determine branch for target worktree."
+
+  # Warn about uncommitted changes in source
+  local source_dirty=false
+  if _git_is_dirty "$source_dir"; then
+    source_dirty=true
+    warn "Source worktree '$source_name' has uncommitted changes."
+    warn "Only committed state will be joined."
+  fi
+
+  # Fast path: source and target at the same commit — nothing to merge
+  local source_head target_head
+  source_head="$(git -C "$source_dir" rev-parse HEAD)"
+  target_head="$(git -C "$target_dir" rev-parse HEAD)"
+
+  if [[ "$source_head" == "$target_head" ]]; then
+    dim "  Source and target are at the same commit — no merge needed."
+  else
+    # Try the merge
+    echo -e "Joining ${BOLD}${source_name}${RESET} (${CYAN}${source_branch}${RESET}) → ${BOLD}${target_name}${RESET} (${CYAN}${target_branch}${RESET})..."
+
+    if ! git -C "$target_dir" merge "$source_branch" --no-edit 2>/dev/null; then
+      # Merge failed — abort and send to agent
+      git -C "$target_dir" merge --abort 2>/dev/null || true
+
+      _join_dispatch_conflict "$parent_dir" "$source_dir" "$source_name" "$source_branch" \
+        "$target_dir" "$target_name" "$target_branch" "$session_name"
+      return 0
+    fi
+
+    dim "  Merge completed successfully."
+  fi
+
+  # Success — clean up source
+  if $source_dirty; then
+    warn "Source '$source_name' has uncommitted changes — worktree preserved."
+    echo -e "  ${DIM}Commit or stash changes, then run: ${CYAN}$SCRIPT_NAME delete $source_name${RESET}"
+  else
+    echo -e "  Cleaning up source worktree..."
+    cmd_delete "$source_name" --force
+  fi
+
+  # Switch to target window
+  if tmux has-session -t "$session_name" 2>/dev/null; then
+    local target_window="$target_name"
+    if tmux list-windows -t "$session_name" -F '#{window_name}' 2>/dev/null \
+        | grep -qx "$target_window"; then
+      tmux select-window -t "$session_name:$target_window" 2>/dev/null || true
+    fi
+  fi
+
+  info "Joined ${BOLD}${source_name}${RESET} → ${BOLD}${target_name}${RESET}"
+}
+
+# Generate a conflict prompt and dispatch it to the target worktree's agent.
+_join_dispatch_conflict() {
+  local parent_dir="$1" source_dir="$2" source_name="$3" source_branch="$4"
+  local target_dir="$5" target_name="$6" target_branch="$7" session_name="$8"
+
+  # Generate the diff of changes on source since it diverged from target
+  local merge_base diff_content
+  merge_base="$(git -C "$parent_dir" merge-base "$source_branch" "$target_branch" 2>/dev/null)" || merge_base=""
+  if [[ -n "$merge_base" ]]; then
+    diff_content="$(git -C "$parent_dir" diff "$merge_base" "$source_branch" 2>/dev/null)" || diff_content=""
+  else
+    diff_content="$(git -C "$parent_dir" diff "$target_branch" "$source_branch" 2>/dev/null)" || diff_content=""
+  fi
+
+  # Build the conflict prompt
+  local prompt
+  printf -v prompt '%s' "\
+# zproj join — merge assistance
+
+You are helping merge changes from worktree \`${source_name}\` (branch \`${source_branch}\`)
+into this worktree \`${target_name}\` (branch \`${target_branch}\`).
+
+An automatic merge was attempted but failed due to conflicts. Below is the
+diff of all changes on the source branch since it diverged from the target.
+Please apply these changes to the current worktree.
+
+After you have incorporated all changes and committed them, run:
+\`\`\`
+zproj join ${source_name} ${target_name}
+\`\`\`
+This will verify the merge is complete and clean up the source worktree.
+
+---
+
+${diff_content}"
+
+  # Save to temp file
+  local tmp_prompt
+  tmp_prompt="$(mktemp "${TMPDIR:-/tmp}/zproj-join-XXXXXX")"
+  printf "%s" "$prompt" > "$tmp_prompt"
+
+  # Try to send to target's agent pane
+  local ai_name
+  ai_name="$(_resolve_ai "$target_dir" 2>/dev/null)" || ai_name=""
+  ai_name="${ai_name%% *}"
+  [[ -z "$ai_name" ]] && ai_name="shell"
+
+  local target_window="$target_name"
+
+  if ! tmux has-session -t "$session_name" 2>/dev/null; then
+    warn "tmux session '$session_name' not found."
+    echo -e "  ${DIM}Prompt saved to: ${CYAN}${tmp_prompt}${RESET}"
+    echo -e "  ${DIM}Paste it manually into your coding agent.${RESET}"
+    return 0
+  fi
+
+  if ! tmux list-windows -t "$session_name" -F '#{window_name}' 2>/dev/null \
+      | grep -qx "$target_window"; then
+    warn "tmux window '$target_window' not found in session '$session_name'."
+    echo -e "  ${DIM}Prompt saved to: ${CYAN}${tmp_prompt}${RESET}"
+    echo -e "  ${DIM}Paste it manually into your coding agent.${RESET}"
+    return 0
+  fi
+
+  local pane_target
+  if ! pane_target="$(_resolve_pane_target "$session_name:$target_window" "$ai_name")"; then
+    if [[ "$ai_name" != "shell" ]]; then
+      warn "Named pane '$ai_name' not found; using first pane."
+    fi
+  fi
+
+  local handoff_msg="I need your help merging changes from another worktree. Please read the instructions and diff: ${tmp_prompt}"
+  if ! tmux send-keys -t "$pane_target" "$handoff_msg" Enter 2>/dev/null; then
+    warn "Failed to send prompt to agent pane."
+    echo -e "  ${DIM}Prompt saved to: ${CYAN}${tmp_prompt}${RESET}"
+    echo -e "  ${DIM}Paste it manually into your coding agent.${RESET}"
+    return 0
+  fi
+
+  tmux select-window -t "$session_name:$target_window" 2>/dev/null || true
+  tmux select-pane -t "$pane_target" 2>/dev/null || true
+
+  warn "Merge conflicts detected — automatic merge aborted."
+  echo -e "  ${DIM}Sent changes to ${BOLD}${ai_name}${RESET}${DIM} in ${BOLD}${target_name}${RESET}"
+  echo -e "  ${DIM}Prompt saved to: ${tmp_prompt}${RESET}"
+  echo -e "  ${DIM}After resolving, run: ${CYAN}$SCRIPT_NAME join $source_name $target_name${RESET}"
+}
+
 cmd_launch() {
   local dir=""
 
@@ -1668,6 +1982,8 @@ ${BOLD}Usage:${RESET}
   $SCRIPT_NAME clone <git-url> [dir]               Clone remote repo as bare worktree structure
   $SCRIPT_NAME create <worktree-dir> [--from ref]  Create a new worktree
   $SCRIPT_NAME delete <worktree-dir> [--force]     Remove worktree, branch, and window
+  $SCRIPT_NAME fork [<source>] <new-worktree>      Fork worktree at same commit
+  $SCRIPT_NAME join [<source>] <target>            Merge source into target, delete source
   $SCRIPT_NAME launch <worktree-dir>               Start or switch to tmux window
   $SCRIPT_NAME list [dir]                          Show worktrees with status
   $SCRIPT_NAME review <subcommand>                 Manage review notes (path/view/dispatch/clear)
@@ -1771,6 +2087,56 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME delete <worktree-dir> [--force]
   Remove the worktree, its branch, and the tmux window.
   Refuses if there are uncommitted changes or the window is open
   unless --force is specified.
+
+EOF
+}
+
+usage_fork() {
+  cat <<EOF
+
+${BOLD}Usage:${RESET} $SCRIPT_NAME fork <new-worktree>
+       $SCRIPT_NAME fork <source> <new-worktree>
+
+  Fork a worktree: create a new worktree at the same commit as the source,
+  with its own branch, and open a tmux window for it.
+
+  With one argument, the source is the current worktree (CWD).
+  With two arguments, the first is the source worktree name.
+
+  Only committed state is forked. If the source has uncommitted changes,
+  a warning is printed but the fork proceeds with committed state only.
+
+${BOLD}Examples:${RESET}
+  $SCRIPT_NAME fork experiment     ${DIM}# fork CWD worktree → experiment${RESET}
+  $SCRIPT_NAME fork main hotfix    ${DIM}# fork main → hotfix${RESET}
+
+EOF
+}
+
+usage_join() {
+  cat <<EOF
+
+${BOLD}Usage:${RESET} $SCRIPT_NAME join <target-worktree>
+       $SCRIPT_NAME join <source> <target>
+
+  Join a worktree into another: merge the source branch into the target
+  branch. On success, the source worktree, branch, and tmux window are
+  removed.
+
+  With one argument, the source is the current worktree (CWD) and the
+  argument is the target. With two arguments, the first is the source
+  and the second is the target.
+
+  If the merge has conflicts, the merge is aborted and the diff is sent
+  to the coding agent in the target worktree for manual resolution. After
+  resolving, re-run the same join command to complete.
+
+  If the source has uncommitted changes, those are preserved (the source
+  worktree is not deleted) even on a successful merge.
+
+${BOLD}Examples:${RESET}
+  $SCRIPT_NAME join main           ${DIM}# join CWD worktree → main${RESET}
+  $SCRIPT_NAME join hotfix main    ${DIM}# join hotfix → main${RESET}
 
 EOF
 }
@@ -2571,9 +2937,11 @@ management available from anywhere inside the tmux session, without needing
 a shell prompt:
 
 \`\`\`tmux
-# zproj integration — create and delete worktrees from inside tmux
+# zproj integration — worktree management from inside tmux
 bind N command-prompt -p "new worktree name:" "run-shell 'cd #{pane_current_path}/.. && zproj %% > /dev/null 2>&1'"
 bind X confirm-before -p "delete worktree '#{window_name}'? (y/n)" "run-shell 'cd #{pane_current_path}/.. && zproj delete #{window_name} --force > /dev/null 2>&1; tmux refresh-client'"
+bind F command-prompt -p "fork to new worktree:" "run-shell 'cd #{pane_current_path}/.. && zproj fork #{window_name} %% > /dev/null 2>&1'"
+bind J command-prompt -p "join into worktree:" "run-shell 'cd #{pane_current_path}/.. && zproj join #{window_name} %% > /dev/null 2>&1'"
 \`\`\`
 
 **What these do:**
@@ -2582,16 +2950,19 @@ bind X confirm-before -p "delete worktree '#{window_name}'? (y/n)" "run-shell 'c
 |---------|--------|
 | \`<prefix> N\` | Prompts for a worktree name, then runs \`zproj <name>\` from the project root — creates the worktree, branch, and opens a new 3-pane tmux window in one step |
 | \`<prefix> X\` | Asks for confirmation, then runs \`zproj delete <window_name> --force\` — removes the current worktree, its branch, and closes the tmux window |
+| \`<prefix> F\` | Prompts for a new worktree name, then forks the current worktree into it — creates a new worktree at the same commit and opens a tmux window for it |
+| \`<prefix> J\` | Prompts for a target worktree name, then joins (merges) the current worktree into it — on success, deletes the current worktree |
 
-Both bindings derive the project root from \`#{pane_current_path}/..\`, so
+All bindings derive the project root from \`#{pane_current_path}/..\`, so
 they work correctly from any pane in any worktree window without needing the
 user to navigate manually. \`zproj <name>\` handles the upsert: if the
 worktree doesn't exist it creates it; if it already exists it switches to it.
 
-Check whether these binding names (\`N\`, \`X\`) conflict with any existing
-bindings in the user's tmux config. If they do, choose alternatives and
-document the change. If the tmux config file does not exist, create it with just
-these bindings.
+Check whether these binding names (\`N\`, \`X\`, \`F\`, \`J\`) conflict with any
+existing bindings in the user's tmux config. If they do, choose alternatives
+and document the change. Note that lowercase \`j\` (pane navigation) and
+uppercase \`J\` are distinct in tmux. If the tmux config file does not exist,
+create it with just these bindings.
 
 ---
 
@@ -4756,6 +5127,157 @@ NOTES
   _t_grep "TX3: home path as default" "$tx3_home/.tmux.conf" echo "$tx3_result"
   rm -rf "$tx3_home" "$tx3_script"
 
+  # ── Section: FK — fork ──────────────────────────────────────────────────
+
+  # Shared bare worktree for fork/join tests
+  local fk_root="$tmp/fk"
+  rm -rf "$fk_root" || true
+  ( cd "$tmp" && "$BASH" "$0" init fk &>/dev/null ) || true
+  # Add a real commit so branches have content
+  git -C "$fk_root/main" config user.name "Test" || true
+  git -C "$fk_root/main" config user.email "t@t.test" || true
+  echo "hello" > "$fk_root/main/file.txt" || true
+  git -C "$fk_root/main" add . && git -C "$fk_root/main" commit -q -m "add file" || true
+
+  _section "FK1 — fork: creates worktree at same commit"
+  local fk1_exit
+  fk1_exit="$( (cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork experiment &>/dev/null); echo $? )"
+  _t_check "FK1: exits 0"                    test "$fk1_exit" -eq 0
+  _t_check "FK1: experiment/ exists"          test -d "$fk_root/experiment"
+  _t_check "FK1: file.txt in experiment"      test -f "$fk_root/experiment/file.txt"
+  # Same commit
+  local fk1_main_head fk1_exp_head
+  fk1_main_head="$(git -C "$fk_root/main" rev-parse HEAD)"
+  fk1_exp_head="$(git -C "$fk_root/experiment" rev-parse HEAD)"
+  _t_check "FK1: same commit as source"       test "$fk1_main_head" = "$fk1_exp_head"
+  # Branch name matches worktree name
+  _t_grep "FK1: branch is experiment"        "^experiment$" \
+    git -C "$fk_root/experiment" rev-parse --abbrev-ref HEAD
+
+  _section "FK2 — fork: explicit source creates worktree"
+  local fk2_exit
+  fk2_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork main from-main &>/dev/null); echo $? )"
+  _t_check "FK2: exits 0"                    test "$fk2_exit" -eq 0
+  _t_check "FK2: from-main/ exists"           test -d "$fk_root/from-main"
+  local fk2_main_head fk2_fm_head
+  fk2_main_head="$(git -C "$fk_root/main" rev-parse HEAD)"
+  fk2_fm_head="$(git -C "$fk_root/from-main" rev-parse HEAD)"
+  _t_check "FK2: same commit as source"       test "$fk2_main_head" = "$fk2_fm_head"
+
+  _section "FK3 — fork: dirty source warns but proceeds"
+  echo "dirty" > "$fk_root/main/dirty.txt"
+  local fk3_out
+  fk3_out="$(cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork dirty-fork 2>&1)" || true
+  _t_grep  "FK3: warns about uncommitted"     "uncommitted"  echo "$fk3_out"
+  _t_check "FK3: dirty-fork/ created"         test -d "$fk_root/dirty-fork"
+  # dirty.txt should NOT be in the fork (only committed state)
+  _t_check "FK3: dirty.txt not in fork"       test ! -f "$fk_root/dirty-fork/dirty.txt"
+  rm -f "$fk_root/main/dirty.txt"
+
+  _section "FK4 — fork: target already exists → error"
+  local fk4_exit
+  fk4_exit="$( (cd "$fk_root/main" && "$BASH" "$0" fork experiment &>/dev/null); echo $? )"
+  _t_check "FK4: exits non-zero"              test "$fk4_exit" -ne 0
+
+  _section "FK5 — fork: invalid branch name → error"
+  local fk5_exit
+  fk5_exit="$( (cd "$fk_root/main" && "$BASH" "$0" fork 'bad name' &>/dev/null); echo $? )"
+  _t_check "FK5: exits non-zero"              test "$fk5_exit" -ne 0
+  _t_check "FK5: no directory created"        test ! -d "$fk_root/bad name"
+
+  _section "FK6 — fork: from non-worktree dir → error"
+  local fk6_exit
+  fk6_exit="$( (cd "$tmp" && "$BASH" "$0" fork new-wt &>/dev/null); echo $? )"
+  _t_check "FK6: exits non-zero"              test "$fk6_exit" -ne 0
+
+  # Clean up extra worktrees
+  ( cd "$fk_root" && "$BASH" "$0" delete experiment --force &>/dev/null ) || true
+  ( cd "$fk_root" && "$BASH" "$0" delete from-main --force &>/dev/null ) || true
+  ( cd "$fk_root" && "$BASH" "$0" delete dirty-fork --force &>/dev/null ) || true
+
+  # ── Section: FJ — join ──────────────────────────────────────────────────
+
+  _section "FJ1 — join: same commit → deletes source"
+  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork fj1-src &>/dev/null ) || true
+  _t_check "FJ1: fj1-src created"             test -d "$fk_root/fj1-src"
+  local fj1_exit
+  fj1_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" join fj1-src main &>/dev/null); echo $? )"
+  _t_check "FJ1: exits 0"                     test "$fj1_exit" -eq 0
+  _t_check "FJ1: source deleted"               test ! -d "$fk_root/fj1-src"
+  _t_check "FJ1: source branch deleted"        bash -c '! git -C "$1" branch 2>/dev/null | grep -q fj1-src' -- "$fk_root"
+
+  _section "FJ2 — join: diverged commits, clean merge"
+  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork fj2-src &>/dev/null ) || true
+  # Add a commit to source
+  git -C "$fk_root/fj2-src" config user.name "Test" || true
+  git -C "$fk_root/fj2-src" config user.email "t@t.test" || true
+  echo "new content" > "$fk_root/fj2-src/new.txt"
+  git -C "$fk_root/fj2-src" add . && git -C "$fk_root/fj2-src" commit -q -m "add new.txt" || true
+  local fj2_exit
+  fj2_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" join fj2-src main &>/dev/null); echo $? )"
+  _t_check "FJ2: exits 0"                     test "$fj2_exit" -eq 0
+  _t_check "FJ2: new.txt merged into main"    test -f "$fk_root/main/new.txt"
+  _t_check "FJ2: source deleted"               test ! -d "$fk_root/fj2-src"
+
+  _section "FJ3 — join: dirty source → warns, merges, preserves source"
+  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork fj3-src &>/dev/null ) || true
+  git -C "$fk_root/fj3-src" config user.name "Test" || true
+  git -C "$fk_root/fj3-src" config user.email "t@t.test" || true
+  echo "committed" > "$fk_root/fj3-src/committed.txt"
+  git -C "$fk_root/fj3-src" add . && git -C "$fk_root/fj3-src" commit -q -m "add committed" || true
+  echo "uncommitted" > "$fk_root/fj3-src/uncommitted.txt"
+  local fj3_out
+  fj3_out="$(cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" join fj3-src main 2>&1)" || true
+  _t_grep  "FJ3: warns about uncommitted"     "uncommitted"      echo "$fj3_out"
+  _t_check "FJ3: committed.txt merged"        test -f "$fk_root/main/committed.txt"
+  _t_check "FJ3: source NOT deleted"           test -d "$fk_root/fj3-src"
+  ( cd "$fk_root" && "$BASH" "$0" delete fj3-src --force &>/dev/null ) || true
+
+  _section "FJ4 — join: source = target → error"
+  local fj4_exit
+  fj4_exit="$( (cd "$fk_root" && "$BASH" "$0" join main main &>/dev/null); echo $? )"
+  _t_check "FJ4: exits non-zero"              test "$fj4_exit" -ne 0
+
+  _section "FJ5 — join: target does not exist → error"
+  local fj5_exit
+  fj5_exit="$( (cd "$fk_root/main" && "$BASH" "$0" join nonexistent &>/dev/null); echo $? )"
+  _t_check "FJ5: exits non-zero"              test "$fj5_exit" -ne 0
+
+  _section "FJ6 — join: source does not exist → error"
+  local fj6_exit
+  fj6_exit="$( (cd "$fk_root" && "$BASH" "$0" join nonexistent main &>/dev/null); echo $? )"
+  _t_check "FJ6: exits non-zero"              test "$fj6_exit" -ne 0
+
+  _section "FJ7 — fork/join identity: fork then immediate join"
+  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork fj7-roundtrip &>/dev/null ) || true
+  local fj7_before fj7_after
+  fj7_before="$(git -C "$fk_root/main" rev-parse HEAD)"
+  local fj7_exit
+  fj7_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" join fj7-roundtrip main &>/dev/null); echo $? )"
+  fj7_after="$(git -C "$fk_root/main" rev-parse HEAD)"
+  _t_check "FJ7: exits 0"                     test "$fj7_exit" -eq 0
+  _t_check "FJ7: main HEAD unchanged"         test "$fj7_before" = "$fj7_after"
+  _t_check "FJ7: source deleted"               test ! -d "$fk_root/fj7-roundtrip"
+
+  _section "FJ8 — join: conflicting changes → aborts, saves prompt"
+  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork fj8-conflict &>/dev/null ) || true
+  # Create conflicting changes
+  git -C "$fk_root/fj8-conflict" config user.name "Test" || true
+  git -C "$fk_root/fj8-conflict" config user.email "t@t.test" || true
+  echo "source version" > "$fk_root/fj8-conflict/file.txt"
+  git -C "$fk_root/fj8-conflict" add . && git -C "$fk_root/fj8-conflict" commit -q -m "conflict src" || true
+  echo "target version" > "$fk_root/main/file.txt"
+  git -C "$fk_root/main" add . && git -C "$fk_root/main" commit -q -m "conflict tgt" || true
+  local fj8_out
+  fj8_out="$(cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" join fj8-conflict main 2>&1)" || true
+  _t_grep  "FJ8: reports conflict"             "conflict"           echo "$fj8_out"
+  _t_grep  "FJ8: mentions temp file"           "zproj-join-"        echo "$fj8_out"
+  _t_check "FJ8: source NOT deleted"           test -d "$fk_root/fj8-conflict"
+  # Target should be clean (merge was aborted)
+  _t_check "FJ8: target is clean (merge aborted)" \
+    bash -c '! git -C "$1/main" status --porcelain | grep -q .' -- "$fk_root"
+  ( cd "$fk_root" && "$BASH" "$0" delete fj8-conflict --force &>/dev/null ) || true
+
   # ── Summary ──────────────────────────────────────────────────────────────
 
   echo ""
@@ -4811,6 +5333,14 @@ main() {
   delete)
     shift
     cmd_delete "$@"
+    ;;
+  fork)
+    shift
+    cmd_fork "$@"
+    ;;
+  join)
+    shift
+    cmd_join "$@"
     ;;
   launch)
     shift

@@ -68,6 +68,8 @@ zproj
 
 # Work on a feature
 zproj feature-auth           # creates worktree + branch + tmux window
+zproj fork experiment        # fork current worktree to try something
+zproj join experiment main   # merge experiment back into main
 zproj delete feature-auth    # tears it all down when done
 ```
 
@@ -161,6 +163,8 @@ zproj init <dir> [--main <branch>]          Init, convert, or upgrade to bare wo
 zproj clone <git-url> [dir]                 Clone remote repo as bare worktree structure
 zproj create <worktree-dir> [--from ref]    Create a new worktree
 zproj delete <worktree-dir> [--force]       Remove worktree, branch, and window
+zproj fork [<source>] <new-worktree>        Fork worktree at same commit
+zproj join [<source>] <target>              Merge source into target, delete source
 zproj launch <worktree-dir>                 Start or switch to tmux window
 zproj list [dir]                            Show worktrees with status
 zproj review <subcommand>                   Manage review notes (path/view/dispatch/clear)
@@ -178,9 +182,9 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-289 tests covering init, clone, upgrade, worktree management, review workflow,
-tmux pane naming, diagnostics, integrate, and tool detection. Requires tmux,
-git, and bash in PATH.
+316 tests covering init, clone, upgrade, worktree management, fork/join,
+review workflow, tmux pane naming, diagnostics, integrate, and tool detection.
+Requires tmux, git, and bash in PATH.
 
 ## License
 
