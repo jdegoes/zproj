@@ -1571,7 +1571,7 @@ ${diff_content}"
     fi
   fi
 
-  local handoff_msg="I need your help merging changes from another worktree. Please read the instructions and diff: ${tmp_prompt}"
+  local handoff_msg="I need you to merge branch ${source_branch} into this worktree. Full instructions and context are in: ${tmp_prompt}"
   if ! tmux send-keys -t "$pane_target" "$handoff_msg" Enter 2>/dev/null; then
     warn "Failed to send prompt to agent pane."
     echo -e "  ${DIM}Prompt saved to: ${CYAN}${tmp_prompt}${RESET}"
