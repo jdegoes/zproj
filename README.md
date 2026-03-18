@@ -20,8 +20,7 @@ A built-in review workflow lets you annotate lines during a diff review and
 dispatch the collected notes to your coding agent for implementation.
 
 `zproj integrate` bootstraps a new machine in one command: installs `ck` and
-`cqs` code search tools, copies bundled skill files into your coding agent's
-global skills directory, and asks your agent to wire up your editor.
+`cqs` code search tools and asks your coding agent to wire up your editor.
 
 ## Requirements
 
@@ -51,7 +50,7 @@ One of the following editors is auto-discovered (or set `$ZPROJ_EDITOR`):
 ## Installation
 
 ```bash
-# Clone the repo (required — zproj needs the bundled skills/ directory)
+# Clone the repo
 git clone https://github.com/jdegoes/zproj ~/Documents/git/zproj
 
 # Symlink the script into your PATH
@@ -60,11 +59,6 @@ ln -s ~/Documents/git/zproj/zproj ~/.local/bin/zproj
 # Verify
 zproj --version
 ```
-
-> **Note:** Clone the repo rather than copying the script. The `skills/` and
-> `rules/` directories next to the script are needed for `zproj integrate` to
-> install skill files, rules, and tools. A standalone script copy will warn
-> gracefully but cannot install skills or rules.
 
 ## Quick start
 
@@ -160,59 +154,14 @@ The notes file is deleted after the temp file is safely written.
    `npm install -g @beaconbay/ck-search` if cargo is absent)
 2. **Installs `cqs`** — code intelligence and call graph analysis
    (`cargo install cqs`)
-3. **Copies skill files** from `skills/*/SKILL.md` in the zproj repo into
-   your coding agent's global skills directory (e.g.
-   `~/.config/opencode/skills/` for OpenCode)
-4. **Installs instruction rules** from `rules/*.md` in the zproj repo into
-   the agent's global instructions file (e.g.
-   `~/.config/opencode/AGENTS.md` for OpenCode)
-5. **Asks your coding agent** to implement the review workflow in your editor
+3. **Asks your coding agent** to implement the review workflow in your editor
    (add note / view / dispatch / clear), using the Neovim reference
    implementation as a concrete example
 
 ```bash
-zproj integrate                      # full bootstrap
-zproj integrate --skills-only        # install tools + skills, skip editor
-zproj integrate --plan               # dry run: show what would be done
-zproj integrate --skills-only --plan # dry run: tools + skills only
+zproj integrate              # full bootstrap
+zproj integrate --plan       # dry run: show what would be done
 ```
-
-Skills directory per agent:
-
-| Agent          | Global skills directory |
-|----------------|-------------------------|
-| opencode       | `~/.config/opencode/skills/` |
-| claude         | `~/.claude/skills/` |
-| codex          | `~/.agents/skills/` |
-| amp            | `~/.config/agents/skills/` |
-| agent (Cursor) | `~/.cursor/skills/` |
-
-### Bundled skills
-
-The `skills/` directory in this repo contains skill files for:
-
-- **`ck`** — semantic code search; replaces grep/rg for source files
-- **`cqs`** — call graphs, impact analysis, refactoring safety, dead code
-
-Add a `skills/<toolname>/SKILL.md` to the repo and it will be installed
-automatically on the next `zproj integrate` run.
-
-### Bundled rules
-
-The `rules/` directory contains instruction rules installed into the agent's
-global instructions file. Each rule is a Markdown file with YAML frontmatter:
-
-```markdown
----
-marker: "stable substring for idempotent detection"
----
-The rule text appended to the instructions file.
-```
-
-The `marker:` field is a stable substring used to detect whether the rule is
-already present — so the rule is never duplicated even if the user edits the
-file. Add a `rules/<name>.md` to the repo and it will be installed
-automatically on the next `zproj integrate` run.
 
 ## Command reference
 
@@ -226,7 +175,7 @@ zproj delete <worktree-dir> [--force]       Remove worktree, branch, and window
 zproj launch <worktree-dir>                 Start or switch to tmux window
 zproj list [dir]                            Show worktrees with status
 zproj review <subcommand>                   Manage review notes (path/view/dispatch/clear)
-zproj integrate [--plan] [--skills-only]    Install tools, skills, and editor integration
+zproj integrate [--plan]                    Install tools and editor integration
 zproj --env                                 Show resolved editor and coding agent
 zproj --diagnostics                         Check environment for problems
 zproj --test                                Run the built-in test suite
@@ -240,9 +189,9 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-257 tests covering init, clone, upgrade, worktree management, review workflow,
-tmux pane naming, diagnostics, integrate, skills installation, and tool
-detection. Requires tmux, git, and bash in PATH.
+289 tests covering init, clone, upgrade, worktree management, review workflow,
+tmux pane naming, diagnostics, integrate, and tool detection. Requires tmux,
+git, and bash in PATH.
 
 ## License
 

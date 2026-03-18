@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.10.0"
+readonly VERSION="4.11.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -390,173 +390,6 @@ _resolve_ai() {
   warn "Set \$CODING_AGENT to specify one, or install a coding agent."
   echo ""
   return 0
-}
-
-# Return the global skills directory for a given agent binary name.
-# Prints the path to stdout and returns 0, or prints nothing and returns 1
-# if the agent has no skills concept.
-#
-# Agent → directory mapping (researched 2026-03-03):
-#   opencode  ~/.config/opencode/skills/   (OpenCode docs)
-#   claude    ~/.claude/skills/            (Claude Code docs)
-#   codex     ~/.agents/skills/            (OpenAI Codex)
-#   amp       ~/.config/agents/skills/     (Amp manual § Agent Skills)
-#   aider     (none — uses CONVENTIONS.md, no skills concept)
-#   goose     (none — uses extensions, no skills concept)
-#   gemini    (none — uses ~/.gemini/GEMINI.md, no skills concept)
-#   agent     ~/.cursor/skills/             (Cursor CLI Agent, since 2.4)
-_agent_skills_dir() {
-  case "$1" in
-    opencode) echo "${HOME}/.config/opencode/skills" ; return 0 ;;
-    claude)   echo "${HOME}/.claude/skills"          ; return 0 ;;
-    codex)    echo "${HOME}/.agents/skills"          ; return 0 ;;
-    amp)      echo "${HOME}/.config/agents/skills"   ; return 0 ;;
-    agent)    echo "${HOME}/.cursor/skills"          ; return 0 ;;
-    *)        return 1 ;;
-  esac
-}
-
-# Return the path to the global instructions file for a given agent binary.
-# Each agent has a single file that is injected into every session globally.
-# Prints the path and returns 0 if the agent is supported; returns 1 otherwise.
-#
-# Agent → file mapping (researched 2026-03-04):
-#   opencode  ~/.config/opencode/AGENTS.md   (OpenCode docs)
-#   claude    ~/.claude/CLAUDE.md             (Claude Code / OpenCode compat docs)
-#   codex     ~/.codex/AGENTS.md              (Codex CLI README §Memory & project docs)
-#   amp       ~/.config/amp/AGENTS.md         (Amp manual §AGENTS.md — more specific
-#                                              than ~/.config/AGENTS.md which other
-#                                              tools may also read)
-#   aider     (none — no global instructions concept)
-#   goose     (none — no global instructions concept)
-#   gemini    (none — no global instructions concept)
-#   agent     (none — Cursor uses .cursor/rules/*.mdc, no single global file)
-_agent_instructions_file() {
-  case "$1" in
-    opencode) echo "${HOME}/.config/opencode/AGENTS.md" ; return 0 ;;
-    claude)   echo "${HOME}/.claude/CLAUDE.md"           ; return 0 ;;
-    codex)    echo "${HOME}/.codex/AGENTS.md"            ; return 0 ;;
-    amp)      echo "${HOME}/.config/amp/AGENTS.md"       ; return 0 ;;
-    *)        return 1 ;;
-  esac
-}
-
-# Return the path to the rules/ directory bundled with this zproj installation.
-# Uses the same readlink -f canonicalisation as _resolve_zproj_skills_dir.
-# Prints the path and returns 0 if found; returns 1 with no output if absent.
-_resolve_zproj_rules_dir() {
-  local src="${BASH_SOURCE[0]:-$0}"
-  local real
-  real="$(readlink -f "$src" 2>/dev/null)" || real="$src"
-  local script_dir
-  script_dir="$(cd "$(dirname "$real")" && pwd)"
-  local rules_dir="${script_dir}/rules"
-  if [[ -d "$rules_dir" ]]; then
-    echo "$rules_dir"
-    return 0
-  fi
-  return 1
-}
-
-# Read the marker: value from a rule file's YAML frontmatter.
-# The marker is the stable substring used to detect whether the rule is already
-# present in the target instructions file.
-_rule_marker_from_file() {
-  grep "^marker:" "$1" | head -1 \
-    | sed 's/^marker:[[:space:]]*//' \
-    | sed 's/^"//;s/"[[:space:]]*$//'
-}
-
-# Extract the rule body from a rule file — everything after the closing ---.
-# Uses awk for positional extraction (after the second ---), not pattern search.
-_rule_body_from_file() {
-  awk 'f; /^---$/ && ++n==2 {f=1}' "$1"
-}
-
-# Ensure the rule from a rule file is present in the given instructions file.
-# With dry_run=true: prints what would be done without touching the filesystem.
-# Creates the instructions file (and parent dirs) if absent.
-# Appends the rule body if the instructions file exists but the rule is missing.
-# Does nothing if the marker is already present.
-_integrate_ensure_rule() {
-  local rule_file="$1" instructions_file="$2" dry_run="${3:-false}"
-  local rule_name marker body
-  rule_name="$(basename "${rule_file%.md}")"
-  marker="$(_rule_marker_from_file "$rule_file")"
-  body="$(_rule_body_from_file "$rule_file")"
-
-  if [[ -z "$marker" ]]; then
-    warn "No marker: field found in ${rule_file} — skipping."
-    return 1
-  fi
-
-  if [[ -f "$instructions_file" ]] && grep -qF "$marker" "$instructions_file"; then
-    dim "  [already present]  rule:${rule_name}  (${instructions_file})"
-    return 0
-  fi
-
-  if $dry_run; then
-    echo "  [would add]  rule:${rule_name}  (${instructions_file})"
-    return 0
-  fi
-
-  mkdir -p "$(dirname "$instructions_file")"
-  if [[ -f "$instructions_file" ]]; then
-    printf '\n%s\n' "$body" >> "$instructions_file"
-    step "  [appended]   rule:${rule_name}  (${instructions_file})"
-  else
-    printf '%s\n' "$body" > "$instructions_file"
-    step "  [created]    rule:${rule_name}  (${instructions_file})"
-  fi
-}
-
-# Install all rules from the bundled rules/ directory into the agent's global
-# instructions file. With dry_run=true: prints what would be done without
-# writing anything. Adding a new rule is as simple as adding a .md file to the
-# rules/ directory — no script changes needed.
-_integrate_install_instructions() {
-  local dry_run="${1:-false}"
-  local ai ai_binary instructions_file rules_dir
-
-  ai="$(_resolve_ai 2>/dev/null)" || ai=""
-  ai_binary="${ai%% *}"
-
-  if ! instructions_file="$(_agent_instructions_file "$ai_binary")"; then
-    warn "Agent '${ai_binary:-none}' has no known global instructions file. Supported: opencode, claude, codex, amp. (agent (Cursor) uses .cursor/rules/*.mdc)"
-    return 0
-  fi
-
-  if ! rules_dir="$(_resolve_zproj_rules_dir)"; then
-    warn "zproj rules/ directory not found. Check out the zproj repo and symlink the script."
-    return 1
-  fi
-
-  local rule_file
-  for rule_file in "$rules_dir"/*.md; do
-    [[ -f "$rule_file" ]] || continue
-    _integrate_ensure_rule "$rule_file" "$instructions_file" "$dry_run"
-  done
-}
-
-# Return the path to the skills/ directory bundled with this zproj installation.
-# Uses readlink -f to get the canonical absolute path of the script before
-# taking dirname. This handles all invocation styles correctly: direct path,
-# symlink, relative path, or PATH lookup — readlink -f resolves all of them
-# to the real file location without assuming any particular style.
-# Prints the path and returns 0 if found; returns 1 with no output if absent.
-_resolve_zproj_skills_dir() {
-  local src="${BASH_SOURCE[0]:-$0}"
-  local real
-  # readlink -f canonicalises the path regardless of whether it is a symlink
-  real="$(readlink -f "$src" 2>/dev/null)" || real="$src"
-  local script_dir
-  script_dir="$(cd "$(dirname "$real")" && pwd)"
-  local skills_dir="${script_dir}/skills"
-  if [[ -d "$skills_dir" ]]; then
-    echo "$skills_dir"
-    return 0
-  fi
-  return 1
 }
 
 # Print current tool resolution to stdout (used by --env).
@@ -2974,107 +2807,13 @@ _integrate_install_tools() {
   fi
 }
 
-# With dry_run=true: prints what would be copied without touching the filesystem.
-# Returns 0 on success, 1 if skills/ dir or agent skills dir cannot be resolved.
-_integrate_install_skills() {
-  local dry_run="${1:-false}"
-  local ai ai_binary skills_src target_dir
-
-  ai="$(_resolve_ai 2>/dev/null)" || ai=""
-  ai_binary="${ai%% *}"
-
-  # Resolve target install directory for this agent
-  if ! target_dir="$(_agent_skills_dir "$ai_binary")"; then
-    warn "Agent '${ai_binary:-none}' has no known skills directory. Supported: opencode, claude, codex, amp, agent (Cursor)."
-    return 1
-  fi
-
-  # Resolve the skills source directory
-  if ! skills_src="$(_resolve_zproj_skills_dir)"; then
-    warn "zproj skills/ directory not found. Check out the zproj repo and symlink the script."
-    return 1
-  fi
-
-  # Collect all skill directories (any subdir containing a SKILL.md)
-  local skill_dirs=()
-  local d
-  for d in "$skills_src"/*/; do
-    [[ -f "${d}SKILL.md" ]] && skill_dirs+=("$d")
-  done
-
-  if [[ ${#skill_dirs[@]} -eq 0 ]]; then
-    warn "No skills found in ${skills_src} — nothing to install."
-    return 0
-  fi
-
-  if $dry_run; then
-    echo "  Agent:           ${ai_binary:-none}"
-    echo "  Skills source:   ${skills_src}"
-    echo "  Install target:  ${target_dir}"
-    echo ""
-    local skill_dir skill_name dest
-    for skill_dir in "${skill_dirs[@]}"; do
-      skill_name="$(basename "$skill_dir")"
-      dest="${target_dir}/${skill_name}/SKILL.md"
-      if [[ -f "$dest" ]]; then
-        if diff -q "${skill_dir}SKILL.md" "$dest" &>/dev/null; then
-          echo "  [up to date]  ${skill_name}"
-        else
-          echo "  [would update] ${skill_name}  (${dest})"
-        fi
-      else
-        echo "  [would install] ${skill_name}  (${dest})"
-      fi
-    done
-    return 0
-  fi
-
-  # Create target directory (handles fresh installs where ~/.config/opencode/ doesn't exist)
-  mkdir -p "$target_dir" || { warn "Could not create ${target_dir}"; return 1; }
-
-  # Copy each skill
-  local skill_dir skill_name dest installed=0 updated=0 unchanged=0
-  for skill_dir in "${skill_dirs[@]}"; do
-    skill_name="$(basename "$skill_dir")"
-    dest="${target_dir}/${skill_name}"
-    mkdir -p "$dest"
-    if [[ -f "${dest}/SKILL.md" ]]; then
-      if diff -q "${skill_dir}SKILL.md" "${dest}/SKILL.md" &>/dev/null; then
-        dim "  [up to date]  ${skill_name}"
-        ((unchanged++)) || true
-      else
-        cp "${skill_dir}SKILL.md" "${dest}/SKILL.md"
-        step "  [updated]     ${skill_name}"
-        ((updated++)) || true
-      fi
-    else
-      cp "${skill_dir}SKILL.md" "${dest}/SKILL.md"
-      step "  [installed]   ${skill_name}"
-      ((installed++)) || true
-    fi
-  done
-
-  echo ""
-  info "Skills: ${installed} installed, ${updated} updated, ${unchanged} up to date"
-  info "Location: ${target_dir}"
-}
-
 cmd_integrate() {
-  local plan_only=false only_components=""
+  local plan_only=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
     --plan)
       plan_only=true ;;
-    --only)
-      shift
-      [[ $# -eq 0 ]] && die "--only requires a comma-separated list: skills, rules, editor"
-      only_components="$1"
-      ;;
-    --skills-only)
-      # Deprecated alias for --only skills,rules
-      only_components="skills,rules"
-      ;;
     --help|-h)
       usage_integrate; exit 0 ;;
     -*) die "Unknown option: $1." ;;
@@ -3083,55 +2822,21 @@ cmd_integrate() {
     shift
   done
 
-  # Validate --only components
-  local do_skills=true do_rules=true do_editor=true
-  if [[ -n "$only_components" ]]; then
-    do_skills=false; do_rules=false; do_editor=false
-    IFS=',' read -ra _only_parts <<< "$only_components"
-    local _part
-    for _part in "${_only_parts[@]}"; do
-      _part="${_part// /}"   # strip spaces
-      case "$_part" in
-        skills) do_skills=true ;;
-        rules)  do_rules=true  ;;
-        editor) do_editor=true ;;
-        *) die "Unknown component '${_part}' in --only. Valid values: skills, rules, editor" ;;
-      esac
-    done
-  fi
-
   # ── Plan only ────────────────────────────────────────────────────────────
 
   if $plan_only; then
-    if $do_editor; then
-      _integrate_build_prompt
-      echo ""
-    fi
-    echo "## Tools, Skills & Instructions"
+    _integrate_build_prompt
     echo ""
     echo -e "${BOLD}Dry run — no changes will be made:${RESET}"
     echo ""
     echo -e "${BOLD}Tools:${RESET}"
     _integrate_install_tools true
-    echo ""
-    if $do_skills; then
-      echo -e "${BOLD}Skills:${RESET}"
-      _integrate_install_skills true || true
-      echo ""
-    fi
-    if $do_rules; then
-      echo -e "${BOLD}Instructions:${RESET}"
-      _integrate_install_instructions true || true
-    fi
     return 0
   fi
 
   # ── Live run ─────────────────────────────────────────────────────────────
 
-  # Editor integration requires a coding agent and tmux session
-  if $do_editor; then
-    check_session_deps
-  fi
+  check_session_deps
 
   local editor ai ai_binary
   editor="$(_resolve_editor 2>/dev/null)" || editor=""
@@ -3139,42 +2844,20 @@ cmd_integrate() {
   ai_binary="${ai%% *}"
 
   echo ""
-  if $do_editor; then
-    echo -e "${BOLD}zproj integrate${RESET}"
-  else
-    echo -e "${BOLD}zproj integrate --only ${only_components}${RESET}"
-  fi
-  $do_editor && echo -e "  Editor:  ${CYAN}${editor}${RESET}"
+  echo -e "${BOLD}zproj integrate${RESET}"
+  echo -e "  Editor:  ${CYAN}${editor}${RESET}"
   echo -e "  Agent:   ${CYAN}${ai_binary:-none}${RESET}"
   echo ""
 
-  if $do_editor && [[ -z "$ai_binary" ]]; then
+  if [[ -z "$ai_binary" ]]; then
     die "No coding agent found. Install one (opencode, claude, etc.) or set \$CODING_AGENT."
   fi
 
-  # Install tools directly (always — they are prerequisites for skills/rules)
+  # Install tools
   step "Installing tools..."
   echo ""
   _integrate_install_tools false
   echo ""
-
-  if $do_skills; then
-    step "Installing skills..."
-    echo ""
-    _integrate_install_skills false || true
-    echo ""
-  fi
-
-  if $do_rules; then
-    step "Installing instructions..."
-    echo ""
-    _integrate_install_instructions false || true
-    echo ""
-  fi
-
-  if ! $do_editor; then
-    return 0
-  fi
 
   # Build and hand off the editor integration prompt to the agent
   step "Building editor integration plan..."
@@ -3234,17 +2917,10 @@ cmd_integrate() {
 usage_integrate() {
   cat <<EOF
 
-${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan] [--only <components>]
+${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan]
 
-  Installs ck and cqs if missing, copies bundled skill files, ensures global
-  instruction rules are present, then asks your coding agent to integrate your
-  editor with the zproj review workflow.
-
-  Tools (ck, cqs), skills, and instruction rules are handled by zproj directly
-  — no agent involvement needed. Any \`skills/*/SKILL.md\` file in the zproj
-  repository is installed to the agent's global skills directory. Adding a new
-  skill or rule to the repo is all that is needed for it to be picked up on
-  the next run.
+  Installs ck and cqs if missing, then asks your coding agent to integrate
+  your editor with the zproj review workflow.
 
   The editor integration prompt is assembled from facts zproj already knows
   (editor binary, agent binary, review notes path, zproj version) and
@@ -3258,32 +2934,13 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan] [--only <components>]
     5. Explain how to test the result
 
 ${BOLD}Options:${RESET}
-  --plan                   Dry run: show what tools would be installed, what
-                           skills would be copied, and print the editor prompt.
-                           Nothing runs.
-  --only <components>      Run only the specified components. Comma-separated
-                           list of: skills, rules, editor
-                           Example: --only skills,rules
-  --skills-only            Deprecated alias for --only skills,rules
+  --plan                   Dry run: show what tools would be installed and
+                           print the editor prompt. Nothing runs.
 
 ${BOLD}Tool installation:${RESET}
   ck:   cargo install ck-search               (preferred)
         npm install -g @beaconbay/ck-search   (fallback if no cargo)
   cqs:  cargo install cqs
-
-${BOLD}Skills directory per agent:${RESET}
-  opencode         → ~/.config/opencode/skills/
-  claude           → ~/.claude/skills/
-  codex            → ~/.agents/skills/
-  amp              → ~/.config/agents/skills/
-  agent (Cursor)   → ~/.cursor/skills/
-
-${BOLD}Global instructions file per agent:${RESET}
-  opencode         → ~/.config/opencode/AGENTS.md
-  claude           → ~/.claude/CLAUDE.md
-  codex            → ~/.codex/AGENTS.md
-  amp              → ~/.config/amp/AGENTS.md
-  agent (Cursor)   → (none — Cursor uses .cursor/rules/*.mdc)
 
 ${BOLD}Environment:${RESET}
   ZPROJ_INTEGRATE_DELAY   Seconds to wait for agent TUI before sending the
@@ -3291,11 +2948,8 @@ ${BOLD}Environment:${RESET}
                           agent starts slowly.
 
 ${BOLD}Examples:${RESET}
-  $SCRIPT_NAME integrate                        ${DIM}# install everything + editor integration${RESET}
-  $SCRIPT_NAME integrate --only skills,rules    ${DIM}# install skills and rules only${RESET}
-  $SCRIPT_NAME integrate --only editor          ${DIM}# editor integration only${RESET}
-  $SCRIPT_NAME integrate --plan                 ${DIM}# preview everything, write nothing${RESET}
-  $SCRIPT_NAME integrate --only skills --plan   ${DIM}# preview skills only${RESET}
+  $SCRIPT_NAME integrate              ${DIM}# install tools + editor integration${RESET}
+  $SCRIPT_NAME integrate --plan       ${DIM}# preview everything, write nothing${RESET}
 
 EOF
 }
@@ -5116,140 +4770,9 @@ NOTES
 
   # ── Section: SK — skills integration ────────────────────────────────────
 
-  # SK1–SK6: Use small temp scripts to test helper functions in isolation.
+  # SK10–SK12: Use small temp scripts to test helper functions in isolation.
   # We can't call internal functions directly from the test runner (set -e context),
   # so each test writes a tiny wrapper script and runs it via $BASH.
-
-  _section "SK1 — _agent_skills_dir: known agents return correct paths"
-  local sk1_script sk1_result
-  sk1_script="$(mktemp)"
-  # Extract just _agent_skills_dir from the main script and call it
-  {
-    echo "#!/usr/bin/env bash"
-    sed -n '/^_agent_skills_dir()/,/^}/p' "$0"
-    echo '_agent_skills_dir "$1"'
-  } > "$sk1_script"
-  chmod +x "$sk1_script"
-  sk1_result="$("$BASH" "$sk1_script" opencode 2>/dev/null)" || true
-  _t_check "SK1: opencode → .config/opencode/skills" \
-    bash -c '[[ "$1" == */".config/opencode/skills" ]]' -- "$sk1_result"
-  sk1_result="$("$BASH" "$sk1_script" claude 2>/dev/null)" || true
-  _t_check "SK1: claude → .claude/skills" \
-    bash -c '[[ "$1" == *"/.claude/skills" ]]' -- "$sk1_result"
-  sk1_result="$("$BASH" "$sk1_script" codex 2>/dev/null)" || true
-  _t_check "SK1: codex → .agents/skills" \
-    bash -c '[[ "$1" == *"/.agents/skills" ]]' -- "$sk1_result"
-  sk1_result="$("$BASH" "$sk1_script" amp 2>/dev/null)" || true
-  _t_check "SK1: amp → .config/agents/skills" \
-    bash -c '[[ "$1" == */".config/agents/skills" ]]' -- "$sk1_result"
-  sk1_result="$("$BASH" "$sk1_script" agent 2>/dev/null)" || true
-  _t_check "SK1: agent → .cursor/skills" \
-    bash -c '[[ "$1" == *"/.cursor/skills" ]]' -- "$sk1_result"
-  rm -f "$sk1_script" || true
-
-  _section "SK2 — _agent_skills_dir: unsupported agents return 1"
-  local sk2_script sk2_exit
-  sk2_script="$(mktemp)"
-  {
-    echo "#!/usr/bin/env bash"
-    sed -n '/^_agent_skills_dir()/,/^}/p' "$0"
-    echo '_agent_skills_dir "$1"'
-  } > "$sk2_script"
-  chmod +x "$sk2_script"
-  for sk2_agent in aider goose gemini unknown-agent; do
-    sk2_exit="$("$BASH" "$sk2_script" "$sk2_agent" &>/dev/null; echo $?)" || true
-    _t_check "SK2: $sk2_agent exits 1" test "$sk2_exit" -eq 1
-  done
-  rm -f "$sk2_script" || true
-
-  _section "SK3 — _resolve_zproj_skills_dir: finds skills/ next to script"
-  local sk3_dir sk3_script sk3_result
-  sk3_dir="$(mktemp -d)"
-  # Write a script in sk3_dir that contains _resolve_zproj_skills_dir and calls it
-  sk3_script="$sk3_dir/zproj-sk3"
-  {
-    echo "#!/usr/bin/env bash"
-    sed -n '/^_resolve_zproj_skills_dir()/,/^}/p' "$0"
-    echo '_resolve_zproj_skills_dir'
-  } > "$sk3_script"
-  chmod +x "$sk3_script"
-  mkdir -p "$sk3_dir/skills/mytool"
-  touch "$sk3_dir/skills/mytool/SKILL.md"
-  sk3_result="$("$BASH" "$sk3_script" 2>/dev/null)" || true
-  _t_check "SK3: returns path containing skills/" \
-    bash -c '[[ "$1" == */skills ]]' -- "$sk3_result"
-  _t_check "SK3: returned path exists" test -d "$sk3_result"
-  rm -rf "$sk3_dir" || true
-
-  _section "SK4 — _resolve_zproj_skills_dir: returns 1 when skills/ absent"
-  local sk4_dir sk4_script sk4_exit
-  sk4_dir="$(mktemp -d)"
-  sk4_script="$sk4_dir/zproj-sk4"
-  {
-    echo "#!/usr/bin/env bash"
-    sed -n '/^_resolve_zproj_skills_dir()/,/^}/p' "$0"
-    echo '_resolve_zproj_skills_dir'
-  } > "$sk4_script"
-  chmod +x "$sk4_script"
-  # No skills/ directory — should return 1
-  sk4_exit="$("$BASH" "$sk4_script" &>/dev/null; echo $?)" || true
-  _t_check "SK4: exits 1 when skills/ absent" test "$sk4_exit" -eq 1
-  rm -rf "$sk4_dir" || true
-
-  _section "SK5 — integrate --skills-only: copies skill files to target dir"
-  local sk5_src sk5_home sk5_target
-  sk5_src="$(mktemp -d)"
-  sk5_home="$(mktemp -d)"
-  sk5_target="${sk5_home}/.config/opencode/skills"
-  mkdir -p "$sk5_src/skills/mytool"
-  printf '%s\n' '---' 'name: mytool' 'description: test skill' '---' '# Mytool' 'Do stuff.' \
-    > "$sk5_src/skills/mytool/SKILL.md"
-  cp "$0" "$sk5_src/zproj"
-  # Run --skills-only from the fake repo dir with fake HOME so nothing real is touched
-  CODING_AGENT=opencode HOME="$sk5_home" "$BASH" "$sk5_src/zproj" \
-    integrate --skills-only &>/dev/null || true
-  _t_check "SK5: SKILL.md copied to target" \
-    test -f "${sk5_target}/mytool/SKILL.md"
-  _t_check "SK5: SKILL.md content correct" \
-    grep -q "Do stuff" "${sk5_target}/mytool/SKILL.md"
-  rm -rf "$sk5_src" "$sk5_home" || true
-
-  _section "SK6 — integrate --skills-only: installs multiple skills"
-  local sk6_src sk6_home sk6_target
-  sk6_src="$(mktemp -d)"
-  sk6_home="$(mktemp -d)"
-  sk6_target="${sk6_home}/.config/opencode/skills"
-  mkdir -p "$sk6_src/skills/alpha" "$sk6_src/skills/beta"
-  printf '%s\n' '---' 'name: alpha' 'description: alpha' '---' '# Alpha' \
-    > "$sk6_src/skills/alpha/SKILL.md"
-  printf '%s\n' '---' 'name: beta' 'description: beta' '---' '# Beta' \
-    > "$sk6_src/skills/beta/SKILL.md"
-  cp "$0" "$sk6_src/zproj"
-  CODING_AGENT=opencode HOME="$sk6_home" "$BASH" "$sk6_src/zproj" \
-    integrate --skills-only &>/dev/null || true
-  _t_check "SK6: alpha/SKILL.md installed" test -f "${sk6_target}/alpha/SKILL.md"
-  _t_check "SK6: beta/SKILL.md installed"  test -f "${sk6_target}/beta/SKILL.md"
-  rm -rf "$sk6_src" "$sk6_home" || true
-
-  _section "SK9 — integrate --skills-only: creates target dir if absent"
-  local sk9_src sk9_home sk9_target
-  sk9_src="$(mktemp -d)"
-  sk9_home="$(mktemp -d)"
-  # Remove the config dir entirely to simulate a fresh machine
-  rm -rf "${sk9_home}/.config"
-  sk9_target="${sk9_home}/.config/opencode/skills"
-  mkdir -p "$sk9_src/skills/mytool"
-  printf '%s\n' '---' 'name: mytool' 'description: test' '---' '# Mytool' \
-    > "$sk9_src/skills/mytool/SKILL.md"
-  cp "$0" "$sk9_src/zproj"
-  CODING_AGENT=opencode HOME="$sk9_home" "$BASH" "$sk9_src/zproj" \
-    integrate --skills-only &>/dev/null || true
-  _t_check "SK9: target dir auto-created"    test -d "$sk9_target"
-  _t_check "SK9: SKILL.md present after create" test -f "${sk9_target}/mytool/SKILL.md"
-  rm -rf "$sk9_src" "$sk9_home" || true
-
-  # SK10–SK12 use isolated scripts that extract only the needed functions,
-  # avoiding the source<(...) approach which misses helper stubs (dim, step, warn).
 
   _section "SK10 — _integrate_install_tools: cargo preferred when both cargo and npm present"
   local sk10_dir sk10_script sk10_out
@@ -5310,282 +4833,11 @@ NOTES
   _t_grep "SK12: cqs shows installed" "installed.*cqs" echo "$sk12_out"
   rm -rf "$sk12_dir" || true
 
-  _section "SK7 — integrate --plan: contains editor prompt and tools/skills dry-run"
+  _section "SK7 — integrate --plan: contains editor prompt and tools dry-run"
   local sk7_out
   sk7_out="$(CODING_AGENT=opencode "$BASH" "$0" integrate --plan 2>/dev/null)" || true
   _t_grep "SK7: contains editor mission section" "zproj review"                           echo "$sk7_out"
   _t_grep "SK7: contains tools section"          "installed\|would install"               echo "$sk7_out"
-  _t_grep "SK7: contains skills section"         "would install\|would update\|up to date" echo "$sk7_out"
-
-  _section "SK8 — integrate --skills-only --plan: dry-run output, no files written"
-  local sk8_src sk8_home sk8_out
-  sk8_src="$(mktemp -d)"
-  sk8_home="$(mktemp -d)"
-  mkdir -p "$sk8_src/skills/mytool"
-  printf '%s\n' '---' 'name: mytool' 'description: test' '---' '# Mytool' \
-    > "$sk8_src/skills/mytool/SKILL.md"
-  cp "$0" "$sk8_src/zproj"
-  sk8_out="$(CODING_AGENT=opencode HOME="$sk8_home" "$BASH" "$sk8_src/zproj" \
-    integrate --skills-only --plan 2>/dev/null)" || true
-  _t_grep  "SK8: dry-run shows would-install" "would install" echo "$sk8_out"
-  _t_check "SK8: no files actually written" \
-    bash -c '! test -d "$1/.config/opencode/skills"' -- "$sk8_home"
-  _t_check "SK8: no editor section in output" \
-    bash -c '! echo "$1" | grep -q "zproj review dispatch"' -- "$sk8_out"
-  rm -rf "$sk8_src" "$sk8_home" || true
-
-  _section "OL1 — integrate --only skills,rules --plan: shows skills+rules, no editor prompt"
-  local ol1_src ol1_home ol1_out
-  ol1_src="$(mktemp -d)"
-  ol1_home="$(mktemp -d)"
-  mkdir -p "$ol1_src/skills/mytool"
-  printf '%s\n' '---' 'name: mytool' 'description: test' '---' '# Mytool' \
-    > "$ol1_src/skills/mytool/SKILL.md"
-  cp "$0" "$ol1_src/zproj"
-  ol1_out="$(CODING_AGENT=opencode HOME="$ol1_home" "$BASH" "$ol1_src/zproj" \
-    integrate --only skills,rules --plan 2>/dev/null)" || true
-  _t_grep  "OL1: shows skills section"        "Skills"              echo "$ol1_out"
-  _t_grep  "OL1: shows instructions section"  "Instructions"        echo "$ol1_out"
-  _t_check "OL1: no editor prompt in output" \
-    bash -c '! echo "$1" | grep -q "zproj review dispatch"' -- "$ol1_out"
-  rm -rf "$ol1_src" "$ol1_home" || true
-
-  _section "OL2 — integrate --only skills --plan: shows skills, no rules, no editor prompt"
-  local ol2_src ol2_home ol2_out
-  ol2_src="$(mktemp -d)"
-  ol2_home="$(mktemp -d)"
-  mkdir -p "$ol2_src/skills/mytool"
-  printf '%s\n' '---' 'name: mytool' 'description: test' '---' '# Mytool' \
-    > "$ol2_src/skills/mytool/SKILL.md"
-  cp "$0" "$ol2_src/zproj"
-  ol2_out="$(CODING_AGENT=opencode HOME="$ol2_home" "$BASH" "$ol2_src/zproj" \
-    integrate --only skills --plan 2>/dev/null)" || true
-  _t_grep  "OL2: shows skills section"          "Skills"              echo "$ol2_out"
-  _t_check "OL2: no instructions section" \
-    bash -c '! echo "$1" | grep -q "^Instructions:"' -- "$ol2_out"
-  _t_check "OL2: no editor prompt in output" \
-    bash -c '! echo "$1" | grep -q "zproj review dispatch"' -- "$ol2_out"
-  rm -rf "$ol2_src" "$ol2_home" || true
-
-  _section "OL3 — integrate --only rules --plan: shows rules, no skills, no editor prompt"
-  local ol3_src ol3_home ol3_out
-  ol3_src="$(mktemp -d)"
-  ol3_home="$(mktemp -d)"
-  mkdir -p "$ol3_src/skills/mytool"
-  printf '%s\n' '---' 'name: mytool' 'description: test' '---' '# Mytool' \
-    > "$ol3_src/skills/mytool/SKILL.md"
-  cp "$0" "$ol3_src/zproj"
-  ol3_out="$(CODING_AGENT=opencode HOME="$ol3_home" "$BASH" "$ol3_src/zproj" \
-    integrate --only rules --plan 2>/dev/null)" || true
-  _t_grep  "OL3: shows instructions section"    "Instructions"        echo "$ol3_out"
-  _t_check "OL3: no skills section" \
-    bash -c '! echo "$1" | grep -q "^Skills:"' -- "$ol3_out"
-  _t_check "OL3: no editor prompt in output" \
-    bash -c '! echo "$1" | grep -q "zproj review dispatch"' -- "$ol3_out"
-  rm -rf "$ol3_src" "$ol3_home" || true
-
-  _section "OL4 — integrate --only editor --plan: shows editor prompt, no skills/rules sections"
-  local ol4_out
-  ol4_out="$(CODING_AGENT=opencode "$BASH" "$0" integrate --only editor --plan 2>/dev/null)" || true
-  _t_grep  "OL4: contains editor prompt"   "zproj review dispatch"  echo "$ol4_out"
-  _t_check "OL4: no skills section" \
-    bash -c '! echo "$1" | grep -q "^Skills:"' -- "$ol4_out"
-  _t_check "OL4: no instructions section" \
-    bash -c '! echo "$1" | grep -q "^Instructions:"' -- "$ol4_out"
-
-  _section "OL5 — integrate --only with unknown component: exits non-zero"
-  local ol5_exit
-  ol5_exit="$(_zproj_exit integrate --only badvalue --plan)"
-  _t_check "OL5: exits non-zero for unknown component" test "$ol5_exit" -ne 0
-
-  _section "OL6 — integrate --skills-only --plan: deprecated alias behaves like --only skills,rules"
-  local ol6_src ol6_home ol6_out
-  ol6_src="$(mktemp -d)"
-  ol6_home="$(mktemp -d)"
-  mkdir -p "$ol6_src/skills/mytool"
-  printf '%s\n' '---' 'name: mytool' 'description: test' '---' '# Mytool' \
-    > "$ol6_src/skills/mytool/SKILL.md"
-  cp "$0" "$ol6_src/zproj"
-  ol6_out="$(CODING_AGENT=opencode HOME="$ol6_home" "$BASH" "$ol6_src/zproj" \
-    integrate --skills-only --plan 2>/dev/null)" || true
-  _t_grep  "OL6: shows skills section"       "Skills"      echo "$ol6_out"
-  _t_grep  "OL6: shows instructions section" "Instructions" echo "$ol6_out"
-  _t_check "OL6: no editor prompt in output" \
-    bash -c '! echo "$1" | grep -q "zproj review dispatch"' -- "$ol6_out"
-  rm -rf "$ol6_src" "$ol6_home" || true
-
-  _section "OL7 — integrate --only skills,rules: installs skills to disk, no editor"
-  local ol7_src ol7_home ol7_target
-  ol7_src="$(mktemp -d)"
-  ol7_home="$(mktemp -d)"
-  ol7_target="${ol7_home}/.config/opencode/skills"
-  mkdir -p "$ol7_src/skills/mytool"
-  printf '%s\n' '---' 'name: mytool' 'description: test' '---' '# Mytool' \
-    > "$ol7_src/skills/mytool/SKILL.md"
-  cp "$0" "$ol7_src/zproj"
-  CODING_AGENT=opencode HOME="$ol7_home" "$BASH" "$ol7_src/zproj" \
-    integrate --only skills,rules &>/dev/null || true
-  _t_check "OL7: SKILL.md installed to disk" test -f "${ol7_target}/mytool/SKILL.md"
-  rm -rf "$ol7_src" "$ol7_home" || true
-
-  # ── Section: IN — global instructions file mapping ───────────────────────
-
-  _section "IN1 — _agent_instructions_file: known agents return correct paths"
-  local in1_result
-  in1_result="$(_agent_instructions_file opencode 2>/dev/null)" || true
-  _t_check "IN1: opencode → .config/opencode/AGENTS.md" \
-    bash -c '[[ "$1" == */".config/opencode/AGENTS.md" ]]' -- "$in1_result"
-  in1_result="$(_agent_instructions_file claude 2>/dev/null)" || true
-  _t_check "IN1: claude → .claude/CLAUDE.md" \
-    bash -c '[[ "$1" == *"/.claude/CLAUDE.md" ]]' -- "$in1_result"
-  in1_result="$(_agent_instructions_file codex 2>/dev/null)" || true
-  _t_check "IN1: codex → .codex/AGENTS.md" \
-    bash -c '[[ "$1" == *"/.codex/AGENTS.md" ]]' -- "$in1_result"
-  in1_result="$(_agent_instructions_file amp 2>/dev/null)" || true
-  _t_check "IN1: amp → .config/amp/AGENTS.md" \
-    bash -c '[[ "$1" == */".config/amp/AGENTS.md" ]]' -- "$in1_result"
-
-  _section "IN2 — _agent_instructions_file: unsupported agents return 1"
-  local in2_exit
-  for in2_agent in aider goose gemini agent unknown-agent; do
-    in2_exit="$(_agent_instructions_file "$in2_agent" &>/dev/null; echo $?)" || true
-    _t_check "IN2: $in2_agent exits 1" test "$in2_exit" -eq 1
-  done
-
-  # ── Section: RU — rules/ directory and ensure-rule mechanics ─────────────
-
-  _section "RU1 — _resolve_zproj_rules_dir: finds rules/ next to script"
-  local ru1_dir ru1_script ru1_result
-  ru1_dir="$(mktemp -d)"
-  mkdir -p "$ru1_dir/rules"
-  touch "$ru1_dir/rules/test.md"
-  ru1_script="$ru1_dir/zproj-ru1"
-  { echo "#!/usr/bin/env bash"
-    sed -n '/^_resolve_zproj_rules_dir()/,/^}/p' "$0"
-    echo '_resolve_zproj_rules_dir'
-  } > "$ru1_script"
-  chmod +x "$ru1_script"
-  ru1_result="$("$BASH" "$ru1_script" 2>/dev/null)" || true
-  _t_check "RU1: returns path containing rules/" \
-    bash -c '[[ "$1" == */rules ]]' -- "$ru1_result"
-  _t_check "RU1: returned path exists" test -d "$ru1_result"
-  rm -rf "$ru1_dir" || true
-
-  _section "RU2 — _resolve_zproj_rules_dir: returns 1 when rules/ absent"
-  local ru2_dir ru2_script ru2_exit
-  ru2_dir="$(mktemp -d)"
-  ru2_script="$ru2_dir/zproj-ru2"
-  { echo "#!/usr/bin/env bash"
-    sed -n '/^_resolve_zproj_rules_dir()/,/^}/p' "$0"
-    echo '_resolve_zproj_rules_dir'
-  } > "$ru2_script"
-  chmod +x "$ru2_script"
-  ru2_exit="$("$BASH" "$ru2_script" &>/dev/null; echo $?)" || true
-  _t_check "RU2: exits 1 when rules/ absent" test "$ru2_exit" -eq 1
-  rm -rf "$ru2_dir" || true
-
-  _section "RU3 — _rule_marker_from_file: parses marker from frontmatter"
-  local ru3_rule ru3_marker
-  ru3_rule="$(mktemp)"
-  printf '%s\n' '---' 'marker: "my stable marker text"' '---' 'Rule body here.' \
-    > "$ru3_rule"
-  ru3_marker="$(_rule_marker_from_file "$ru3_rule")"
-  _t_check "RU3: marker parsed correctly" \
-    bash -c '[[ "$1" == "my stable marker text" ]]' -- "$ru3_marker"
-  rm -f "$ru3_rule" || true
-
-  _section "RU4 — _rule_body_from_file: returns body after second ---"
-  local ru4_rule ru4_body
-  ru4_rule="$(mktemp)"
-  printf '%s\n' '---' 'marker: "test marker"' '---' 'This is the rule body.' \
-    > "$ru4_rule"
-  ru4_body="$(_rule_body_from_file "$ru4_rule")"
-  _t_check "RU4: body contains rule text" \
-    bash -c '[[ "$1" == *"rule body"* ]]' -- "$ru4_body"
-  _t_check "RU4: body does not contain frontmatter" \
-    bash -c '! [[ "$1" == *"marker"* ]]' -- "$ru4_body"
-  rm -f "$ru4_rule" || true
-
-  _section "RU5 — _integrate_ensure_rule: creates file with rule when absent"
-  local ru5_rule ru5_home ru5_file
-  ru5_rule="$(mktemp)"
-  printf '%s\n' '---' 'marker: "ru5 marker text"' '---' 'RU5 rule body.' > "$ru5_rule"
-  ru5_home="$(mktemp -d)"
-  ru5_file="${ru5_home}/.config/opencode/AGENTS.md"
-  _integrate_ensure_rule "$ru5_rule" "$ru5_file" false &>/dev/null
-  _t_check "RU5: file created"    test -f "$ru5_file"
-  _t_grep  "RU5: body written"    "RU5 rule body" cat "$ru5_file"
-  rm -rf "$ru5_home" "$ru5_rule" || true
-
-  _section "RU6 — _integrate_ensure_rule: appends rule to existing file"
-  local ru6_rule ru6_home ru6_file
-  ru6_rule="$(mktemp)"
-  printf '%s\n' '---' 'marker: "ru6 marker text"' '---' 'RU6 rule body.' > "$ru6_rule"
-  ru6_home="$(mktemp -d)"
-  ru6_file="${ru6_home}/.config/opencode/AGENTS.md"
-  mkdir -p "$(dirname "$ru6_file")"
-  echo "Existing content." > "$ru6_file"
-  _integrate_ensure_rule "$ru6_rule" "$ru6_file" false &>/dev/null
-  _t_grep "RU6: original content preserved" "Existing content" cat "$ru6_file"
-  _t_grep "RU6: rule body appended"         "RU6 rule body"    cat "$ru6_file"
-  rm -rf "$ru6_home" "$ru6_rule" || true
-
-  _section "RU7 — _integrate_ensure_rule: idempotent when marker already present"
-  local ru7_rule ru7_home ru7_file ru7_lines_before ru7_lines_after
-  ru7_rule="$(mktemp)"
-  printf '%s\n' '---' 'marker: "ru7 marker text"' '---' 'RU7 rule body.' > "$ru7_rule"
-  ru7_home="$(mktemp -d)"
-  ru7_file="${ru7_home}/.config/opencode/AGENTS.md"
-  mkdir -p "$(dirname "$ru7_file")"
-  echo "RU7 rule body. ru7 marker text already here." > "$ru7_file"
-  ru7_lines_before="$(wc -l < "$ru7_file")"
-  _integrate_ensure_rule "$ru7_rule" "$ru7_file" false &>/dev/null
-  ru7_lines_after="$(wc -l < "$ru7_file")"
-  _t_check "RU7: line count unchanged" test "$ru7_lines_before" -eq "$ru7_lines_after"
-  rm -rf "$ru7_home" "$ru7_rule" || true
-
-  _section "RU8 — _integrate_ensure_rule: dry-run does not write files"
-  local ru8_rule ru8_home ru8_file ru8_out
-  ru8_rule="$(mktemp)"
-  printf '%s\n' '---' 'marker: "ru8 marker text"' '---' 'RU8 rule body.' > "$ru8_rule"
-  ru8_home="$(mktemp -d)"
-  ru8_file="${ru8_home}/.config/opencode/AGENTS.md"
-  ru8_out="$(_integrate_ensure_rule "$ru8_rule" "$ru8_file" true 2>/dev/null)"
-  _t_check "RU8: no file written"           bash -c '! test -f "$1"' -- "$ru8_file"
-  _t_grep  "RU8: dry-run reports would-add" "would add" echo "$ru8_out"
-  rm -rf "$ru8_home" "$ru8_rule" || true
-
-  _section "RU9 — _integrate_install_instructions: iterates multiple rule files"
-  local ru9_rules_dir ru9_home ru9_file ru9_script
-  ru9_rules_dir="$(mktemp -d)"
-  printf '%s\n' '---' 'marker: "ru9 alpha marker"' '---' 'RU9 alpha rule.' \
-    > "$ru9_rules_dir/alpha.md"
-  printf '%s\n' '---' 'marker: "ru9 beta marker"' '---' 'RU9 beta rule.' \
-    > "$ru9_rules_dir/beta.md"
-  ru9_home="$(mktemp -d)"
-  ru9_file="${ru9_home}/.config/opencode/AGENTS.md"
-  ru9_script="$(mktemp)"
-  {
-    echo "#!/usr/bin/env bash"
-    echo "dim() { :; }; step() { :; }; warn() { echo \"WARN: \$*\" >&2; }"
-    echo "_agent_instructions_file() { echo \"$ru9_file\"; return 0; }"
-    echo "_resolve_zproj_rules_dir()  { echo \"$ru9_rules_dir\"; return 0; }"
-    sed -n '/^_rule_marker_from_file()/,/^}/p' "$0"
-    sed -n '/^_rule_body_from_file()/,/^}/p' "$0"
-    sed -n '/^_integrate_ensure_rule()/,/^}/p' "$0"
-    sed -n '/^_integrate_install_instructions()/,/^}/p' "$0"
-    echo "CODING_AGENT=opencode _integrate_install_instructions false"
-  } > "$ru9_script"
-  chmod +x "$ru9_script"
-  "$BASH" "$ru9_script" &>/dev/null || true
-  _t_grep "RU9: alpha rule installed" "RU9 alpha rule" cat "$ru9_file"
-  _t_grep "RU9: beta rule installed"  "RU9 beta rule"  cat "$ru9_file"
-  rm -rf "$ru9_rules_dir" "$ru9_home" "$ru9_script" || true
-
-  _section "IN7 — integrate --plan: includes instructions dry-run section"
-  local in7_out
-  in7_out="$(CODING_AGENT=opencode "$BASH" "$0" integrate --plan 2>/dev/null)" || true
-  _t_grep "IN7: instructions section present" "Instructions" echo "$in7_out"
 
   _section "TX1 — _tmux_config_path: returns XDG when it exists"
   local tx1_home tx1_xdg tx1_script tx1_result

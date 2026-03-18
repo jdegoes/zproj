@@ -6,8 +6,7 @@ Single-file bash script (`zproj`) managing parallel git worktrees with tmux.
 Each worktree gets a tmux window with a 3-pane layout (coding agent, editor,
 shell). Includes a review workflow for annotating diffs and dispatching notes.
 
-Also in the repo: `skills/` and `rules/` (installed by `zproj integrate`),
-`README.md` (user-facing docs).
+`README.md` contains user-facing docs.
 
 ## Build & Test
 
@@ -37,7 +36,7 @@ Before every commit:
 1. **Constants** — `VERSION`, `BARE_DIR`, color vars, `_KNOWN_AGENTS`
 2. **Helpers** — `die`, `warn`, `_version_gte`, `_dotglob_expand`, `_git_is_registered_worktree`, `_git_default_branch`
 3. **Dependency checks** — `check_git`, `check_session_deps`
-4. **Tool resolution** — `_resolve_editor`, `_resolve_ai`, `_agent_skills_dir`, `_agent_instructions_file`
+4. **Tool resolution** — `_resolve_editor`, `_resolve_ai`
 5. **Directory resolution** — `resolve_project_dir`
 6. **Init helpers** — `_init_bare_structure`, `_case1_plain_dir`, `_case2_upgrade_repo`
 7. **Subcommands** — `cmd_init`, `cmd_clone`, `cmd_create`, `cmd_delete`, `cmd_launch`, `cmd_list`, `cmd_open`, `cmd_default`, `cmd_review`, `cmd_diagnostics`, `cmd_integrate`
@@ -51,7 +50,7 @@ Every feature, behaviour change, or bug fix requires tests. No exceptions.
 
 Helpers: `_t_check "desc" <cmd>` (pass if exit 0), `_t_grep "desc" <pattern> <cmd>` (pass if output matches), `_t_pass`, `_t_fail`, `_t_skip`, `_section "XX1 — desc"`.
 
-Each section uses a unique 1-3 letter prefix: R (init), C (plain dir), U (upgrade), E (editor), A (agent), RP (cursor), P/V/RC/D (review), I (integrate), X (diagnostics), T (tmux/launch), B (regressions), TM (session names), S (safety/meta), N (edge cases), RT (runtime), SK (skills), IN (instructions), RU (rules), OL (--only), TX (tmux config).
+Each section uses a unique 1-3 letter prefix: R (init), C (plain dir), U (upgrade), E (editor), A (agent), RP (cursor), P/V/RC/D (review), I (integrate), X (diagnostics), T (tmux/launch), B (regressions), TM (session names), S (safety/meta), N (edge cases), RT (runtime), SK (tools), TX (tmux config).
 
 To add a test: find the prefix, use the next number (e.g. `T12` exists, add `T13`), place adjacent to related tests. Tests requiring tmux are gated behind `command -v tmux`; tests requiring specific binaries use `_t_skip`.
 
@@ -69,10 +68,8 @@ To add a test: find the prefix, use the next number (e.g. `T12` exists, add `T13
 ### Adding a coding agent
 
 1. Append to `_KNOWN_AGENTS` (order = discovery priority)
-2. Add case in `_agent_skills_dir()` if it supports skills
-3. Add case in `_agent_instructions_file()` if it has global instructions
-4. Add tests in SK and IN sections
-5. Update `usage_launch` help text
+2. Update `usage_launch` help text
+3. Add tests
 
 ### Fixing a bug
 
@@ -110,7 +107,6 @@ Most tmux behaviours *can* be tested via `tmux list-panes`, `tmux list-windows`,
 - Use `die` inside a function that needs cleanup — use `_err` + `return 1`
 - Edit `zproj` via a symlink — edit in the worktree directory
 - Add comments restating what code does — only explain *why*
-- Modify `skills/` or `rules/` unless asked
 
 ## When Stuck
 
