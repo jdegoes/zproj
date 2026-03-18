@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.12.0"
+readonly VERSION="4.13.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -2744,7 +2744,7 @@ cmd_diagnostics() {
 # All facts known to zproj are embedded directly — the agent does not guess.
 _integrate_build_prompt() {
   local zproj_path editor editor_binary ai ai_binary review_path_rel review_path_abs
-  local zproj_version diffview_lua_contents tmux_conf
+  local zproj_version diffview_lua_contents
 
   zproj_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   zproj_version="$VERSION"
@@ -2754,7 +2754,6 @@ _integrate_build_prompt() {
   ai_binary="${ai%% *}"
   [[ -z "$ai_binary" ]] && ai_binary="(none detected)"
   review_path_rel="$REVIEW_NOTES_RELPATH"
-  tmux_conf="$(_tmux_config_path)"
 
   # Absolute review path only meaningful inside a worktree; best-effort
   review_path_abs="$("$zproj_path" review path --abs 2>/dev/null)" \
@@ -2927,42 +2926,8 @@ zproj is a workflow manager that combines:
 The user opens a project with \`zproj launch <worktree>\` and gets all three
 tools in one window, already positioned in the worktree directory.
 
----
-
-## tmux worktree keybindings
-
-In addition to the editor integration, you must add the following tmux key
-bindings to the user's tmux config file (\`${tmux_conf}\`). These bindings make worktree
-management available from anywhere inside the tmux session, without needing
-a shell prompt:
-
-\`\`\`tmux
-# zproj integration — worktree management from inside tmux
-bind N command-prompt -p "new worktree name:" "run-shell 'cd #{pane_current_path}/.. && zproj %% > /dev/null 2>&1'"
-bind X confirm-before -p "delete worktree '#{window_name}'? (y/n)" "run-shell 'cd #{pane_current_path}/.. && zproj delete #{window_name} --force > /dev/null 2>&1; tmux refresh-client'"
-bind F command-prompt -p "fork to new worktree:" "run-shell 'cd #{pane_current_path}/.. && zproj fork #{window_name} %% > /dev/null 2>&1'"
-bind J command-prompt -p "join into worktree:" "run-shell 'cd #{pane_current_path}/.. && zproj join #{window_name} %% > /dev/null 2>&1'"
-\`\`\`
-
-**What these do:**
-
-| Binding | Action |
-|---------|--------|
-| \`<prefix> N\` | Prompts for a worktree name, then runs \`zproj <name>\` from the project root — creates the worktree, branch, and opens a new 3-pane tmux window in one step |
-| \`<prefix> X\` | Asks for confirmation, then runs \`zproj delete <window_name> --force\` — removes the current worktree, its branch, and closes the tmux window |
-| \`<prefix> F\` | Prompts for a new worktree name, then forks the current worktree into it — creates a new worktree at the same commit and opens a tmux window for it |
-| \`<prefix> J\` | Prompts for a target worktree name, then joins (merges) the current worktree into it — on success, deletes the current worktree |
-
-All bindings derive the project root from \`#{pane_current_path}/..\`, so
-they work correctly from any pane in any worktree window without needing the
-user to navigate manually. \`zproj <name>\` handles the upsert: if the
-worktree doesn't exist it creates it; if it already exists it switches to it.
-
-Check whether these binding names (\`N\`, \`X\`, \`F\`, \`J\`) conflict with any
-existing bindings in the user's tmux config. If they do, choose alternatives
-and document the change. Note that lowercase \`j\` (pane navigation) and
-uppercase \`J\` are distinct in tmux. If the tmux config file does not exist,
-create it with just these bindings.
+tmux keybindings for worktree management (create, delete, fork, join) are
+installed automatically by \`zproj integrate\` — no editor-side action needed.
 
 ---
 
@@ -3120,11 +3085,10 @@ exact file path to check, and the exact output to expect.
 When done, provide a structured summary:
 
 1. **Editor found on this machine:** (what you detected in Step 1)
-2. **tmux prefix key:** (what \`prefix\` is set to in \`~/.tmux.conf\`, or the default \`C-b\`)
-3. **Integration status before this session:** (A / B / C from Step 2)
-4. **Changes made:** list every file modified and what was added
-5. **How to test:** the step-by-step instructions from Step 4
-6. **Notes:** anything unusual about this editor's integration approach,
+2. **Integration status before this session:** (A / B / C from Step 2)
+3. **Changes made:** list every file modified and what was added
+4. **How to test:** the step-by-step instructions from Step 4
+5. **Notes:** anything unusual about this editor's integration approach,
    or any limitations the user should know about
 
 PROMPT
@@ -3136,6 +3100,81 @@ PROMPT
 # Install ck and cqs if not already present.
 # With dry_run=true: prints what would be run without executing anything.
 # Picks the best available installer: npm preferred for ck, cargo for cqs.
+_integrate_install_tmux_bindings() {
+  local dry_run="${1:-false}"
+  local conf
+  conf="$(_tmux_config_path)"
+
+  # The full binding block. Written as a heredoc to avoid quote-escaping hell.
+  local _bind_block
+  _bind_block="$(cat <<'TMUX_BINDINGS'
+bind N command-prompt -p "new worktree name:" "run-shell 'cd #{pane_current_path}/.. && zproj %% > /dev/null 2>&1'"
+bind X confirm-before -p "delete worktree '#{window_name}'? (y/n)" "run-shell 'cd #{pane_current_path}/.. && zproj delete #{window_name} --force > /dev/null 2>&1; tmux refresh-client'"
+bind F command-prompt -p "fork to new worktree:" "run-shell 'cd #{pane_current_path}/.. && zproj fork #{window_name} %% > /dev/null 2>&1'"
+bind J command-prompt -p "join into worktree:" "run-shell 'cd #{pane_current_path}/.. && zproj join #{window_name} %% > /dev/null 2>&1'"
+TMUX_BINDINGS
+)"
+
+  # Check which bindings are already present by grepping for each key+zproj
+  local -a bind_keys=( N X F J )
+  local -a missing_keys=() missing_lines=()
+  local key line
+  while IFS= read -r line; do
+    key="${line#bind }"
+    key="${key%% *}"
+    if [[ -f "$conf" ]] && grep -q "bind ${key} .*zproj" "$conf" 2>/dev/null; then
+      dim "  [already present]  bind ${key}  (${conf})"
+    else
+      missing_keys+=("$key")
+      missing_lines+=("$line")
+    fi
+  done <<< "$_bind_block"
+
+  if [[ ${#missing_keys[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  if $dry_run; then
+    local mk
+    for mk in "${missing_keys[@]}"; do
+      echo "  [would add]  bind ${mk}  (${conf})"
+    done
+    return 0
+  fi
+
+  # Append missing bindings
+  local marker="# zproj integration"
+  if [[ ! -f "$conf" ]]; then
+    mkdir -p "$(dirname "$conf")"
+    {
+      echo "$marker"
+      local ml
+      for ml in "${missing_lines[@]}"; do
+        echo "$ml"
+      done
+    } > "$conf"
+    step "  [created]  ${conf}"
+  else
+    local needs_marker=true
+    grep -qF "$marker" "$conf" && needs_marker=false
+    {
+      echo ""
+      if $needs_marker; then
+        echo "$marker"
+      fi
+      local ml
+      for ml in "${missing_lines[@]}"; do
+        echo "$ml"
+      done
+    } >> "$conf"
+  fi
+
+  local mk
+  for mk in "${missing_keys[@]}"; do
+    step "  [added]  bind ${mk}  (${conf})"
+  done
+}
+
 cmd_integrate() {
   local plan_only=false
 
@@ -3155,6 +3194,9 @@ cmd_integrate() {
 
   if $plan_only; then
     _integrate_build_prompt
+    echo ""
+    echo -e "${BOLD}tmux bindings (dry run):${RESET}"
+    _integrate_install_tmux_bindings true
     return 0
   fi
 
@@ -3176,6 +3218,12 @@ cmd_integrate() {
   if [[ -z "$ai_binary" ]]; then
     die "No coding agent found. Install one (opencode, claude, etc.) or set \$CODING_AGENT."
   fi
+
+  # Install tmux keybindings directly
+  step "Installing tmux keybindings..."
+  echo ""
+  _integrate_install_tmux_bindings false
+  echo ""
 
   # Build and hand off the editor integration prompt to the agent
   step "Building editor integration plan..."
@@ -3237,8 +3285,9 @@ usage_integrate() {
 
 ${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan]
 
-  Asks your coding agent to integrate your editor with the zproj review
-  workflow.
+  Installs tmux keybindings for worktree management (create, delete, fork,
+  join), then asks your coding agent to integrate your editor with the zproj
+  review workflow.
 
   The editor integration prompt is assembled from facts zproj already knows
   (editor binary, agent binary, review notes path, zproj version) and
@@ -5277,6 +5326,84 @@ NOTES
   _t_check "FJ8: target is clean (merge aborted)" \
     bash -c '! git -C "$1/main" status --porcelain | grep -q .' -- "$fk_root"
   ( cd "$fk_root" && "$BASH" "$0" delete fj8-conflict --force &>/dev/null ) || true
+
+  # ── Section: TI — tmux binding installation ─────────────────────────────
+
+  _section "TI1 — tmux bindings: fresh install (no config file)"
+  local ti1_home ti1_conf
+  ti1_home="$(mktemp -d)"
+  ti1_conf="${ti1_home}/.tmux.conf"
+  ( HOME="$ti1_home" _integrate_install_tmux_bindings false &>/dev/null )
+  _t_check "TI1: config file created"          test -f "$ti1_conf"
+  _t_grep  "TI1: has marker comment"           "zproj integration"   cat "$ti1_conf"
+  _t_grep  "TI1: has bind N"                   "bind N.*zproj"       cat "$ti1_conf"
+  _t_grep  "TI1: has bind X"                   "bind X.*zproj"       cat "$ti1_conf"
+  _t_grep  "TI1: has bind F"                   "bind F.*zproj"       cat "$ti1_conf"
+  _t_grep  "TI1: has bind J"                   "bind J.*zproj"       cat "$ti1_conf"
+  rm -rf "$ti1_home" || true
+
+  _section "TI2 — tmux bindings: append to existing config"
+  local ti2_home ti2_conf
+  ti2_home="$(mktemp -d)"
+  ti2_conf="${ti2_home}/.tmux.conf"
+  echo "set -g mouse on" > "$ti2_conf"
+  ( HOME="$ti2_home" _integrate_install_tmux_bindings false &>/dev/null )
+  _t_grep  "TI2: original content preserved"   "set -g mouse on"     cat "$ti2_conf"
+  _t_grep  "TI2: has bind N"                   "bind N.*zproj"       cat "$ti2_conf"
+  _t_grep  "TI2: has bind F"                   "bind F.*zproj"       cat "$ti2_conf"
+  rm -rf "$ti2_home" || true
+
+  _section "TI3 — tmux bindings: idempotent when all present"
+  local ti3_home ti3_conf ti3_before ti3_after
+  ti3_home="$(mktemp -d)"
+  ti3_conf="${ti3_home}/.tmux.conf"
+  ( HOME="$ti3_home" _integrate_install_tmux_bindings false &>/dev/null )
+  ti3_before="$(wc -l < "$ti3_conf")"
+  ( HOME="$ti3_home" _integrate_install_tmux_bindings false &>/dev/null )
+  ti3_after="$(wc -l < "$ti3_conf")"
+  _t_check "TI3: line count unchanged"          test "$ti3_before" -eq "$ti3_after"
+  rm -rf "$ti3_home" || true
+
+  _section "TI4 — tmux bindings: upgrade adds missing F and J"
+  local ti4_home ti4_conf
+  ti4_home="$(mktemp -d)"
+  ti4_conf="${ti4_home}/.tmux.conf"
+  # Simulate old config with only N and X
+  cat > "$ti4_conf" <<'TI4EOF'
+# zproj integration
+bind N command-prompt -p "new worktree name:" "run-shell 'cd #{pane_current_path}/.. && zproj %% > /dev/null 2>&1'"
+bind X confirm-before -p "delete worktree '#{window_name}'? (y/n)" "run-shell 'cd #{pane_current_path}/.. && zproj delete #{window_name} --force > /dev/null 2>&1; tmux refresh-client'"
+TI4EOF
+  ( HOME="$ti4_home" _integrate_install_tmux_bindings false &>/dev/null )
+  _t_grep  "TI4: bind N still present"          "bind N.*zproj"       cat "$ti4_conf"
+  _t_grep  "TI4: bind X still present"          "bind X.*zproj"       cat "$ti4_conf"
+  _t_grep  "TI4: bind F added"                  "bind F.*zproj"       cat "$ti4_conf"
+  _t_grep  "TI4: bind J added"                  "bind J.*zproj"       cat "$ti4_conf"
+  # Marker should not be duplicated
+  local ti4_marker_count
+  ti4_marker_count="$(grep -c 'zproj integration' "$ti4_conf")" || ti4_marker_count=0
+  _t_check "TI4: marker not duplicated"          test "$ti4_marker_count" -eq 1
+  rm -rf "$ti4_home" || true
+
+  _section "TI5 — tmux bindings: dry-run writes nothing"
+  local ti5_home ti5_conf ti5_out
+  ti5_home="$(mktemp -d)"
+  ti5_conf="${ti5_home}/.tmux.conf"
+  ti5_out="$(HOME="$ti5_home" _integrate_install_tmux_bindings true 2>/dev/null)"
+  _t_check "TI5: no config file created"         test ! -f "$ti5_conf"
+  _t_grep  "TI5: reports would add"              "would add"           echo "$ti5_out"
+  rm -rf "$ti5_home" || true
+
+  _section "TI6 — tmux bindings: existing content not clobbered"
+  local ti6_home ti6_conf
+  ti6_home="$(mktemp -d)"
+  ti6_conf="${ti6_home}/.tmux.conf"
+  printf 'set -g prefix C-a\nbind r source-file ~/.tmux.conf\n' > "$ti6_conf"
+  ( HOME="$ti6_home" _integrate_install_tmux_bindings false &>/dev/null )
+  _t_grep  "TI6: prefix setting preserved"      "set -g prefix C-a"   cat "$ti6_conf"
+  _t_grep  "TI6: reload binding preserved"      "bind r source-file"  cat "$ti6_conf"
+  _t_grep  "TI6: zproj bindings added"          "bind N.*zproj"       cat "$ti6_conf"
+  rm -rf "$ti6_home" || true
 
   # ── Summary ──────────────────────────────────────────────────────────────
 

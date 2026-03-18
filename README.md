@@ -19,8 +19,8 @@ branches, and windows are created and torn down together as a unit.
 A built-in review workflow lets you annotate lines during a diff review and
 dispatch the collected notes to your coding agent for implementation.
 
-`zproj integrate` asks your coding agent to wire up your editor with the
-review workflow.
+`zproj integrate` installs tmux keybindings for worktree management and asks
+your coding agent to wire up your editor with the review workflow.
 
 ## Requirements
 
@@ -145,7 +145,9 @@ The notes file is deleted after the temp file is safely written.
 
 `zproj integrate` bootstraps a new machine in one step:
 
-1. **Asks your coding agent** to implement the review workflow in your editor
+1. **Installs tmux keybindings** for worktree management (create, delete,
+   fork, join) into your tmux config
+2. **Asks your coding agent** to implement the review workflow in your editor
    (add note / view / dispatch / clear), using the Neovim reference
    implementation as a concrete example
 
@@ -168,7 +170,7 @@ zproj join [<source>] <target>              Merge source into target, delete sou
 zproj launch <worktree-dir>                 Start or switch to tmux window
 zproj list [dir]                            Show worktrees with status
 zproj review <subcommand>                   Manage review notes (path/view/dispatch/clear)
-zproj integrate [--plan]                    Editor integration via coding agent
+zproj integrate [--plan]                    tmux bindings + editor integration
 zproj --env                                 Show resolved editor and coding agent
 zproj --diagnostics                         Check environment for problems
 zproj --test                                Run the built-in test suite
@@ -182,9 +184,9 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-316 tests covering init, clone, upgrade, worktree management, fork/join,
-review workflow, tmux pane naming, diagnostics, integrate, and tool detection.
-Requires tmux, git, and bash in PATH.
+336 tests covering init, clone, upgrade, worktree management, fork/join,
+review workflow, tmux binding installation, diagnostics, integrate, and tool
+detection. Requires tmux, git, and bash in PATH.
 
 ## License
 

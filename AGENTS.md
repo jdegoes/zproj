@@ -50,7 +50,7 @@ Every feature, behaviour change, or bug fix requires tests. No exceptions.
 
 Helpers: `_t_check "desc" <cmd>` (pass if exit 0), `_t_grep "desc" <pattern> <cmd>` (pass if output matches), `_t_pass`, `_t_fail`, `_t_skip`, `_section "XX1 — desc"`.
 
-Each section uses a unique 1-3 letter prefix: R (init), C (plain dir), U (upgrade), E (editor), A (agent), RP (cursor), P/V/RC/D (review), I (integrate), X (diagnostics), T (tmux/launch), B (regressions), TM (session names), S (safety/meta), N (edge cases), RT (runtime), TX (tmux config), FK (fork), FJ (join).
+Each section uses a unique 1-3 letter prefix: R (init), C (plain dir), U (upgrade), E (editor), A (agent), RP (cursor), P/V/RC/D (review), I (integrate), X (diagnostics), T (tmux/launch), B (regressions), TM (session names), S (safety/meta), N (edge cases), RT (runtime), TX (tmux config), FK (fork), FJ (join), TI (tmux binding installation).
 
 To add a test: find the prefix, use the next number (e.g. `T12` exists, add `T13`), place adjacent to related tests. Tests requiring tmux are gated behind `command -v tmux`; tests requiring specific binaries use `_t_skip`.
 
