@@ -30,24 +30,24 @@ your coding agent to wire up your editor with the review workflow.
 | git | 2.5+ | Worktree support |
 | tmux | 3.0+ | Named pane support |
 
-One of the following coding agents is auto-discovered (or set `$CODING_AGENT`):  
+One of the following coding agents is auto-discovered (or set `$CODING_AGENT`):
 `opencode`, `claude`, `codex`, `amp`, `aider`, `goose`, `gemini`, `agent` (Cursor)
 
 > **Cursor CLI Agent:** In repositories containing `.cursor/`, `.cursorrules`,
 > or `.cursorignore`, the Cursor CLI agent (`agent`) is automatically preferred
 > over the default discovery order.
 
-One of the following editors is auto-discovered (or set `$ZPROJ_EDITOR`):  
-`$EDITOR`, `nvim`, `vim`
+Editor resolution (first match wins):
+`$ZPROJ_EDITOR` → `$EDITOR` → `nvim` → `vim`
 
 ## Installation
 
 ```bash
 # Clone the repo
-git clone https://github.com/jdegoes/zproj ~/Documents/git/zproj
+git clone https://github.com/jdegoes/zproj ~/zproj
 
 # Symlink the script into your PATH
-ln -s ~/Documents/git/zproj/zproj ~/.local/bin/zproj
+ln -s ~/zproj/zproj ~/.local/bin/zproj
 
 # Verify
 zproj --version
@@ -68,9 +68,18 @@ zproj
 
 # Work on a feature
 zproj feature-auth           # creates worktree + branch + tmux window
-zproj fork experiment        # fork current worktree to try something
-zproj join experiment main   # merge experiment back into main
-zproj delete feature-auth    # tears it all down when done
+
+# Try an experiment (fork from main, work on it, merge back)
+zproj fork main experiment   # fork main → experiment at same commit
+# ... make changes in experiment, commit ...
+zproj join experiment main   # merge experiment → main, delete experiment
+
+# Convert an existing directory or git repo
+cd ~/my-existing-project
+zproj init .                 # upgrades in place (preserves history)
+
+# Done with a feature
+zproj delete feature-auth    # removes worktree, branch, and tmux window
 ```
 
 ## How it works
@@ -112,6 +121,19 @@ Panes are named after the tool they run (e.g. `opencode`, `nvim`, `shell`)
 so dispatch commands always reach the right pane regardless of which window
 is active.
 
+### Tmux keybindings
+
+`zproj integrate` installs these keybindings into your tmux config:
+
+| Binding | Action |
+|---------|--------|
+| `<prefix> N` | Create a new worktree (prompts for name) |
+| `<prefix> X` | Delete the current worktree (with confirmation) |
+| `<prefix> F` | Fork the current worktree (prompts for new name) |
+| `<prefix> J` | Join the current worktree into another (prompts for target) |
+
+All bindings work from any pane — they derive the project root automatically.
+
 ### Tool resolution
 
 ```bash
@@ -123,6 +145,36 @@ zproj --diagnostics  # check the full environment for problems
 |---------|---------|
 | `CODING_AGENT` | Override coding agent (e.g. `export CODING_AGENT=claude`) |
 | `ZPROJ_EDITOR` | Override editor (e.g. `export ZPROJ_EDITOR=nvim`) |
+
+## Fork and join
+
+Fork creates a new worktree at the same commit as the source. Join merges a
+source worktree's branch into a target and deletes the source on success.
+
+```bash
+# Fork from CWD worktree
+zproj fork experiment        # CWD → experiment
+
+# Fork from a named source
+zproj fork main hotfix       # main → hotfix
+
+# Join back (merge + delete source)
+zproj join hotfix main       # hotfix → main
+
+# Join from CWD
+zproj join main              # CWD → main
+```
+
+Only committed state is forked/joined. Uncommitted changes produce a warning
+but don't block the operation. If the source has uncommitted changes at join
+time, it is preserved (not deleted) even on a successful merge.
+
+If a join has merge conflicts, the merge is aborted and the diff is sent to
+the coding agent in the target worktree with instructions. After resolving
+the conflicts and committing, re-run the same `zproj join` command to
+complete the join and clean up the source.
+
+Fork/join identity: `zproj fork old new && zproj join new old` is a no-op.
 
 ## Review workflow
 
