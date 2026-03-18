@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.13.0"
+readonly VERSION="4.13.1"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -1493,20 +1493,46 @@ _join_dispatch_conflict() {
   printf -v prompt '%s' "\
 # zproj join — merge assistance
 
-You are helping merge changes from worktree \`${source_name}\` (branch \`${source_branch}\`)
-into this worktree \`${target_name}\` (branch \`${target_branch}\`).
+## Context
 
-An automatic merge was attempted but failed due to conflicts. Below is the
-diff of all changes on the source branch since it diverged from the target.
-Please apply these changes to the current worktree.
+zproj manages parallel git worktrees as separate directories. You are the
+coding agent running in the **${target_name}** worktree (branch \`${target_branch}\`).
 
-After you have incorporated all changes and committed them, run:
-\`\`\`
-zproj join ${source_name} ${target_name}
-\`\`\`
-This will verify the merge is complete and clean up the source worktree.
+A user wants to merge changes from the **${source_name}** worktree
+(branch \`${source_branch}\`) into this worktree. An automatic \`git merge\`
+was attempted but failed due to conflicts, so the merge was aborted.
+Your worktree is in a clean state — no partial merge is in progress.
 
----
+## What to do
+
+1. Start the merge:
+   \`\`\`
+   git merge ${source_branch}
+   \`\`\`
+   This will apply cleanly where possible and mark conflicts in the
+   remaining files.
+
+2. Resolve every conflicted file. The diff below shows what the source
+   branch changed — use it to understand the intent of each change and
+   choose the correct resolution.
+
+3. Stage and commit the merge:
+   \`\`\`
+   git add -A && git commit --no-edit
+   \`\`\`
+
+4. Complete the join by running from the project root (one directory up):
+   \`\`\`
+   cd .. && zproj join ${source_name} ${target_name}
+   \`\`\`
+   This re-runs the join. Since the merge commit is now in place, it will
+   succeed immediately and delete the **${source_name}** worktree and branch.
+
+## Diff of source changes (for conflict resolution context)
+
+The following diff shows everything that changed on \`${source_branch}\` since
+it diverged from \`${target_branch}\`. Use this to understand what each change
+is trying to accomplish when resolving conflicts.
 
 ${diff_content}"
 
@@ -1559,7 +1585,7 @@ ${diff_content}"
   warn "Merge conflicts detected — automatic merge aborted."
   echo -e "  ${DIM}Sent changes to ${BOLD}${ai_name}${RESET}${DIM} in ${BOLD}${target_name}${RESET}"
   echo -e "  ${DIM}Prompt saved to: ${tmp_prompt}${RESET}"
-  echo -e "  ${DIM}After resolving, run: ${CYAN}$SCRIPT_NAME join $source_name $target_name${RESET}"
+  echo -e "  ${DIM}After resolving, run: ${CYAN}cd .. && $SCRIPT_NAME join $source_name $target_name${RESET}"
 }
 
 cmd_launch() {
