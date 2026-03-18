@@ -726,6 +726,33 @@ _case1_plain_dir() {
   local dir="$2"
   local main_branch="$3"
 
+  # Pre-flight: refuse if subdirectories contain their own .git entries.
+  # A directory full of independent git repos is a parent/workspace directory,
+  # not a project — converting it would nest them all inside a single worktree.
+  local _nested_repos=()
+  local _child
+  for _child in "$abs_dir"/*/; do
+    [[ -e "$_child.git" ]] && _nested_repos+=("$(basename "${_child%/}")")
+  done
+  if [[ ${#_nested_repos[@]} -gt 0 ]]; then
+    local _count=${#_nested_repos[@]}
+    _err "'${dir}' contains ${_count} subdirector$( [[ $_count -eq 1 ]] && echo "y that is its" || echo "ies that are their" ) own git repo$(_plural "$_count"):"
+    local _shown=0
+    for _child in "${_nested_repos[@]}"; do
+      echo -e "    ${DIM}${_child}/${RESET}" >&2
+      ((_shown++)) || true
+      if [[ $_shown -ge 10 && $_count -gt 10 ]]; then
+        echo -e "    ${DIM}… and $((_count - _shown)) more${RESET}" >&2
+        break
+      fi
+    done
+    echo "" >&2
+    echo -e "  This looks like a workspace directory, not a project." >&2
+    echo -e "  To init a specific project, run:" >&2
+    echo -e "    ${CYAN}cd ${dir}/<project> && $SCRIPT_NAME init .${RESET}" >&2
+    exit 1
+  fi
+
   echo -e "${BOLD}Converting existing directory to bare worktree structure...${RESET}"
   echo ""
   step "Detected: plain directory (no git repo)"
@@ -785,6 +812,16 @@ _case1_plain_dir() {
   info "Converted ${BOLD}${dir}${RESET} → bare worktree with ${BOLD}${main_branch}${RESET}"
   echo ""
   echo -e "  ${DIM}Original files are now in ${dir}/${main_branch}/${RESET}"
+
+  # If the user ran 'zproj init .', their shell's CWD is now a stale inode
+  # (we moved the directory and created a new one at the same path).
+  # Warn them to re-enter the directory so their shell picks up the new inode.
+  if [[ "${_ZPROJ_INIT_DOT:-}" == "1" ]]; then
+    echo ""
+    warn "Your shell is still in the old directory (moved during init)."
+    echo -e "  ${CYAN}Run: cd .${RESET}  ${DIM}to refresh your shell's working directory${RESET}"
+  fi
+
   _hint_next_steps "$dir"
 }
 
@@ -1086,6 +1123,7 @@ cmd_init() {
   if [[ "$dir" == "." ]]; then
     abs_dir="$(pwd)"
     dir="$(basename "$abs_dir")"
+    _ZPROJ_INIT_DOT=1
   elif [[ "$dir" = /* ]]; then
     abs_dir="$dir"
     dir="$(basename "$abs_dir")"
@@ -3394,9 +3432,19 @@ cmd_test() {
   _section "C6 — plain dir: zproj init . (cwd)"
   rm -rf "$tmp/c6"
   mkdir "$tmp/c6" && echo "dot test" > "$tmp/c6/dot.txt"
-  (cd "$tmp/c6" && "$BASH" "$0" init . &>/dev/null)
+  local c6_out
+  c6_out="$(cd "$tmp/c6" && "$BASH" "$0" init . 2>&1)"
   _t_check "dot.txt in main/"    test -f "$tmp/c6/main/dot.txt"
   _t_check "backup cleaned up"   test ! -e "$tmp/c6.bak"
+  _t_grep  "warns about stale cwd" "still in the old directory" echo "$c6_out"
+
+  _section "C6b — non-dot init: no stale cwd warning"
+  rm -rf "$tmp/c6b"
+  mkdir "$tmp/c6b" && echo "data" > "$tmp/c6b/data.txt"
+  local c6b_out
+  c6b_out="$(_zproj init c6b 2>&1)"
+  _t_check "init succeeds"          test -d "$tmp/c6b/.bare"
+  _t_check "no stale cwd warning"   bash -c '! echo "$1" | grep -q "still in the old directory"' -- "$c6b_out"
 
   _section "C7 — error: .git is a linked worktree pointer"
   rm -rf "$tmp/c7a"
@@ -3414,6 +3462,30 @@ cmd_test() {
   c7b_exit="$(_zproj_exit init c7b)"
   _t_check "exits non-zero"        test "$c7b_exit" -ne 0
   _t_grep  "prints useful message" "unexpected content" _zproj init c7b
+
+  _section "C9 — error: plain dir with nested git repos is refused"
+  rm -rf "$tmp/c9"
+  mkdir -p "$tmp/c9/project-a" "$tmp/c9/project-b" "$tmp/c9/plain-dir"
+  git -C "$tmp/c9/project-a" init -q
+  git -C "$tmp/c9/project-b" init -q
+  # plain-dir has no .git — should not count
+  local c9_exit
+  c9_exit="$(_zproj_exit init c9)"
+  _t_check "exits non-zero"                test "$c9_exit" -ne 0
+  _t_grep  "mentions nested repos"          "own git repo"      _zproj init c9
+  _t_grep  "lists project-a"               "project-a"         _zproj init c9
+  _t_grep  "lists project-b"               "project-b"         _zproj init c9
+  _t_check "no .bare created"              test ! -d "$tmp/c9/.bare"
+  _t_check "original dir untouched"        test -d "$tmp/c9/project-a/.git"
+
+  _section "C10 — plain dir with no nested repos still works"
+  rm -rf "$tmp/c10"
+  mkdir -p "$tmp/c10/subdir"
+  echo "data" > "$tmp/c10/file.txt"
+  _zproj init c10 &>/dev/null
+  _t_check "init succeeds"             test -d "$tmp/c10/.bare"
+  _t_check "file moved into main/"     test -f "$tmp/c10/main/file.txt"
+  _t_check "subdir moved into main/"   test -d "$tmp/c10/main/subdir"
 
   # ── Section: Case 2 (existing git repo upgrade) ───────────────────────────
 
