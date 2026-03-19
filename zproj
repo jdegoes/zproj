@@ -3023,6 +3023,8 @@ with directed notes for the coding agent. The workflow is:
    exact format:
    \`\`\`
    ### \`<file>\` line <n> -- <YYYY-MM-DD HH:MM>
+   > <quoted line text>
+
    <note text>
 
    \`\`\`
@@ -3049,32 +3051,36 @@ The four editor actions that must be bound are:
 
 ---
 
-## Reference implementation (Neovim + diffview.nvim)
+## Reference implementation (Neovim)
 
-This is a complete, working implementation for **Neovim with the diffview.nvim
-plugin**. It is provided as a concrete illustration of the pattern — not as a
-constraint or assumption about the user's editor.
+This is a complete, working implementation for **Neovim**. It is provided as a
+concrete illustration of the pattern — not as a constraint or assumption about
+the user's editor.
 
-**If the user's editor is Neovim with diffview.nvim:** check whether this
-implementation (or something equivalent) is already present before adding
-anything.
+**If the user's editor is Neovim:** check whether this implementation (or
+something equivalent) is already present before adding anything.
 
 **If the user's editor is anything else:** ignore this code entirely and
 implement the four actions using that editor's native idioms. The only
 invariants that must hold regardless of editor are:
 - The file path recorded in each note must be absolute
 - The review notes path must be obtained at runtime via \`zproj review path --abs\`
-- The note entry format must be exactly: \`### \`<abs-file>\` line <n> -- <YYYY-MM-DD HH:MM>\`
+- The note entry format must be exactly:
+  \`\`\`
+  ### \`<abs-file>\` line <n> -- <YYYY-MM-DD HH:MM>
+  > <quoted line text>
 
-The implementation is split across two files. **\`lua/config/keymaps.lua\`**
-holds all four review bindings as permanent global keymaps, available in any
-buffer at all times. This is critical: none of the review bindings should be
-registered inside a diffview \`view_opened\` hook, because that hook registers
-them as global keymaps that \`view_closed\` then deletes entirely — leaving no
-bindings after diffview closes.
+  <note text>
 
-**\`lua/plugins/diffview.lua\`** holds only the diffview plugin spec and its
-\`diff_buf_read\` hook. It contains no review-related keymaps.
+  \`\`\`
+
+The four review bindings live in **\`lua/config/keymaps.lua\`** as permanent
+global keymaps, available in any buffer at all times. They have no dependency
+on diffview or any other plugin — they work on whatever buffer is current.
+
+**\`lua/plugins/diffview.lua\`** is the user's diff viewer config. It is shown
+here for completeness but is independent of the review workflow — the review
+keymaps work identically whether or not diffview is installed.
 
 \`\`\`lua
 ${keymaps_lua_contents}
