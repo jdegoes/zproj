@@ -290,6 +290,61 @@ _tmux_config_path() {
   echo "$HOME/.tmux.conf"
 }
 
+# Return mtime of $1 as epoch seconds. Tries macOS stat first, falls back to GNU.
+_notify_stat_mtime() {
+  local file="$1"
+  stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0
+}
+
+# Debounce per pane: return 0 to proceed, 1 to suppress.
+# Uses mkdir atomicity for lock; checks mtime for cooldown expiry.
+# $1 = pane_id  $2 = cooldown_seconds (default 5)
+_notify_debounce() {
+  local pane_id="${1:-}" cooldown="${2:-5}"
+  [[ -z "$pane_id" ]] && return 0
+  local lock_dir="${TMPDIR:-/tmp}/zproj-notify-${pane_id}"
+  mkdir -p "${TMPDIR:-/tmp}"
+  if mkdir "$lock_dir" 2>/dev/null; then
+    return 0
+  fi
+  local now mtime age
+  now="$(date +%s)"
+  mtime="$(_notify_stat_mtime "$lock_dir")"
+  ((age = now - mtime)) || true
+  if [[ $age -lt $cooldown ]]; then
+    return 1
+  fi
+  rmdir "$lock_dir" 2>/dev/null || true
+  mkdir "$lock_dir" 2>/dev/null || true
+  return 0
+}
+
+# Return 0 if the running tmux is >= $1. Returns 1 if tmux absent or older.
+_notify_tmux_version_gte() {
+  local want="$1"
+  command -v tmux &>/dev/null || return 1
+  local ver
+  ver="$(tmux -V 2>/dev/null | awk '{print $2}')" || return 1
+  _version_gte "$ver" "$want"
+}
+
+# Send an OSC 777 desktop notification to $3 (default: /dev/stdout).
+# Inside tmux >= 3.2: uses DCS passthrough with doubled ESC.
+# Inside tmux < 3.2: emits plain BEL (only signal that passes through).
+# Outside tmux: emits plain OSC 777 (Ghostty handles directly).
+_notify_osc777() {
+  local title="$1" body="$2" tty="${3:-/dev/stdout}"
+  if [[ -n "${TMUX:-}" ]]; then
+    if _notify_tmux_version_gte "3.2"; then
+      printf '\033Ptmux;\033\033]777;notify;%s;%s\a\033\\' "$title" "$body" > "$tty" 2>/dev/null || true
+    else
+      printf '\a' > "$tty" 2>/dev/null || true
+    fi
+  else
+    printf '\033]777;notify;%s;%s\a' "$title" "$body" > "$tty" 2>/dev/null || true
+  fi
+}
+
 # Return a human-readable label for which config source resolved the editor.
 # $1 = resolved editor binary name (first word of the resolved command)
 # Prints one of: "\$ZPROJ_EDITOR", "\$EDITOR", "default"
@@ -2014,6 +2069,7 @@ ${BOLD}Usage:${RESET}
   $SCRIPT_NAME list [dir]                          Show worktrees with status
   $SCRIPT_NAME review <subcommand>                 Manage review notes (path/view/dispatch/clear)
   $SCRIPT_NAME integrate [--plan]                  Generate editor integration prompt for coding agent
+  $SCRIPT_NAME notify [session] [window] [pane]   Emit desktop notification (used by tmux hooks)
   $SCRIPT_NAME --env                               Show resolved editor and coding agent
   $SCRIPT_NAME --diagnostics                       Check environment for problems
   $SCRIPT_NAME --test                              Run the built-in test suite
@@ -3201,6 +3257,110 @@ TMUX_BINDINGS
   done
 }
 
+_integrate_install_notify_hooks() {
+  local dry_run="${1:-false}"
+  local conf
+  conf="$(_tmux_config_path)"
+
+  local tmux_ver=""
+  if command -v tmux &>/dev/null; then
+    tmux_ver="$(tmux -V 2>/dev/null | awk '{print $2}')" || tmux_ver=""
+  fi
+
+  # Version-adaptive hook commands.
+  local run_shell_cmd="run-shell"
+  if [[ -n "$tmux_ver" ]] && _version_gte "$tmux_ver" "3.3"; then
+    run_shell_cmd="run-shell -b"
+  fi
+
+  local _bell_hook
+  _bell_hook="set-hook -ga alert-bell '${run_shell_cmd} \"zproj notify \\\"#{hook_session}\\\" \\\"#{hook_window}\\\" \\\"#{hook_pane}\\\"\"'"
+  local _silence_hook
+  _silence_hook="set-hook -ga alert-silence '${run_shell_cmd} \"zproj notify \\\"#{hook_session}\\\" \\\"#{hook_window}\\\" \\\"#{hook_pane}\\\" silence\"'"
+
+  # Settings to install — each checked independently.
+  # Format: "grep_pattern|||line_to_append"
+  local -a _settings=(
+    "visual-bell off|||set -g visual-bell off"
+    "monitor-bell on|||set -g monitor-bell on"
+    "bell-action any|||set -g bell-action any"
+    "window-status-bell-style|||set -g window-status-bell-style fg=white,bg=red,bold"
+    "monitor-silence|||setw -g monitor-silence 45"
+    "alert-bell.*zproj notify|||${_bell_hook}"
+    "alert-silence.*zproj notify|||${_silence_hook}"
+  )
+
+  # allow-passthrough only on tmux 3.2+
+  local add_passthrough=false
+  if [[ -n "$tmux_ver" ]] && _version_gte "$tmux_ver" "3.2"; then
+    add_passthrough=true
+    _settings+=("allow-passthrough|||set -g allow-passthrough all")
+  fi
+
+  local -a missing_lines=()
+  local entry grep_pat line_val
+  for entry in "${_settings[@]}"; do
+    grep_pat="${entry%%|||*}"
+    line_val="${entry##*|||}"
+    if [[ -f "$conf" ]] && grep -qE "$grep_pat" "$conf" 2>/dev/null; then
+      dim "  [already present]  ${grep_pat}  (${conf})"
+    else
+      missing_lines+=("$line_val")
+    fi
+  done
+
+  if [[ ${#missing_lines[@]} -eq 0 ]]; then
+    if ! $add_passthrough && [[ -n "$tmux_ver" ]] && ! _version_gte "$tmux_ver" "3.2"; then
+      warn "tmux < 3.2 detected — OSC 777 desktop notifications require tmux 3.2+. Bell forwarding still works."
+    fi
+    return 0
+  fi
+
+  if $dry_run; then
+    for line_val in "${missing_lines[@]}"; do
+      echo "  [would add]  ${line_val%%$'\n'*}  (${conf})"
+    done
+    if ! $add_passthrough && [[ -n "$tmux_ver" ]]; then
+      echo "  [skip]  allow-passthrough  (requires tmux 3.2+, detected: ${tmux_ver})"
+    fi
+    return 0
+  fi
+
+  local marker="# zproj notification"
+  if [[ ! -f "$conf" ]]; then
+    mkdir -p "$(dirname "$conf")"
+    {
+      echo "$marker"
+      local ml
+      for ml in "${missing_lines[@]}"; do
+        echo "$ml"
+      done
+    } > "$conf"
+    step "  [created]  ${conf}"
+  else
+    local needs_marker=true
+    grep -qF "$marker" "$conf" && needs_marker=false
+    {
+      echo ""
+      if $needs_marker; then
+        echo "$marker"
+      fi
+      local ml
+      for ml in "${missing_lines[@]}"; do
+        echo "$ml"
+      done
+    } >> "$conf"
+  fi
+
+  for line_val in "${missing_lines[@]}"; do
+    step "  [added]  ${line_val%%$'\n'*}  (${conf})"
+  done
+
+  if ! $add_passthrough && [[ -n "$tmux_ver" ]]; then
+    warn "tmux < 3.2 — OSC 777 desktop notifications unavailable. Bell forwarding only."
+  fi
+}
+
 cmd_integrate() {
   local plan_only=false
 
@@ -3306,6 +3466,25 @@ cmd_integrate() {
   echo -e "  ${DIM}Plan file: ${tmp_plan}${RESET}"
 }
 
+cmd_notify() {
+  # Called by tmux alert-bell hook: zproj notify <session> <window> <pane> [type]
+  # Also supports: zproj notify --help
+  case "${1:-}" in
+  --help|-h) usage_notify; return 0 ;;
+  esac
+
+  local session="${1:-}" window="${2:-}" pane="${3:-}" type="${4:-bell}"
+
+  # Outside tmux with no args: nothing to do (e.g., manual invocation for testing)
+  if [[ -z "${TMUX:-}" && -z "$session" ]]; then
+    return 0
+  fi
+
+  # Full notification logic wired in Task 5.
+  # For now: placeholder that exits cleanly.
+  return 0
+}
+
 usage_integrate() {
   cat <<EOF
 
@@ -3338,6 +3517,37 @@ ${BOLD}Environment:${RESET}
 ${BOLD}Examples:${RESET}
   $SCRIPT_NAME integrate              ${DIM}# launch agent with editor integration prompt${RESET}
   $SCRIPT_NAME integrate --plan       ${DIM}# print the prompt without launching${RESET}
+
+EOF
+}
+
+usage_notify() {
+  cat <<EOF
+
+${BOLD}Usage:${RESET} $SCRIPT_NAME notify [session] [window] [pane] [type]
+
+  Called automatically by tmux alert-bell and alert-silence hooks to deliver
+  desktop notifications when a coding agent in a pane becomes idle.
+
+  Arguments are passed by tmux hooks using format variables:
+    session   #{hook_session}  — tmux session name (project)
+    window    #{hook_window}   — tmux window name (worktree)
+    pane      #{hook_pane}     — tmux pane ID (e.g., %3)
+    type      bell|silence     — notification trigger type (default: bell)
+
+  Notifications are debounced per pane (default 5s).
+  Set \$ZPROJ_NOTIFY_COOLDOWN to override the debounce period.
+
+  Outside tmux with no arguments: exits silently (safe to call from scripts).
+
+${BOLD}Options:${RESET}
+  --help, -h               Show this help
+
+${BOLD}Environment:${RESET}
+  ZPROJ_NOTIFY_COOLDOWN   Debounce cooldown in seconds (default: 5)
+
+${BOLD}Example tmux hook (installed by zproj integrate):${RESET}
+  set-hook -ga alert-bell 'run-shell -b "zproj notify \\"#{hook_session}\\" \\"#{hook_window}\\" \\"#{hook_pane}\\""'
 
 EOF
 }
@@ -4744,7 +4954,10 @@ NOTES
 
   # Functions legitimately called via variable indirection or only as callbacks
   local -a s5_allowlist=(
-    _list_process_entry   # called as a function inside a loop in cmd_list
+    _list_process_entry             # called as a function inside a loop in cmd_list
+    _integrate_install_notify_hooks # called by cmd_integrate (integration step)
+    _notify_debounce                # called by cmd_notify (wired in task 5)
+    _notify_osc777                  # called by cmd_notify (wired in task 5)
   )
 
   local s5_dead=""
@@ -5510,6 +5723,10 @@ main() {
   integrate)
     shift
     cmd_integrate "$@"
+    ;;
+  notify)
+    shift
+    cmd_notify "$@"
     ;;
   -*) die "Unknown option: $1\n  Run ${CYAN}$SCRIPT_NAME --help${RESET} for usage." ;;
   *) cmd_default "$1" ;;
