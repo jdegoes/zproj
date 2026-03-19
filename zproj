@@ -2791,7 +2791,7 @@ cmd_diagnostics() {
       local _np_live_pt
       _np_live_pt="$(tmux show -gv allow-passthrough 2>/dev/null)" || _np_live_pt=""
       local _np_conf_has_pt=false
-      grep -qE "allow-passthrough" "$(_tmux_config_path)" 2>/dev/null && _np_conf_has_pt=true
+      grep -qE "allow-passthrough[[:space:]]+all" "$(_tmux_config_path)" 2>/dev/null && _np_conf_has_pt=true
       if [[ "$_np_live_pt" == "all" ]]; then
         _diag_ok "allow-passthrough" "all (OSC 777 passthrough enabled)"
       elif $_np_conf_has_pt; then
@@ -3646,7 +3646,7 @@ cmd_integrate() {
         fi
         local _pi_live_pt
         _pi_live_pt="$(tmux show -gv allow-passthrough 2>/dev/null)" || _pi_live_pt=""
-        if grep -qE "allow-passthrough" "$_pi_conf" 2>/dev/null && [[ "$_pi_live_pt" != "all" ]]; then
+        if grep -qE "allow-passthrough[[:space:]]+all" "$_pi_conf" 2>/dev/null && [[ "$_pi_live_pt" != "all" ]]; then
           warn "  ⚠ allow-passthrough: config has 'all' but server has '${_pi_live_pt:-off}' — run: tmux source-file ${_pi_conf}"
         fi
       fi
