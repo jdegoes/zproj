@@ -5867,6 +5867,99 @@ TI4EOF
   nt8_out="$(TMUX='' "$BASH" "$0" notify 2>&1)" || true
   _t_check "NT8: silent exit outside tmux"  test -z "$nt8_out"
 
+  _section "NT9 — notify hooks: fresh install"
+  local nt9_home nt9_conf
+  nt9_home="$(mktemp -d)"
+  nt9_conf="${nt9_home}/.tmux.conf"
+  ( HOME="$nt9_home" _integrate_install_notify_hooks false &>/dev/null )
+  _t_check "NT9: config file created"      test -f "$nt9_conf"
+  _t_grep  "NT9: has zproj notification"   "zproj notification"        cat "$nt9_conf"
+  _t_grep  "NT9: has alert-bell hook"      "alert-bell.*zproj notify"  cat "$nt9_conf"
+  _t_grep  "NT9: has monitor-silence"      "monitor-silence"           cat "$nt9_conf"
+  rm -rf "$nt9_home" || true
+
+  _section "NT10 — notify hooks: idempotent"
+  local nt10_home nt10_conf nt10_before nt10_after
+  nt10_home="$(mktemp -d)"
+  nt10_conf="${nt10_home}/.tmux.conf"
+  ( HOME="$nt10_home" _integrate_install_notify_hooks false &>/dev/null )
+  nt10_before="$(wc -l < "$nt10_conf")"
+  ( HOME="$nt10_home" _integrate_install_notify_hooks false &>/dev/null )
+  nt10_after="$(wc -l < "$nt10_conf")"
+  _t_check "NT10: line count unchanged" test "$nt10_before" -eq "$nt10_after"
+  rm -rf "$nt10_home" || true
+
+  _section "NT11 — notify hooks: dry-run writes nothing"
+  local nt11_home nt11_conf nt11_out
+  nt11_home="$(mktemp -d)"
+  nt11_conf="${nt11_home}/.tmux.conf"
+  nt11_out="$(HOME="$nt11_home" _integrate_install_notify_hooks true 2>/dev/null)"
+  _t_check "NT11: no config file created" test ! -f "$nt11_conf"
+  _t_grep  "NT11: reports would add"      "would add"    echo "$nt11_out"
+  rm -rf "$nt11_home" || true
+
+  _section "NT12 — notify hooks: appends to existing config"
+  local nt12_home nt12_conf
+  nt12_home="$(mktemp -d)"
+  nt12_conf="${nt12_home}/.tmux.conf"
+  printf 'set -g mouse on\n' > "$nt12_conf"
+  ( HOME="$nt12_home" _integrate_install_notify_hooks false &>/dev/null )
+  _t_grep "NT12: original content preserved"  "set -g mouse on"           cat "$nt12_conf"
+  _t_grep "NT12: hooks added"                 "alert-bell.*zproj notify"  cat "$nt12_conf"
+  rm -rf "$nt12_home" || true
+
+  _section "NT13 — agent config: dry-run writes nothing"
+  local nt13_home nt13_out
+  nt13_home="$(mktemp -d)"
+  mkdir -p "$nt13_home/bin"
+  printf '#!/bin/sh\n' > "$nt13_home/bin/aider" && chmod +x "$nt13_home/bin/aider"
+  nt13_out="$(HOME="$nt13_home" PATH="$nt13_home/bin:$PATH" _integrate_configure_agents true 2>/dev/null)"
+  _t_check "NT13: aider config not created"  test ! -f "$nt13_home/.aider.conf.yml"
+  _t_grep  "NT13: reports would configure"   "would configure"  echo "$nt13_out"
+  rm -rf "$nt13_home" || true
+
+  _section "NT14 — agent config: aider config created with marker"
+  local nt14_home
+  nt14_home="$(mktemp -d)"
+  mkdir -p "$nt14_home/bin"
+  printf '#!/bin/sh\n' > "$nt14_home/bin/aider" && chmod +x "$nt14_home/bin/aider"
+  ( HOME="$nt14_home" PATH="$nt14_home/bin:$PATH" _integrate_configure_agents false &>/dev/null )
+  _t_check "NT14: aider config created"         test -f "$nt14_home/.aider.conf.yml"
+  _t_grep  "NT14: has notifications setting"    "notifications: true"   cat "$nt14_home/.aider.conf.yml"
+  _t_grep  "NT14: has marker comment"           "zproj notification"    cat "$nt14_home/.aider.conf.yml"
+  rm -rf "$nt14_home" || true
+
+  _section "NT15 — agent config: aider idempotent"
+  local nt15_home nt15_count
+  nt15_home="$(mktemp -d)"
+  mkdir -p "$nt15_home/bin"
+  printf '#!/bin/sh\n' > "$nt15_home/bin/aider" && chmod +x "$nt15_home/bin/aider"
+  ( HOME="$nt15_home" PATH="$nt15_home/bin:$PATH" _integrate_configure_agents false &>/dev/null )
+  ( HOME="$nt15_home" PATH="$nt15_home/bin:$PATH" _integrate_configure_agents false &>/dev/null )
+  nt15_count="$(grep -c "^notifications: true" "$nt15_home/.aider.conf.yml" 2>/dev/null || echo 0)"
+  _t_check "NT15: notifications not duplicated"  test "$nt15_count" -eq 1
+  rm -rf "$nt15_home" || true
+
+  _section "NT16 — integrate --plan: includes notification section"
+  local nt16_out
+  nt16_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" integrate --plan 2>&1)"
+  _t_grep "NT16: plan mentions notification hooks"  "notification hooks"  echo "$nt16_out"
+  _t_grep "NT16: plan mentions agent config"        "agent notification"  echo "$nt16_out"
+
+  _section "NT17 — integrate --plan: I-section not regressed"
+  local nt17_out
+  nt17_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" integrate --plan 2>&1)"
+  _t_grep "NT17: editor prompt still present"  "zproj Editor Integration"  echo "$nt17_out"
+
+  _section "NT18 — agent config: marker present in created configs"
+  local nt18_home
+  nt18_home="$(mktemp -d)"
+  mkdir -p "$nt18_home/bin"
+  printf '#!/bin/sh\n' > "$nt18_home/bin/aider" && chmod +x "$nt18_home/bin/aider"
+  ( HOME="$nt18_home" PATH="$nt18_home/bin:$PATH" _integrate_configure_agents false &>/dev/null )
+  _t_grep "NT18: aider config has marker"  "zproj notification"  cat "$nt18_home/.aider.conf.yml"
+  rm -rf "$nt18_home" || true
+
   # ── Summary ──────────────────────────────────────────────────────────────
 
   echo ""
