@@ -2661,6 +2661,8 @@ cmd_diagnostics() {
     if _is_gui_editor "$editor_binary"; then
       _diag_warn "$editor" "GUI app — will not work in a tmux pane  [${editor_src}]"
       _diag_warn "" "  set ZPROJ_EDITOR=nvim (or another terminal editor)"
+    elif [[ "$editor_binary" == ":" ]]; then
+      _diag_warn ":" "bash no-op — editor pane will exit immediately  [${editor_src}]"
     else
       _diag_ok "$editor" "$(command -v "$editor_binary" 2>/dev/null)  [${editor_src}]"
     fi
@@ -3461,7 +3463,10 @@ _integrate_configure_agents() {
 
   # ── OpenCode ──────────────────────────────────────────────────────────────
   if command -v opencode &>/dev/null; then
-    if $dry_run; then
+    local oc_plugins_dir="${HOME}/.config/opencode/plugins"
+    if [[ -d "$oc_plugins_dir" ]] && grep -rl 'session\.idle' "$oc_plugins_dir" &>/dev/null; then
+      dim "  [already configured]  opencode  (global plugin detected in ${oc_plugins_dir})"
+    elif $dry_run; then
       echo "  [manual setup needed]  opencode  (per-project .opencode/plugins/ required)"
     else
       info "opencode  Add a session.idle plugin to each project's .opencode/plugins/ directory."
@@ -3530,19 +3535,20 @@ cmd_integrate() {
 
   # ── Plan only ────────────────────────────────────────────────────────────
 
-  if $plan_only; then
-    _integrate_build_prompt
-    echo ""
-    echo -e "${BOLD}tmux bindings (dry run):${RESET}"
-    _integrate_install_tmux_bindings true
-    echo ""
-    echo -e "${BOLD}tmux notification hooks (dry run):${RESET}"
-    _integrate_install_notify_hooks true
-    echo ""
-    echo -e "${BOLD}agent notification config (dry run):${RESET}"
-    _integrate_configure_agents true
-    return 0
-  fi
+   if $plan_only; then
+     _integrate_build_prompt
+     echo ""
+     echo -e "${BOLD}tmux bindings (dry run):${RESET}"
+     _integrate_install_tmux_bindings true
+     echo ""
+     echo -e "${BOLD}tmux notification hooks (dry run):${RESET}"
+     _integrate_install_notify_hooks true
+     dim "  Note: run 'tmux source-file $(_tmux_config_path)' to activate in the current server"
+     echo ""
+     echo -e "${BOLD}agent notification config (dry run):${RESET}"
+     _integrate_configure_agents true
+     return 0
+   fi
 
   # ── Live run ─────────────────────────────────────────────────────────────
 
@@ -5987,7 +5993,41 @@ TI4EOF
     bash -c '[[ "'"$nt19_out"'" != *"[would configure]"* ]]'
   _t_grep  "NT19: already configured — shows [already configured]" \
     "already configured" bash -c 'echo "'"$nt19_out"'"'
-  rm -rf "$nt19_home" || true
+   rm -rf "$nt19_home" || true
+
+  _section "NT20 — diagnostics: editor ':' shows warning not checkmark"
+  local nt20_out
+  nt20_out="$(EDITOR=: ZPROJ_EDITOR= _zproj --diagnostics 2>&1)" || true
+  _t_grep  "NT20: editor ':' warns no-op"    "no-op"  bash -c 'echo "'"$nt20_out"'"'
+  _t_check "NT20: editor ':' no green check" bash -c '[[ "'"$nt20_out"'" != *"✓  :"* ]]'
+
+  _section "NT21 — integrate --plan: includes tmux reload reminder"
+  local nt21_out
+  nt21_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" integrate --plan 2>&1)" || true
+  _t_grep "NT21: dry-run has reload reminder"  "source-file"  echo "$nt21_out"
+
+  _section "NT22 — agent config: opencode global plugin detected"
+  local nt22_home
+  nt22_home="$(mktemp -d)"
+  mkdir -p "$nt22_home/.config/opencode/plugins" "$nt22_home/bin"
+  printf 'session.idle handler\n' > "$nt22_home/.config/opencode/plugins/notify.js"
+  printf '#!/bin/sh\n' > "$nt22_home/bin/opencode" && chmod +x "$nt22_home/bin/opencode"
+  local nt22_out
+  nt22_out="$(HOME="$nt22_home" PATH="$nt22_home/bin:$PATH" _integrate_configure_agents true 2>/dev/null)"
+  _t_grep "NT22: opencode global plugin → already configured"  "already configured" \
+    bash -c 'echo "'"$nt22_out"'"'
+  rm -rf "$nt22_home" || true
+
+  _section "NT23 — agent config: opencode no global plugin → manual setup"
+  local nt23_home
+  nt23_home="$(mktemp -d)"
+  mkdir -p "$nt23_home/bin"
+  printf '#!/bin/sh\n' > "$nt23_home/bin/opencode" && chmod +x "$nt23_home/bin/opencode"
+  local nt23_out
+  nt23_out="$(HOME="$nt23_home" PATH="$nt23_home/bin:$PATH" _integrate_configure_agents true 2>/dev/null)"
+  _t_grep "NT23: opencode no plugin → manual setup"  "manual setup" \
+    bash -c 'echo "'"$nt23_out"'"'
+  rm -rf "$nt23_home" || true
 
   # ── Summary ──────────────────────────────────────────────────────────────
 
