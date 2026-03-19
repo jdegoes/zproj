@@ -208,6 +208,33 @@ zproj integrate              # full bootstrap
 zproj integrate --plan       # dry run: show what would be done
 ```
 
+## Notifications
+
+`zproj integrate` configures a three-layer notification pipeline so that when
+any coding agent finishes working in a tmux pane, you get a desktop
+notification with worktree context.
+
+**Agent layer**: configures each installed agent to emit BEL on idle (claude,
+aider, codex, gemini). Agents without a notification API (amp, goose, agent)
+use a `monitor-silence` fallback.
+
+**tmux layer**: installs `alert-bell` and `alert-silence` hooks that call
+`zproj notify` with session and window context.
+
+**Terminal layer**: add these to `~/.config/ghostty/config` for rich desktop
+notifications (not auto-configured):
+
+```
+desktop-notifications = true
+bell-features = title,attention,audio
+bell-audio-path = /System/Library/Sounds/Glass.aiff
+```
+
+tmux 3.3+ delivers full OSC 777 desktop notifications. tmux 3.0–3.2 delivers
+bell forwarding only (dock bounce + audio still work via `bell-features`).
+
+Set `$ZPROJ_NOTIFY_COOLDOWN` to override the 5-second per-pane debounce.
+
 ## Command reference
 
 ```
@@ -223,6 +250,7 @@ zproj launch <worktree-dir>                 Start or switch to tmux window
 zproj list [dir]                            Show worktrees with status
 zproj review <subcommand>                   Manage review notes (path/view/dispatch/clear)
 zproj integrate [--plan]                    tmux bindings + editor integration
+zproj notify [session] [window] [pane]      Emit desktop notification (used by tmux hooks)
 zproj --env                                 Show resolved editor and coding agent
 zproj --diagnostics                         Check environment for problems
 zproj --test                                Run the built-in test suite
