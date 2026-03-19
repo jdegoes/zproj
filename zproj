@@ -3662,33 +3662,32 @@ usage_integrate() {
 
 ${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan]
 
-  Installs tmux keybindings for worktree management (create, delete, fork,
-  join), then asks your coding agent to integrate your editor with the zproj
-  review workflow.
+  Bootstraps your machine with three integration steps:
 
-  The editor integration prompt is assembled from facts zproj already knows
-  (editor binary, agent binary, review notes path, zproj version) and
-  includes the reference Neovim implementation as a concrete example. The
-  agent will:
-
-    1. Research your editor (\$ZPROJ_EDITOR / \$EDITOR / auto-detected)
-    2. Check whether the editor integration already exists
-    3. If absent: implement it  (add note / view / dispatch / clear)
-    4. If partial or different: ask you before making changes
-    5. Explain how to test the result
+    1. Installs tmux keybindings for worktree management (create, delete,
+       fork, join)
+    2. Configures the notification pipeline — installs tmux alert hooks so
+       that any coding agent pane that emits a bell triggers a desktop
+       notification via OSC 777 (Ghostty) with session and window context.
+       Also configures each installed agent (claude, aider, codex, gemini)
+       to emit BEL when idle.
+    3. Asks your coding agent to implement the review workflow in your editor
+       (add note / view / dispatch / clear)
 
 ${BOLD}Options:${RESET}
-  --plan                   Dry run: print the editor prompt without launching
-                           the agent. Nothing runs.
+  --plan                   Dry run: print the full integration plan without
+                           executing anything.
 
 ${BOLD}Environment:${RESET}
   ZPROJ_INTEGRATE_DELAY   Seconds to wait for agent TUI before sending the
                           handoff message (default: 2). Increase if your
                           agent starts slowly.
+  ZPROJ_NOTIFY_COOLDOWN   Notification debounce cooldown in seconds
+                          (default: 5). Reduce for faster notifications.
 
 ${BOLD}Examples:${RESET}
-  $SCRIPT_NAME integrate              ${DIM}# launch agent with editor integration prompt${RESET}
-  $SCRIPT_NAME integrate --plan       ${DIM}# print the prompt without launching${RESET}
+  $SCRIPT_NAME integrate              ${DIM}# full bootstrap${RESET}
+  $SCRIPT_NAME integrate --plan       ${DIM}# preview without executing${RESET}
 
 EOF
 }
@@ -5815,6 +5814,58 @@ TI4EOF
   _t_grep  "TI6: reload binding preserved"      "bind r source-file"  cat "$ti6_conf"
   _t_grep  "TI6: zproj bindings added"          "bind N.*zproj"       cat "$ti6_conf"
   rm -rf "$ti6_home" || true
+
+  # ── Section: NT — notification helpers ───────────────────────────────────
+
+  _section "NT1 — notify: _notify_stat_mtime returns epoch seconds"
+  local nt1_tmp
+  nt1_tmp="$(mktemp)"
+  _t_grep "NT1: stat_mtime returns digits"  "^[0-9]"  _notify_stat_mtime "$nt1_tmp"
+  rm -f "$nt1_tmp" || true
+
+  _section "NT2 — notify: _notify_debounce allows first call"
+  local nt2_lock
+  nt2_lock="${TMPDIR:-/tmp}/zproj-notify-%nt2test"
+  rm -rf "$nt2_lock" 2>/dev/null || true
+  _t_check "NT2: first debounce succeeds"  _notify_debounce "%nt2test" 5
+  rm -rf "$nt2_lock" 2>/dev/null || true
+
+  _section "NT3 — notify: _notify_debounce suppresses within cooldown"
+  local nt3_lock nt3_ec
+  nt3_lock="${TMPDIR:-/tmp}/zproj-notify-%nt3test"
+  rm -rf "$nt3_lock" 2>/dev/null || true
+  mkdir "$nt3_lock" 2>/dev/null || true
+  nt3_ec=0
+  _notify_debounce "%nt3test" 300 || nt3_ec=$?
+  _t_check "NT3: debounce returns 1 (suppressed)"  test "$nt3_ec" -eq 1
+  rm -rf "$nt3_lock" 2>/dev/null || true
+
+  _section "NT4 — notify: _notify_debounce allows after cooldown expires"
+  local nt4_lock
+  nt4_lock="${TMPDIR:-/tmp}/zproj-notify-%nt4test"
+  rm -rf "$nt4_lock" 2>/dev/null || true
+  mkdir "$nt4_lock" 2>/dev/null || true
+  touch -t 200001010000 "$nt4_lock" 2>/dev/null || true
+  _t_check "NT4: debounce allows after expiry"  _notify_debounce "%nt4test" 5
+  rm -rf "$nt4_lock" 2>/dev/null || true
+
+  _section "NT5 — notify: _notify_osc777 emits OSC 777 outside tmux"
+  local nt5_out
+  nt5_out="$(TMUX='' _notify_osc777 "TestTitle" "TestBody" 2>/dev/null)" || true
+  _t_grep "NT5: contains 777;notify"  "777;notify"  printf '%s' "$nt5_out"
+
+  _section "NT6 — notify: _notify_osc777 includes title and body"
+  local nt6_out
+  nt6_out="$(TMUX='' _notify_osc777 "MyTitle" "MyBody" 2>/dev/null)" || true
+  _t_grep "NT6: title and body present"  "MyTitle.*MyBody"  printf '%s' "$nt6_out"
+
+  _section "NT7 — notify: zproj notify --help exits 0 with usage"
+  _t_grep "NT7: help shows usage"  "notify"  "$BASH" "$0" notify --help
+
+  _section "NT8 — notify: zproj notify outside tmux exits silently"
+  local nt8_out
+  nt8_out="$(TMUX='' "$BASH" "$0" notify 2>&1)" || true
+  _t_check "NT8: silent exit outside tmux"  test -z "$nt8_out"
 
   # ── Summary ──────────────────────────────────────────────────────────────
 
