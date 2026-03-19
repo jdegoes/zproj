@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.14.0"
+readonly VERSION="4.14.1"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -3378,7 +3378,7 @@ _integrate_configure_agents() {
     local claude_settings="${HOME}/.claude/settings.json"
     local claude_configured=false
     # Check if Stop hook with BEL command already present
-    if [[ -f "$claude_settings" ]] && grep -q '"printf.*\\\\a"' "$claude_settings" 2>/dev/null; then
+    if [[ -f "$claude_settings" ]] && grep -q 'printf.*\\\\a' "$claude_settings" 2>/dev/null; then
       dim "  [already configured]  claude  (${claude_settings})"
       claude_configured=true
     fi
@@ -5965,6 +5965,21 @@ TI4EOF
   ( HOME="$nt18_home" PATH="$nt18_home/bin:$PATH" _integrate_configure_agents false &>/dev/null )
   _t_grep "NT18: aider config has marker"  "zproj notification"  cat "$nt18_home/.aider.conf.yml"
   rm -rf "$nt18_home" || true
+
+  _section "NT19 — agent config: claude already-configured detected"
+  local nt19_home
+  nt19_home="$(mktemp -d)"
+  mkdir -p "$nt19_home/bin" "$nt19_home/.claude"
+  printf '#!/bin/sh\n' > "$nt19_home/bin/claude" && chmod +x "$nt19_home/bin/claude"
+  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"printf \"\\\\a\""}]}]}}\n' \
+    > "$nt19_home/.claude/settings.json"
+  local nt19_out
+  nt19_out="$(HOME="$nt19_home" PATH="$nt19_home/bin:$PATH" _integrate_configure_agents true 2>/dev/null)"
+  _t_check "NT19: already configured — no [would configure]" \
+    bash -c '[[ "'"$nt19_out"'" != *"[would configure]"* ]]'
+  _t_grep  "NT19: already configured — shows [already configured]" \
+    "already configured" bash -c 'echo "'"$nt19_out"'"'
+  rm -rf "$nt19_home" || true
 
   # ── Summary ──────────────────────────────────────────────────────────────
 
