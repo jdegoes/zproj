@@ -3361,6 +3361,145 @@ _integrate_install_notify_hooks() {
   fi
 }
 
+# Configure each installed coding agent to emit BEL on idle.
+# With dry_run=true: prints what would be done without executing.
+_integrate_configure_agents() {
+  local dry_run="${1:-false}"
+  local marker="# zproj notification"
+
+  # ── Claude Code ───────────────────────────────────────────────────────────
+  if command -v claude &>/dev/null; then
+    local claude_settings="${HOME}/.claude/settings.json"
+    local claude_configured=false
+    # Check if Stop hook with BEL command already present
+    if [[ -f "$claude_settings" ]] && grep -q '"printf.*\\\\a"' "$claude_settings" 2>/dev/null; then
+      dim "  [already configured]  claude  (${claude_settings})"
+      claude_configured=true
+    fi
+    if ! $claude_configured; then
+      if $dry_run; then
+        echo "  [would configure]  claude  (preferredNotifChannel + Stop hook)"
+      else
+        # Set notification channel
+        claude config set --global preferredNotifChannel terminal_bell 2>/dev/null || true
+        # Add Stop hook via jq if available; otherwise warn
+        if command -v jq &>/dev/null; then
+          local tmp_settings
+          tmp_settings="$(mktemp "${TMPDIR:-/tmp}/zproj-claude-XXXXXX")"
+          if [[ -f "$claude_settings" ]]; then
+            jq '.hooks.Stop |= (. // []) + [{"hooks": [{"type": "command", "command": "printf \"\\a\""}]}]' \
+              "$claude_settings" > "$tmp_settings" 2>/dev/null && mv "$tmp_settings" "$claude_settings" || true
+          else
+            mkdir -p "$(dirname "$claude_settings")"
+            printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"printf \"\\a\""}]}]}}\n' > "$claude_settings"
+          fi
+          step "  [configured]  claude  (${claude_settings})"
+        else
+          warn "  jq not found — add Stop hook to ${claude_settings} manually:"
+          step '    {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"printf \"\\a\""}]}]}}'
+        fi
+      fi
+    fi
+  else
+    dim "  [not installed]  claude"
+  fi
+
+  # ── Aider ─────────────────────────────────────────────────────────────────
+  if command -v aider &>/dev/null; then
+    local aider_conf="${HOME}/.aider.conf.yml"
+    if [[ -f "$aider_conf" ]] && grep -qE "^notifications: *true" "$aider_conf" 2>/dev/null; then
+      dim "  [already configured]  aider  (${aider_conf})"
+    elif $dry_run; then
+      echo "  [would configure]  aider  (notifications: true → ${aider_conf})"
+    else
+      if [[ ! -f "$aider_conf" ]]; then
+        mkdir -p "$(dirname "$aider_conf")"
+        { echo "$marker"; echo "notifications: true"; } > "$aider_conf"
+      else
+        { echo ""; echo "$marker"; echo "notifications: true"; } >> "$aider_conf"
+      fi
+      step "  [configured]  aider  (${aider_conf})"
+    fi
+  else
+    dim "  [not installed]  aider"
+  fi
+
+  # ── Codex CLI ─────────────────────────────────────────────────────────────
+  if command -v codex &>/dev/null; then
+    local codex_conf="${HOME}/.codex/config.toml"
+    if [[ -f "$codex_conf" ]] && grep -qE "notification_method" "$codex_conf" 2>/dev/null; then
+      dim "  [already configured]  codex  (${codex_conf})"
+    elif $dry_run; then
+      echo "  [would configure]  codex  (notification_method = \"bel\" → ${codex_conf})"
+    else
+      if [[ ! -f "$codex_conf" ]]; then
+        mkdir -p "$(dirname "$codex_conf")"
+        { echo "$marker"; echo "[tui]"; echo 'notification_method = "bel"'; } > "$codex_conf"
+      elif grep -q '^\[tui\]' "$codex_conf" 2>/dev/null; then
+        { echo ""; echo "$marker"; echo 'notification_method = "bel"'; } >> "$codex_conf"
+      else
+        { echo ""; echo "$marker"; echo "[tui]"; echo 'notification_method = "bel"'; } >> "$codex_conf"
+      fi
+      step "  [configured]  codex  (${codex_conf})"
+    fi
+  else
+    dim "  [not installed]  codex"
+  fi
+
+  # ── OpenCode ──────────────────────────────────────────────────────────────
+  if command -v opencode &>/dev/null; then
+    if $dry_run; then
+      echo "  [manual setup needed]  opencode  (per-project .opencode/plugins/ required)"
+    else
+      info "opencode  Add a session.idle plugin to each project's .opencode/plugins/ directory."
+      step "  See: https://opencode.ai/docs/plugins"
+    fi
+  else
+    dim "  [not installed]  opencode"
+  fi
+
+  # ── Gemini CLI ────────────────────────────────────────────────────────────
+  if command -v gemini &>/dev/null; then
+    local gemini_settings="${HOME}/.gemini/settings.json"
+    if [[ -f "$gemini_settings" ]] && grep -q '"enableNotifications".*true' "$gemini_settings" 2>/dev/null; then
+      dim "  [already configured]  gemini  (${gemini_settings})"
+    elif $dry_run; then
+      echo "  [would configure]  gemini  (enableNotifications: true → ${gemini_settings})"
+    else
+      if command -v jq &>/dev/null; then
+        local tmp_gem
+        tmp_gem="$(mktemp "${TMPDIR:-/tmp}/zproj-gemini-XXXXXX")"
+        if [[ -f "$gemini_settings" ]]; then
+          jq '.general.enableNotifications = true' "$gemini_settings" > "$tmp_gem" 2>/dev/null \
+            && mv "$tmp_gem" "$gemini_settings" || true
+        else
+          mkdir -p "$(dirname "$gemini_settings")"
+          printf '{"general":{"enableNotifications":true}}\n' > "$gemini_settings"
+        fi
+        step "  [configured]  gemini  (${gemini_settings})"
+      else
+        warn "  jq not found — add to ${gemini_settings} manually:"
+        step '    {"general": {"enableNotifications": true}}'
+      fi
+    fi
+  else
+    dim "  [not installed]  gemini"
+  fi
+
+  # ── Silence-fallback agents (no terminal notification API) ────────────────
+  local _silence_agents=()
+  command -v amp   &>/dev/null && _silence_agents+=(amp)
+  command -v goose &>/dev/null && _silence_agents+=(goose)
+  command -v agent &>/dev/null && _silence_agents+=(agent)
+
+  if [[ ${#_silence_agents[@]} -gt 0 ]]; then
+    local ag
+    for ag in "${_silence_agents[@]}"; do
+      step "  [silence fallback]  ${ag}  (no terminal notification API — uses monitor-silence)"
+    done
+  fi
+}
+
 cmd_integrate() {
   local plan_only=false
 
@@ -3383,6 +3522,12 @@ cmd_integrate() {
     echo ""
     echo -e "${BOLD}tmux bindings (dry run):${RESET}"
     _integrate_install_tmux_bindings true
+    echo ""
+    echo -e "${BOLD}tmux notification hooks (dry run):${RESET}"
+    _integrate_install_notify_hooks true
+    echo ""
+    echo -e "${BOLD}agent notification config (dry run):${RESET}"
+    _integrate_configure_agents true
     return 0
   fi
 
@@ -3409,6 +3554,16 @@ cmd_integrate() {
   step "Installing tmux keybindings..."
   echo ""
   _integrate_install_tmux_bindings false
+  echo ""
+
+  step "Installing tmux notification hooks..."
+  echo ""
+  _integrate_install_notify_hooks false
+  echo ""
+
+  step "Configuring coding agent notifications..."
+  echo ""
+  _integrate_configure_agents false
   echo ""
 
   # Build and hand off the editor integration prompt to the agent
@@ -3475,14 +3630,31 @@ cmd_notify() {
 
   local session="${1:-}" window="${2:-}" pane="${3:-}" type="${4:-bell}"
 
-  # Outside tmux with no args: nothing to do (e.g., manual invocation for testing)
+  # Outside tmux with no args: nothing to do
   if [[ -z "${TMUX:-}" && -z "$session" ]]; then
     return 0
   fi
 
-  # Full notification logic wired in Task 5.
-  # For now: placeholder that exits cleanly.
-  return 0
+  # Debounce: skip if same pane notified recently
+  if ! _notify_debounce "$pane" "${ZPROJ_NOTIFY_COOLDOWN:-5}"; then
+    return 0
+  fi
+
+  # Build notification content
+  local title body
+  if [[ "$type" == "silence" ]]; then
+    title="Agent Idle"
+  else
+    title="Agent Ready"
+  fi
+  body="${session} → ${window}"
+
+  # Discover all attached client ttys and notify each
+  local tty
+  while IFS= read -r tty; do
+    [[ -z "$tty" ]] && continue
+    _notify_osc777 "$title" "$body" "$tty"
+  done < <(tmux list-clients -F '#{client_tty}' 2>/dev/null)
 }
 
 usage_integrate() {
