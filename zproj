@@ -2742,6 +2742,96 @@ cmd_diagnostics() {
     fi
   fi
 
+  # ── Section: Notification pipeline ──────────────────────────────────────
+  _section_header "Notification pipeline"
+
+  local _np_tmux_ver=""
+  local _np_server_running=false
+  if command -v tmux &>/dev/null; then
+    _np_tmux_ver="$(tmux -V 2>/dev/null | awk '{print $2}')" || _np_tmux_ver=""
+  fi
+  if tmux list-sessions &>/dev/null; then
+    _np_server_running=true
+  fi
+
+  # ── tmux layer (hooks + passthrough) — only if server is running ─────────
+  if ! command -v tmux &>/dev/null; then
+    _diag_info "tmux hooks" "skipped (tmux not available)"
+  elif ! $_np_server_running; then
+    _diag_info "tmux hooks" "skipped (no tmux server running — start one with: tmux new-session)"
+  else
+    # Check alert-bell hook
+    local _np_conf
+    _np_conf="$(_tmux_config_path)"
+    local _np_conf_has_bell=false _np_server_has_bell=false
+    grep -qE "alert-bell.*zproj notify" "$_np_conf" 2>/dev/null && _np_conf_has_bell=true
+    tmux show-hooks -g 2>/dev/null | grep -qE "alert-bell.*zproj notify" && _np_server_has_bell=true
+    if $_np_server_has_bell; then
+      _diag_ok "alert-bell hook" "loaded in server"
+    elif $_np_conf_has_bell; then
+      _diag_warn "alert-bell hook" "in config but not loaded — run: tmux source-file ${_np_conf}"
+    else
+      _diag_info "alert-bell hook" "not configured — run 'zproj integrate' to set up"
+    fi
+
+    # Check alert-silence hook
+    local _np_conf_has_silence=false _np_server_has_silence=false
+    grep -qE "alert-silence.*zproj notify" "$_np_conf" 2>/dev/null && _np_conf_has_silence=true
+    tmux show-hooks -g 2>/dev/null | grep -qE "alert-silence.*zproj notify" && _np_server_has_silence=true
+    if $_np_server_has_silence; then
+      _diag_ok "alert-silence hook" "loaded in server"
+    elif $_np_conf_has_silence; then
+      _diag_warn "alert-silence hook" "in config but not loaded — run: tmux source-file ${_np_conf}"
+    else
+      _diag_info "alert-silence hook" "not configured — run 'zproj integrate' to set up"
+    fi
+
+    # Check allow-passthrough (tmux 3.2+ only)
+    if [[ -n "$_np_tmux_ver" ]] && _version_gte "$_np_tmux_ver" "3.2"; then
+      local _np_live_pt
+      _np_live_pt="$(tmux show -gv allow-passthrough 2>/dev/null)" || _np_live_pt=""
+      local _np_conf_has_pt=false
+      grep -qE "allow-passthrough" "$(_tmux_config_path)" 2>/dev/null && _np_conf_has_pt=true
+      if [[ "$_np_live_pt" == "all" ]]; then
+        _diag_ok "allow-passthrough" "all (OSC 777 passthrough enabled)"
+      elif $_np_conf_has_pt; then
+        _diag_warn "allow-passthrough" "config has 'all' but server has '${_np_live_pt:-off}' — run: tmux source-file $(_tmux_config_path)"
+      else
+        _diag_info "allow-passthrough" "not set — run 'zproj integrate' to configure"
+      fi
+    else
+      _diag_info "allow-passthrough" "requires tmux 3.2+ (have ${_np_tmux_ver:-unknown}) — OSC 777 unavailable"
+    fi
+  fi
+
+  # ── terminal layer — always runs ─────────────────────────────────────────
+  # ── terminal emulator detection (always runs) ────────────────────────────
+  local _np_term="${TERM_PROGRAM:-}"
+  local _np_ssh_note=""
+  [[ -n "${SSH_CONNECTION:-}" ]] && _np_ssh_note=" (via SSH — may reflect local terminal)"
+  case "$_np_term" in
+  ghostty)
+    if command -v ghostty &>/dev/null; then
+      if ghostty +show-config --default 2>/dev/null | grep 'desktop-notifications = true' >/dev/null; then
+        _diag_ok "terminal" "ghostty (desktop-notifications enabled)${_np_ssh_note}"
+      else
+        _diag_warn "terminal" "ghostty (desktop-notifications disabled — enable in ghostty config)${_np_ssh_note}"
+      fi
+    else
+      _diag_ok "terminal" "ghostty (can't verify desktop-notifications — binary not in PATH)${_np_ssh_note}"
+    fi
+    ;;
+  iTerm.app|iterm2|WezTerm|wezterm|kitty|xterm-kitty)
+    _diag_info "terminal" "${_np_term} (check docs for OSC 777 notification support)${_np_ssh_note}"
+    ;;
+  "")
+    _diag_info "terminal" "unknown (\$TERM_PROGRAM not set)${_np_ssh_note}"
+    ;;
+  *)
+    _diag_info "terminal" "${_np_term} (check docs for OSC 777 notification support)${_np_ssh_note}"
+    ;;
+  esac
+
   # ── Section: git identity ────────────────────────────────────────────────
   _section_header "git identity  (needed for 'zproj init' on new repos)"
 
@@ -6027,7 +6117,45 @@ TI4EOF
   nt23_out="$(HOME="$nt23_home" PATH="$nt23_home/bin:$PATH" _integrate_configure_agents true 2>/dev/null)"
   _t_grep "NT23: opencode no plugin → manual setup"  "manual setup" \
     bash -c 'echo "'"$nt23_out"'"'
-  rm -rf "$nt23_home" || true
+   rm -rf "$nt23_home" || true
+
+  _section "NT24 — diagnostics: notification pipeline section present"
+  local nt24_out
+  nt24_out="$(_zproj --diagnostics 2>&1)" || true
+  _t_grep "NT24: notification pipeline section present"  \
+    "[Nn]otification pipeline"  echo "$nt24_out"
+
+  _section "NT25 — diagnostics: alert-bell hook shown when server running"
+  if ! command -v tmux &>/dev/null || ! tmux list-sessions &>/dev/null; then
+    _t_skip "NT25 (no tmux server)"
+  else
+    tmux source-file "$(_tmux_config_path)" 2>/dev/null || true
+    local nt25_out
+    nt25_out="$(_zproj --diagnostics 2>&1)" || true
+    _t_grep "NT25: alert-bell hook shown"  "alert-bell"  echo "$nt25_out"
+  fi
+
+  _section "NT26 — diagnostics: allow-passthrough shown when server running"
+  if ! command -v tmux &>/dev/null || ! tmux list-sessions &>/dev/null; then
+    _t_skip "NT26 (no tmux server)"
+  elif ! _version_gte "$(tmux -V 2>/dev/null | awk '{print $2}')" "3.2"; then
+    _t_skip "NT26 (tmux < 3.2)"
+  else
+    tmux set -g allow-passthrough all 2>/dev/null || true
+    local nt26_out
+    nt26_out="$(_zproj --diagnostics 2>&1)" || true
+    _t_grep "NT26: allow-passthrough shown"  "allow-passthrough"  echo "$nt26_out"
+  fi
+
+  _section "NT27 — diagnostics: terminal emulator detection reports TERM_PROGRAM"
+  local nt27_out
+  nt27_out="$(TERM_PROGRAM=ghostty _zproj --diagnostics 2>&1)" || true
+  _t_grep "NT27: ghostty terminal detected"  "ghostty"  echo "$nt27_out"
+
+  _section "NT28 — diagnostics: unknown terminal when TERM_PROGRAM unset"
+  local nt28_out
+  nt28_out="$(TERM_PROGRAM= _zproj --diagnostics 2>&1)" || true
+  _t_grep "NT28: unknown terminal shown"  "unknown"  echo "$nt28_out"
 
   # ── Summary ──────────────────────────────────────────────────────────────
 
