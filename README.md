@@ -264,7 +264,7 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-336 tests covering init, clone, upgrade, worktree management, fork/join,
+363 tests covering init, clone, upgrade, worktree management, fork/join,
 review workflow, tmux binding installation, diagnostics, integrate, and tool
 detection. Requires tmux, git, and bash in PATH.
 
