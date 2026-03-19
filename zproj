@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.14.1"
+readonly VERSION="4.14.2"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -3378,7 +3378,7 @@ _integrate_configure_agents() {
     local claude_settings="${HOME}/.claude/settings.json"
     local claude_configured=false
     # Check if Stop hook with BEL command already present
-    if [[ -f "$claude_settings" ]] && grep -q 'printf.*\\\\a' "$claude_settings" 2>/dev/null; then
+    if [[ -f "$claude_settings" ]] && grep -q 'printf.*\\\\a.*>/dev/tty' "$claude_settings" 2>/dev/null; then
       dim "  [already configured]  claude  (${claude_settings})"
       claude_configured=true
     fi
@@ -3393,11 +3393,11 @@ _integrate_configure_agents() {
           local tmp_settings
           tmp_settings="$(mktemp "${TMPDIR:-/tmp}/zproj-claude-XXXXXX")"
           if [[ -f "$claude_settings" ]]; then
-            jq '.hooks.Stop |= (. // []) + [{"hooks": [{"type": "command", "command": "printf \"\\a\""}]}]' \
+            jq '.hooks.Stop = ((.hooks.Stop // []) | map(select((.hooks[0].command // "") | startswith("printf") | not))) + [{"hooks": [{"type": "command", "command": "printf \"\\a\" >/dev/tty"}]}]' \
               "$claude_settings" > "$tmp_settings" 2>/dev/null && mv "$tmp_settings" "$claude_settings" || true
           else
             mkdir -p "$(dirname "$claude_settings")"
-            printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"printf \"\\a\""}]}]}}\n' > "$claude_settings"
+            printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"printf \"\\a\" >/dev/tty"}]}]}}\n' > "$claude_settings"
           fi
           step "  [configured]  claude  (${claude_settings})"
         else
@@ -3565,6 +3565,7 @@ cmd_integrate() {
   step "Installing tmux notification hooks..."
   echo ""
   _integrate_install_notify_hooks false
+  dim "  Note: run 'tmux source-file ~/.tmux.conf' to activate in the current server"
   echo ""
 
   step "Configuring coding agent notifications..."
@@ -5971,7 +5972,7 @@ TI4EOF
   nt19_home="$(mktemp -d)"
   mkdir -p "$nt19_home/bin" "$nt19_home/.claude"
   printf '#!/bin/sh\n' > "$nt19_home/bin/claude" && chmod +x "$nt19_home/bin/claude"
-  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"printf \"\\\\a\""}]}]}}\n' \
+  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"printf \"\\\\a\" >/dev/tty"}]}]}}\n' \
     > "$nt19_home/.claude/settings.json"
   local nt19_out
   nt19_out="$(HOME="$nt19_home" PATH="$nt19_home/bin:$PATH" _integrate_configure_agents true 2>/dev/null)"
