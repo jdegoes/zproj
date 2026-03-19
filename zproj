@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.14.3"
+readonly VERSION="4.15.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -3633,9 +3633,25 @@ cmd_integrate() {
      echo ""
      echo -e "${BOLD}tmux notification hooks (dry run):${RESET}"
      _integrate_install_notify_hooks true
-     dim "  Note: run 'tmux source-file $(_tmux_config_path)' to activate in the current server"
-     echo ""
-     echo -e "${BOLD}agent notification config (dry run):${RESET}"
+      dim "  Note: run 'tmux source-file $(_tmux_config_path)' to activate in the current server"
+      # Warn if running tmux server diverges from config
+      if command -v tmux &>/dev/null && tmux list-sessions &>/dev/null; then
+        local _pi_conf
+        _pi_conf="$(_tmux_config_path)"
+        local _pi_conf_has_bell=false _pi_server_has_bell=false
+        grep -qE "alert-bell.*zproj notify" "$_pi_conf" 2>/dev/null && _pi_conf_has_bell=true
+        tmux show-hooks -g 2>/dev/null | grep -qE "alert-bell.*zproj notify" && _pi_server_has_bell=true
+        if $_pi_conf_has_bell && ! $_pi_server_has_bell; then
+          warn "  ⚠ hooks in config but not loaded in running tmux server — run: tmux source-file ${_pi_conf}"
+        fi
+        local _pi_live_pt
+        _pi_live_pt="$(tmux show -gv allow-passthrough 2>/dev/null)" || _pi_live_pt=""
+        if grep -qE "allow-passthrough" "$_pi_conf" 2>/dev/null && [[ "$_pi_live_pt" != "all" ]]; then
+          warn "  ⚠ allow-passthrough: config has 'all' but server has '${_pi_live_pt:-off}' — run: tmux source-file ${_pi_conf}"
+        fi
+      fi
+      echo ""
+      echo -e "${BOLD}agent notification config (dry run):${RESET}"
      _integrate_configure_agents true
      return 0
    fi
@@ -6156,6 +6172,32 @@ TI4EOF
   local nt28_out
   nt28_out="$(TERM_PROGRAM= _zproj --diagnostics 2>&1)" || true
   _t_grep "NT28: unknown terminal shown"  "unknown"  echo "$nt28_out"
+
+  _section "NT29 — integrate --plan: divergence warning when hooks in config but not server"
+  if ! command -v tmux &>/dev/null; then
+    _t_skip "NT29 (tmux not available)"
+  else
+    local nt29_home nt29_socket
+    nt29_home="$(mktemp -d)"
+    # Write tmux config with hooks (matching the grep pattern)
+    printf '# zproj notification\nset-hook -ga alert-bell run-shell "zproj notify"\n' \
+      > "$nt29_home/.tmux.conf"
+    # Start isolated tmux server with NO hooks (empty config: /dev/null)
+    tmux -L nt29test -f /dev/null new-session -d -s nt29 2>/dev/null || true
+    nt29_socket="$(tmux -L nt29test display-message -p '#{socket_path}' 2>/dev/null)" || nt29_socket=""
+    if [[ -z "$nt29_socket" ]]; then
+      _t_skip "NT29 (could not start isolated tmux server)"
+    else
+      local nt29_out nt29_pid
+      nt29_pid="$(tmux -L nt29test display-message -p '#{pid}' 2>/dev/null)" || nt29_pid="0"
+      nt29_out="$(HOME="$nt29_home" TMUX="${nt29_socket},${nt29_pid},0" \
+        ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" integrate --plan 2>&1)" || true
+      _t_grep "NT29: divergence warning shown"  "config but not loaded"  \
+        echo "$nt29_out"
+      tmux -L nt29test kill-server 2>/dev/null || true
+    fi
+    rm -rf "$nt29_home" || true
+  fi
 
   # ── Summary ──────────────────────────────────────────────────────────────
 
