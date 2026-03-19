@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.14.2"
+readonly VERSION="4.14.3"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -2781,6 +2781,13 @@ cmd_diagnostics() {
     _diag_ok "version comparison" "using built-in fallback (sort -V unavailable)"
   fi
 
+  # jq (optional — used by 'zproj integrate' to configure Claude/Gemini JSON files)
+  if command -v jq &>/dev/null; then
+    _diag_ok "jq" "$(command -v jq)  (used by 'zproj integrate' for Claude/Gemini config)"
+  else
+    _diag_warn "jq not found" "'zproj integrate' can't auto-configure Claude/Gemini — install: brew install jq"
+  fi
+
   # disown (used in integrate for async handoff scheduling)
   if ( sleep 0 & disown ) 2>/dev/null; then
     _diag_ok "disown" "async job scheduling works"
@@ -3402,7 +3409,7 @@ _integrate_configure_agents() {
           step "  [configured]  claude  (${claude_settings})"
         else
           warn "  jq not found — add Stop hook to ${claude_settings} manually:"
-          step '    {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"printf \"\\a\""}]}]}}'
+          step '    {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"printf \"\\a\" >/dev/tty"}]}]}}'
         fi
       fi
     fi
