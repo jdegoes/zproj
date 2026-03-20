@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.15.0"
+readonly VERSION="4.15.1"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -2925,7 +2925,7 @@ cmd_diagnostics() {
 # All facts known to zproj are embedded directly — the agent does not guess.
 _integrate_build_prompt() {
   local zproj_path editor editor_binary ai ai_binary review_path_rel review_path_abs
-  local zproj_version diffview_lua_contents
+  local zproj_version
 
   zproj_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   zproj_version="$VERSION"
@@ -2940,13 +2940,6 @@ _integrate_build_prompt() {
   review_path_abs="$("$zproj_path" review path --abs 2>/dev/null)" \
     || review_path_abs="(run from inside a worktree)"
 
-  # Embed the reference Neovim+diffview.nvim implementation as a literal
-  # heredoc bundled in the script — not read from the user's live config,
-  # which may not exist (the user may not use Neovim at all).
-  #
-  # The implementation is split across two files:
-  #   lua/config/keymaps.lua     — all four review bindings as permanent globals
-  #   lua/plugins/diffview.lua   — diffview plugin spec only (no review hooks)
   keymaps_lua_contents="$(cat <<'KEYMAPS_LUA'
 -- lua/config/keymaps.lua
 
@@ -3011,49 +3004,6 @@ vim.keymap.set("n", "<leader>rc", function()
   end
 end, { desc = "Clear review notes" })
 KEYMAPS_LUA
-)"
-
-  diffview_lua_contents="$(cat <<'DIFFVIEW_LUA'
--- lua/plugins/diffview.lua
-
-return {
-  {
-    "sindrets/diffview.nvim",
-    lazy = false,
-    dependencies = { "nvim-tree/nvim-web-devicons" },
-    opts = {
-      hooks = {
-        diff_buf_read = function(bufnr, _ctx)
-          vim.bo[bufnr].modifiable = false
-        end,
-      },
-    },
-    keys = {
-      {
-        "<leader>df",
-        function()
-          local file = vim.fn.expand("%:~:.")
-          if file ~= "" then
-            vim.cmd("DiffviewOpen HEAD -- " .. vim.fn.fnameescape(file))
-            vim.cmd("DiffviewToggleFiles")
-          end
-        end,
-        desc = "Diffview: current file",
-      },
-      {
-        "<leader>dq",
-        "<cmd>DiffviewClose<cr>",
-        desc = "Diffview: close",
-      },
-      {
-        "<leader>dh",
-        "<cmd>DiffviewFileHistory %<cr>",
-        desc = "Diffview: file history",
-      },
-    },
-  },
-}
-DIFFVIEW_LUA
 )"
 
   cat <<PROMPT
@@ -3175,18 +3125,10 @@ invariants that must hold regardless of editor are:
 
 The four review bindings live in **\`lua/config/keymaps.lua\`** as permanent
 global keymaps, available in any buffer at all times. They have no dependency
-on diffview or any other plugin — they work on whatever buffer is current.
-
-**\`lua/plugins/diffview.lua\`** is the user's diff viewer config. It is shown
-here for completeness but is independent of the review workflow — the review
-keymaps work identically whether or not diffview is installed.
+on any specific plugin — they work on whatever buffer is current.
 
 \`\`\`lua
 ${keymaps_lua_contents}
-\`\`\`
-
-\`\`\`lua
-${diffview_lua_contents}
 \`\`\`
 
 Key observations from this implementation:
@@ -3194,7 +3136,7 @@ Key observations from this implementation:
 - The review notes path is obtained via \`zproj review path --abs\` (shelled
   out), never hardcoded
 - All four bindings are permanent global keymaps in \`keymaps.lua\` — available
-  in any buffer, regardless of whether diffview is open
+  in any buffer at all times
 - \`<leader>rn\` checks both \`vim.v.shell_error\` and the empty-string to detect
   \`zproj\` failures robustly
 - \`<leader>rv\` opens the notes file in a split for inspection
