@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.15.1"
+readonly VERSION="4.15.2"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -71,8 +71,8 @@ step() { echo -e "  $*"; }
 # $1 = directory name to cd into
 _hint_next_steps() {
   local dir="$1"
+  echo -e "  ${DIM}$SCRIPT_NAME ${dir}${RESET}       ${DIM}# open session${RESET}"
   echo -e "  ${DIM}cd ${dir}${RESET}"
-  echo -e "  ${DIM}$SCRIPT_NAME${RESET}              ${DIM}# open session${RESET}"
   echo -e "  ${DIM}$SCRIPT_NAME my-feature${RESET}  ${DIM}# create new worktree + window${RESET}"
 }
 
@@ -2020,6 +2020,17 @@ cmd_open() {
 cmd_default() {
   local dir="$1"
 
+  # If the arg itself is a bare worktree root (contains .bare/), treat
+  # `zproj <dir>` as equivalent to `cd <dir>; zproj` — open the project's
+  # session. Without this, `resolve_project_dir` would interpret the arg
+  # as a worktree name inside cwd and produce the misleading error
+  # "'<cwd>' is not a bare worktree root" — exactly the scenario the `init`
+  # success message invites (user runs `zproj init my-dir`, then `zproj my-dir`).
+  if [[ -d "$dir/$BARE_DIR" ]]; then
+    ( cd "$dir" && cmd_open )
+    return
+  fi
+
   resolve_project_dir "$dir"
   check_session_deps
 
@@ -2077,6 +2088,7 @@ ${BOLD}Usage:${RESET}
 ${BOLD}Directory resolution:${RESET}
   From the bare repo root:   $SCRIPT_NAME feature-auth
   From anywhere:             $SCRIPT_NAME ~/projects/zio-blocks/feature-auth
+  Project root as shortcut:  $SCRIPT_NAME zio-blocks   ${DIM}# opens session (same as: cd zio-blocks; zproj)${RESET}
 
 ${BOLD}Tmux layout:${RESET}
   One session per project (e.g. zio-blocks).
@@ -5022,6 +5034,35 @@ NOTES
   _t_check "B10b: main/ created in spaced path"   test -d "$b10b_dir/main"
   _t_check "B10b: README.md moved into main/"     test -f "$b10b_dir/main/README.md"
   rm -rf "$(dirname "$b10b_dir")" || true
+
+  # B11 — default: `zproj <bare-root>` opens the project, not a misleading error
+  # Bug: running `zproj my-dir` from the parent of a zproj-initialized
+  # directory produced "'<parent>' is not a bare worktree root." because
+  # resolve_project_dir treated the arg as a worktree name inside cwd.
+  # The init success message explicitly invites this usage ("cd my-dir; zproj"),
+  # so `zproj my-dir` as a shortcut should open the session instead.
+  _section "B11 — default: arg that is itself a bare root opens the project"
+  local b11_parent b11_root
+  b11_parent="$(mktemp -d)"
+  b11_root="$b11_parent/b11proj"
+  ( cd "$b11_parent" && "$BASH" "$0" init b11proj &>/dev/null ) || true
+  tmux kill-session -t "b11proj" 2>/dev/null || true
+  local b11_out b11_exit=0
+  b11_out="$(cd "$b11_parent" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" b11proj 2>&1)" || b11_exit=$?
+  _t_check "B11: exits 0 for bare-root arg from parent" test "$b11_exit" -eq 0
+  _t_check "B11: no 'not a bare worktree root' error" \
+    bash -c '! echo "$1" | grep -q "is not a bare worktree root"' -- "$b11_out"
+  _t_check "B11: session created for bare-root arg" \
+    tmux has-session -t "b11proj"
+  tmux kill-session -t "b11proj" 2>/dev/null || true
+  # Also verify the absolute-path form works identically
+  local b11_abs_out b11_abs_exit=0
+  b11_abs_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" "$b11_root" 2>&1)" || b11_abs_exit=$?
+  _t_check "B11: exits 0 for absolute bare-root arg" test "$b11_abs_exit" -eq 0
+  _t_check "B11: session created for absolute bare-root arg" \
+    tmux has-session -t "b11proj"
+  tmux kill-session -t "b11proj" 2>/dev/null || true
+  rm -rf "$b11_parent" || true
 
   # ── Section: TM — tmux session name sanitisation ─────────────────────────
   # Bug: '.' and ':' in a project directory name are tmux target-syntax

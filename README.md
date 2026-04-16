@@ -58,8 +58,8 @@ zproj --version
 ```bash
 # Start a new project
 zproj init my-project
-cd my-project
-zproj                        # opens tmux session with main worktree
+zproj my-project             # opens tmux session with main worktree
+# (or: cd my-project; zproj)
 
 # Clone an existing repo
 zproj clone git@github.com:you/my-project.git
@@ -240,6 +240,7 @@ Set `$ZPROJ_NOTIFY_COOLDOWN` to override the 5-second per-pane debounce.
 ```
 zproj                                       Open project session (from repo root)
 zproj <worktree-dir>                        Create (if needed) and launch
+zproj <project-root>                        Open project session (shortcut; from parent)
 zproj init <dir> [--main <branch>]          Init, convert, or upgrade to bare worktree repo
 zproj clone <git-url> [dir]                 Clone remote repo as bare worktree structure
 zproj create <worktree-dir> [--from ref]    Create a new worktree
@@ -264,7 +265,7 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-363 tests covering init, clone, upgrade, worktree management, fork/join,
+381 tests covering init, clone, upgrade, worktree management, fork/join,
 review workflow, tmux binding installation, diagnostics, integrate, and tool
 detection. Requires tmux, git, and bash in PATH.
 
