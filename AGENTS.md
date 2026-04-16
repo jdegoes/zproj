@@ -97,8 +97,10 @@ Most tmux behaviours *can* be tested via `tmux list-panes`, `tmux list-windows`,
 3. Update `README.md` for user-facing changes
 4. Verify `AGENTS.md` is factually correct
 5. `git add && git commit` with clear message
-6. `git push` and open PR with good description
-7. Fix CI failures, address valid feedback
+6. Publish:
+   - **With push rights on this repo**: `git push` to `main`
+   - **Without**: push a branch to your fork and open a PR with a clear description
+7. Fix CI failures; for PRs, address review feedback
 
 ## Do Not
 
