@@ -815,8 +815,17 @@ _case2_upgrade_repo() {
     echo "gitdir: ./$BARE_DIR" >"$abs_dir/$GIT_POINTER"
     local _rc=0
     while IFS= read -r _remote; do
-      git -C "$abs_dir" config \
-        "remote.${_remote}.fetch" "+refs/heads/*:refs/remotes/${_remote}/*" || _rc=1
+      local _key="remote.${_remote}.fetch"
+      local _want="+refs/heads/*:refs/remotes/${_remote}/*"
+      # Preserve any extra user-configured refspecs (e.g. a parallel
+      # +refs/schemas/* mapping). Only normalize if the standard
+      # heads-only refspec isn't already present.
+      if git -C "$abs_dir" config --get-all "$_key" 2>/dev/null \
+           | grep -Fxq "$_want"; then
+        : # already correct
+      else
+        git -C "$abs_dir" config --add "$_key" "$_want" || _rc=1
+      fi
       ((remote_count++)) || true
     done < <(git -C "$abs_dir" remote 2>/dev/null)
     return $_rc
@@ -4402,6 +4411,25 @@ STUB
   _zproj init u3 &>/dev/null
   _t_grep "remote origin preserved"  "^origin$"                              git -C "$tmp/u3/main" remote
   _t_grep "fetch refspec fixed"      '+refs/heads/\*:refs/remotes/origin/\*'  git -C "$tmp/u3" config remote.origin.fetch
+
+  _section "U3b — upgrade: multiple fetch refspecs preserved"
+  rm -rf "$tmp/u3b-remote" || true
+  git init -q --bare "$tmp/u3b-remote" || true
+  _make_repo u3b
+  git -C "$tmp/u3b" remote add origin "$tmp/u3b-remote" || true
+  git -C "$tmp/u3b" push -q origin main || true
+  # Add a second fetch refspec — the classic case that previously broke
+  # with: "cannot overwrite multiple values with a single value".
+  git -C "$tmp/u3b" config --add remote.origin.fetch \
+    "+refs/schemas/*:refs/remotes/origin/schemas/*"
+  _zproj init u3b &>/dev/null
+  _t_check "upgrade succeeds with multi-refspec" test -d "$tmp/u3b/main"
+  _t_grep "standard refspec retained" \
+    '+refs/heads/\*:refs/remotes/origin/\*' \
+    git -C "$tmp/u3b" config --get-all remote.origin.fetch
+  _t_grep "extra refspec preserved" \
+    '+refs/schemas/\*:refs/remotes/origin/schemas/\*' \
+    git -C "$tmp/u3b" config --get-all remote.origin.fetch
 
   _section "U4 — upgrade: tags preserved"
   _make_repo u4
