@@ -102,6 +102,13 @@ my-project/
 Each worktree directory is a fully independent working tree. You can have
 multiple branches open simultaneously without stashing or switching.
 
+> **Invariant**: each worktree directory holds the branch of the same name
+> (`feature-auth/` is on branch `feature-auth`, `main/` is on branch `main`).
+> zproj enforces this on `create`/`fork`. If you manually `git checkout` a
+> different branch inside a worktree, `zproj launch`, `fork`, `join`, and
+> `update` will warn — operations like `update` resolve the source by branch
+> name and will silently target the wrong branch otherwise.
+
 ### Tmux layout
 
 One tmux **session** per project, one **window** per worktree. Each window has
@@ -283,7 +290,7 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-409 tests covering init, clone, upgrade, worktree management, fork/update/join,
+415 tests covering init, clone, upgrade, worktree management, fork/update/join,
 review workflow, tmux binding installation, diagnostics, integrate, and tool
 detection. Requires tmux, git, and bash in PATH.
 

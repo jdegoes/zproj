@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.16.0"
+readonly VERSION="4.17.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -97,6 +97,29 @@ _tmux_attach_or_switch() {
 # Return 0 if the git repo at $1 has uncommitted changes (dirty), 1 if clean.
 _git_is_dirty() {
   git -C "$1" status --porcelain 2>/dev/null | grep -q .
+}
+
+# Warn if the worktree at $1 has a branch checked out whose name does not
+# match the worktree's directory name. zproj's whole model assumes the
+# invariant `basename(<worktree>) == checked-out branch name`; when a user
+# manually checks out a different branch, operations like `zproj update`
+# silently target the wrong branch.
+#
+# Detached HEAD is intentionally not warned about (rare, and warning would
+# fire constantly during legitimate bisects). Returns 0 always.
+_warn_branch_mismatch() {
+  local wt_dir="$1"
+  local dir_name actual_branch
+  dir_name="$(basename "$wt_dir")"
+  actual_branch="$(git -C "$wt_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" || return 0
+  [[ -z "$actual_branch" ]] && return 0
+  [[ "$actual_branch" == "HEAD" ]] && return 0
+  if [[ "$dir_name" != "$actual_branch" ]]; then
+    warn "Worktree '${dir_name}' is on branch '${actual_branch}' (expected '${dir_name}')."
+    warn "  zproj assumes worktree directory name == branch name."
+    warn "  Switch back: ${CYAN}git -C ${wt_dir} checkout ${dir_name}${RESET}"
+  fi
+  return 0
 }
 
 # Expand the glob <dir>/*, storing all entries in the global array _GLOB_RESULT.
@@ -1361,6 +1384,8 @@ cmd_fork() {
   source_branch="$(git -C "$source_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" || \
     die "Could not determine branch for source worktree."
 
+  _warn_branch_mismatch "$source_dir"
+
   # Warn if source has uncommitted changes
   if _git_is_dirty "$source_dir"; then
     warn "Source worktree '$(basename "$source_dir")' has uncommitted changes."
@@ -1573,6 +1598,8 @@ cmd_update() {
     die "Worktree '$target_name' is on detached HEAD; cannot determine current branch."
   fi
 
+  _warn_branch_mismatch "$target_dir"
+
   # Resolve source branch
   local source_branch
   if [[ -n "$explicit_source" ]]; then
@@ -1596,6 +1623,15 @@ cmd_update() {
 
   [[ "$source_branch" == "$target_branch" ]] && \
     die "Source and target branches are the same ('${source_branch}')."
+
+  # If the worktree dir matching the source branch exists, warn when its
+  # checked-out branch differs — this is exactly the scenario where update
+  # silently merges stale commits from the recorded source ref while the user
+  # is committing to a different branch in that directory.
+  local source_wt="$parent_dir/$source_branch"
+  if [[ -d "$source_wt" ]] && _git_is_registered_worktree "$parent_dir" "$source_wt"; then
+    _warn_branch_mismatch "$source_wt"
+  fi
 
   # Already up to date?
   local source_head target_head
@@ -1688,6 +1724,8 @@ cmd_join() {
   source_branch="$(git -C "$source_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" || \
     die "Could not determine branch for source worktree."
 
+  _warn_branch_mismatch "$source_dir"
+
   # Resolve target worktree
   resolve_project_dir "$target"
   local target_dir="$PROJECT_DIR"
@@ -1703,6 +1741,8 @@ cmd_join() {
   local target_branch
   target_branch="$(git -C "$target_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" || \
     die "Could not determine branch for target worktree."
+
+  _warn_branch_mismatch "$target_dir"
 
   # Warn about uncommitted changes in source
   local source_dirty=false
@@ -1924,6 +1964,8 @@ cmd_launch() {
   if ! _git_is_registered_worktree "$PARENT_DIR" "$PROJECT_DIR"; then
     die "'$WORKTREE_NAME' exists but is not a registered git worktree.\n  Create one with: ${CYAN}$SCRIPT_NAME create $WORKTREE_NAME${RESET}\n  List worktrees:  ${CYAN}$SCRIPT_NAME list${RESET}"
   fi
+
+  _warn_branch_mismatch "$PROJECT_DIR"
 
   # Resolve editor and AI agent
   local editor ai
@@ -6274,6 +6316,58 @@ NOTES
   up12_exit="$( (cd "$up_root/up12" && "$BASH" "$0" update up12 &>/dev/null); echo $? )"
   _t_check "UP12: exits non-zero"               test "$up12_exit" -ne 0
   _t_grep "UP12: error mentions same"           "same"  echo "$up12_out"
+
+  # ── Section: BM — branch-name mismatch warnings ─────────────────────────
+
+  # Fresh bare repo so BM tests don't interact with UP/FK leftovers.
+  local bm_root="$tmp/bm"
+  rm -rf "$bm_root" || true
+  ( cd "$tmp" && "$BASH" "$0" init bm &>/dev/null ) || true
+  git -C "$bm_root/main" config user.name "Test" || true
+  git -C "$bm_root/main" config user.email "t@t.test" || true
+  echo "base" > "$bm_root/main/file.txt"
+  git -C "$bm_root/main" add . && git -C "$bm_root/main" commit -q -m "base" || true
+
+  _section "BM1 — cmd_update on matching branch: no mismatch warning"
+  ( cd "$bm_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork bm1 &>/dev/null ) || true
+  echo "src" > "$bm_root/main/src1.txt"
+  git -C "$bm_root/main" add . && git -C "$bm_root/main" commit -q -m "src1" || true
+  local bm1_out
+  bm1_out="$(cd "$bm_root/bm1" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update 2>&1)" || true
+  _t_check "BM1: no 'is on branch' warning"     bash -c '! grep -q "is on branch" <<< "$1"' -- "$bm1_out"
+
+  _section "BM2 — cmd_update warns when target worktree is on a stray branch"
+  ( cd "$bm_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork bm2 &>/dev/null ) || true
+  ( cd "$bm_root/bm2" && git checkout -q -b stray-branch ) 2>/dev/null
+  local bm2_out
+  bm2_out="$(cd "$bm_root/bm2" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update 2>&1)" || true
+  _t_grep "BM2: warns about stray-branch"       "stray-branch"             echo "$bm2_out"
+  _t_grep "BM2: suggests git checkout"          "git -C .* checkout bm2"   echo "$bm2_out"
+  ( cd "$bm_root/bm2" && git checkout -q bm2 ) 2>/dev/null
+  git -C "$bm_root/bm2" branch -D stray-branch 2>/dev/null || true
+
+  _section "BM3 — cmd_update warns when source worktree is on a different branch (user's scenario)"
+  ( cd "$bm_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork bm3 &>/dev/null ) || true
+  # Switch the main worktree to a different branch — reflect-vs-main scenario
+  ( cd "$bm_root/main" && git checkout -q -b drifted ) 2>/dev/null
+  echo "drift" > "$bm_root/main/drift.txt"
+  git -C "$bm_root/main" add . && git -C "$bm_root/main" commit -q -m "drift" || true
+  local bm3_out
+  bm3_out="$(cd "$bm_root/bm3" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update 2>&1)" || true
+  _t_grep "BM3: warns about source mismatch"    "Worktree 'main' is on branch 'drifted'"  echo "$bm3_out"
+  _t_grep "BM3: still reports up to date"       "already up to date"  echo "$bm3_out"
+  ( cd "$bm_root/main" && git checkout -q main ) 2>/dev/null
+  git -C "$bm_root/main" branch -D drifted 2>/dev/null || true
+
+  _section "BM4 — cmd_fork warns when source is on a different branch"
+  ( cd "$bm_root/main" && git checkout -q -b drifted2 ) 2>/dev/null
+  echo "d2" > "$bm_root/main/d2.txt"
+  git -C "$bm_root/main" add . && git -C "$bm_root/main" commit -q -m "d2" || true
+  local bm4_out
+  bm4_out="$(cd "$bm_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork bm4 2>&1)" || true
+  _t_grep "BM4: fork warns about source mismatch"  "Worktree 'main' is on branch 'drifted2'"  echo "$bm4_out"
+  ( cd "$bm_root/main" && git checkout -q main ) 2>/dev/null
+  git -C "$bm_root/main" branch -D drifted2 2>/dev/null || true
 
   # ── Section: TI — tmux binding installation ─────────────────────────────
 
