@@ -72,6 +72,8 @@ zproj feature-auth           # creates worktree + branch + tmux window
 # Try an experiment (fork from main, work on it, merge back)
 zproj fork main experiment   # fork main → experiment at same commit
 # ... make changes in experiment, commit ...
+# Pull main's latest commits into experiment as you go:
+cd experiment && zproj update    # merge latest main into experiment
 zproj join experiment main   # merge experiment → main, delete experiment
 
 # Convert an existing directory or git repo
@@ -131,6 +133,7 @@ is active.
 | `<prefix> X` | Delete the current worktree (with confirmation) |
 | `<prefix> F` | Fork the current worktree (prompts for new name) |
 | `<prefix> J` | Join the current worktree into another (prompts for target) |
+| `<prefix> U` | Update the current worktree from its forked source (with confirmation) |
 
 All bindings work from any pane — they derive the project root automatically.
 
@@ -146,9 +149,10 @@ zproj --diagnostics  # check the full environment for problems
 | `CODING_AGENT` | Override coding agent (e.g. `export CODING_AGENT=claude`) |
 | `ZPROJ_EDITOR` | Override editor (e.g. `export ZPROJ_EDITOR=nvim`) |
 
-## Fork and join
+## Fork, update, and join
 
-Fork creates a new worktree at the same commit as the source. Join merges a
+Fork creates a new worktree at the same commit as the source. Update pulls
+the source's latest commits into a fork as it progresses. Join merges a
 source worktree's branch into a target and deletes the source on success.
 
 ```bash
@@ -158,6 +162,11 @@ zproj fork experiment        # CWD → experiment
 # Fork from a named source
 zproj fork main hotfix       # main → hotfix
 
+# Pull latest source commits into a fork
+cd experiment && zproj update           # CWD ← recorded source (e.g. main)
+zproj update main                       # CWD ← main (also self-records)
+zproj update experiment main            # experiment ← main (from anywhere)
+
 # Join back (merge + delete source)
 zproj join hotfix main       # hotfix → main
 
@@ -165,14 +174,22 @@ zproj join hotfix main       # hotfix → main
 zproj join main              # CWD → main
 ```
 
-Only committed state is forked/joined. Uncommitted changes produce a warning
-but don't block the operation. If the source has uncommitted changes at join
-time, it is preserved (not deleted) even on a successful merge.
+Only committed state is forked/joined/updated. Uncommitted changes produce a
+warning but don't block the operation. If the source has uncommitted changes
+at join time, it is preserved (not deleted) even on a successful merge.
 
-If a join has merge conflicts, the merge is aborted and the diff is sent to
-the coding agent in the target worktree with instructions. After resolving
-the conflicts and committing, re-run the same `zproj join` command to
-complete the join and clean up the source.
+If a `join` or `update` hits merge conflicts, the merge is aborted and the
+diff is sent to the coding agent in the target worktree with instructions.
+After resolving the conflicts and committing, the merge is complete (for
+`update`) or you re-run the same `zproj join` to clean up the source.
+
+`zproj fork` records the source branch in `branch.<n>.zprojSource` so that
+subsequent `zproj update` calls (or `<prefix> U`) need no arguments. For
+worktrees forked before this feature existed, the source is auto-detected
+from local-branch topology (the branch with the most-recent merge-base with
+your fork; the bare repo's default branch wins on ties) and recorded on
+first successful update. Disambiguate auto-detection failures by passing the
+source explicitly: `zproj update <source>`.
 
 Fork/join identity: `zproj fork old new && zproj join new old` is a no-op.
 
@@ -198,7 +215,7 @@ The notes file is deleted after the temp file is safely written.
 `zproj integrate` bootstraps a new machine in one step:
 
 1. **Installs tmux keybindings** for worktree management (create, delete,
-   fork, join) into your tmux config
+   fork, join, update) into your tmux config
 2. **Asks your coding agent** to implement the review workflow in your editor
    (add note / view / dispatch / clear), using the Neovim reference
    implementation as a concrete example
@@ -246,6 +263,7 @@ zproj clone <git-url> [dir]                 Clone remote repo as bare worktree s
 zproj create <worktree-dir> [--from ref]    Create a new worktree
 zproj delete <worktree-dir> [--force]       Remove worktree, branch, and window
 zproj fork [<source>] <new-worktree>        Fork worktree at same commit
+zproj update [<target>] [<source>]          Merge forked source branch into target
 zproj join [<source>] <target>              Merge source into target, delete source
 zproj launch <worktree-dir>                 Start or switch to tmux window
 zproj list [dir]                            Show worktrees with status
@@ -265,7 +283,7 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-381 tests covering init, clone, upgrade, worktree management, fork/join,
+409 tests covering init, clone, upgrade, worktree management, fork/update/join,
 review workflow, tmux binding installation, diagnostics, integrate, and tool
 detection. Requires tmux, git, and bash in PATH.
 

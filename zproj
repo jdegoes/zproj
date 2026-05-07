@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.15.2"
+readonly VERSION="4.16.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -1394,10 +1394,237 @@ cmd_fork() {
     git -C "$target_dir" branch --set-upstream-to="$upstream" "$target_name" --quiet 2>/dev/null || true
   fi
 
+  # Record the source branch so `zproj update` can find it later.
+  git -C "$target_dir" config "branch.${target_name}.zprojSource" "$source_branch" 2>/dev/null || true
+
   info "Forked ${BOLD}$(basename "$source_dir")${RESET} → ${BOLD}${target_name}${RESET}"
 
   # Launch the new worktree window (use absolute path so it works from any CWD)
   cmd_launch "$target_dir"
+}
+
+# Resolve the source branch a worktree was forked from.
+#
+# Resolution order:
+#   1. Recorded source: `git config branch.<branch>.zprojSource`
+#   2. Auto-detect: pick the local branch with the most-recent merge-base with
+#      <branch> (i.e. the branch <branch> diverged from most recently). On
+#      ties, prefer the bare repo's default branch.
+#
+# Why merge-base recency rather than ancestor-of: after a fork has been updated
+# (or source has moved on), source's HEAD is no longer an ancestor of fork's
+# HEAD. The most-recent merge-base, however, robustly identifies the branch
+# the fork descended from in all common cases (fresh fork, source-ahead,
+# diverged, previously-merged).
+#
+# On success, prints the source branch name to stdout and (when not already
+# recorded) writes it to git config so subsequent calls are O(1).
+#
+# On failure, prints a diagnostic to stderr and returns 1. The caller is
+# expected to die() with additional context (target name, suggested fix).
+#
+# Arguments:
+#   $1 = absolute path to worktree
+#   $2 = current branch name in that worktree
+#   $3 = absolute path to bare repo parent (for default-branch lookup)
+_resolve_fork_source() {
+  local wt_dir="$1"
+  local branch="$2"
+  local parent_dir="$3"
+
+  # 1. Recorded source wins.
+  local recorded
+  recorded="$(git -C "$wt_dir" config "branch.${branch}.zprojSource" 2>/dev/null)" || recorded=""
+  if [[ -n "$recorded" ]]; then
+    echo "$recorded"
+    return 0
+  fi
+
+  # 2. Auto-detect by merge-base recency.
+  local -a candidates=() mb_times=()
+  local b mb mb_time
+  while IFS= read -r b; do
+    [[ -z "$b" ]] && continue
+    [[ "$b" == "$branch" ]] && continue
+    mb="$(git -C "$wt_dir" merge-base "refs/heads/$b" "refs/heads/$branch" 2>/dev/null)" || continue
+    [[ -z "$mb" ]] && continue
+    mb_time="$(git -C "$wt_dir" log -1 --format=%ct "$mb" 2>/dev/null)" || continue
+    candidates+=("$b")
+    mb_times+=("$mb_time")
+  done < <(git -C "$wt_dir" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)
+
+  if [[ ${#candidates[@]} -eq 0 ]]; then
+    echo "no candidate source branch found (no other local branch shares history with '${branch}')" >&2
+    return 1
+  fi
+
+  # Find the highest merge-base timestamp.
+  local max_time="" i
+  for i in "${!mb_times[@]}"; do
+    if [[ -z "$max_time" ]] || [[ "${mb_times[$i]}" -gt "$max_time" ]]; then
+      max_time="${mb_times[$i]}"
+    fi
+  done
+
+  # Collect branches tied at max_time.
+  local -a tied=()
+  for i in "${!candidates[@]}"; do
+    if [[ "${mb_times[$i]}" == "$max_time" ]]; then
+      tied+=("${candidates[$i]}")
+    fi
+  done
+
+  local chosen=""
+  if [[ ${#tied[@]} -eq 1 ]]; then
+    chosen="${tied[0]}"
+  else
+    # Tie — prefer the default branch.
+    local default_branch
+    default_branch="$(_git_default_branch "$parent_dir" 2>/dev/null)" || default_branch=""
+    if [[ -n "$default_branch" ]]; then
+      for b in "${tied[@]}"; do
+        if [[ "$b" == "$default_branch" ]]; then
+          chosen="$b"
+          break
+        fi
+      done
+    fi
+    if [[ -z "$chosen" ]]; then
+      {
+        echo "multiple candidate source branches for '${branch}' (equally recent):"
+        for b in "${tied[@]}"; do
+          echo "    - $b"
+        done
+        echo "  pass one explicitly: ${SCRIPT_NAME} update <source>"
+      } >&2
+      return 1
+    fi
+  fi
+
+  # Self-heal: record the resolved source so future calls skip the search.
+  git -C "$wt_dir" config "branch.${branch}.zprojSource" "$chosen" 2>/dev/null || true
+  echo "$chosen"
+  return 0
+}
+
+cmd_update() {
+  local first="" second=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --help | -h)
+      usage_update
+      exit 0
+      ;;
+    -*) die "Unknown option: $1." ;;
+    *)
+      if [[ -z "$first" ]]; then
+        first="$1"
+      elif [[ -z "$second" ]]; then
+        second="$1"
+      else
+        die "Too many arguments."
+      fi
+      ;;
+    esac
+    shift
+  done
+
+  # Argument shapes:
+  #   (none)            target = CWD worktree, source = recorded/auto
+  #   <source>          target = CWD worktree, source = <source>
+  #   <target> <source> target = <target>,     source = <source>
+  local target="" explicit_source=""
+  if [[ -n "$first" && -n "$second" ]]; then
+    target="$first"
+    explicit_source="$second"
+  elif [[ -n "$first" ]]; then
+    explicit_source="$first"
+  fi
+
+  check_session_deps
+
+  # Resolve target worktree
+  local target_dir target_name parent_dir session_name
+  if [[ -z "$target" ]]; then
+    if ! _review_locate; then
+      die "Not inside a zproj worktree. Specify the target explicitly:\n  ${CYAN}$SCRIPT_NAME update <target> <source>${RESET}"
+    fi
+    target_dir="$_REVIEW_WT_ROOT"
+    resolve_project_dir "$target_dir"
+  else
+    resolve_project_dir "$target"
+    target_dir="$PROJECT_DIR"
+  fi
+  target_name="$(basename "$target_dir")"
+  parent_dir="$PARENT_DIR"
+  session_name="$SESSION_NAME"
+
+  [[ ! -d "$target_dir" ]] && die "Target worktree '$target_name' does not exist."
+  if ! _git_is_registered_worktree "$parent_dir" "$target_dir"; then
+    die "'$target_name' is not a registered git worktree."
+  fi
+
+  # Determine current branch
+  local target_branch
+  target_branch="$(git -C "$target_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" || \
+    die "Could not determine branch for '$target_name'."
+  if [[ "$target_branch" == "HEAD" ]]; then
+    die "Worktree '$target_name' is on detached HEAD; cannot determine current branch."
+  fi
+
+  # Resolve source branch
+  local source_branch
+  if [[ -n "$explicit_source" ]]; then
+    source_branch="$explicit_source"
+    # Self-heal: record explicit source if nothing was recorded yet.
+    local existing
+    existing="$(git -C "$target_dir" config "branch.${target_branch}.zprojSource" 2>/dev/null)" || existing=""
+    if [[ -z "$existing" ]]; then
+      git -C "$target_dir" config "branch.${target_branch}.zprojSource" "$source_branch" 2>/dev/null || true
+    fi
+  else
+    if ! source_branch="$(_resolve_fork_source "$target_dir" "$target_branch" "$parent_dir")"; then
+      die "Could not resolve source branch for '$target_name'.\n  Pass it explicitly: ${CYAN}$SCRIPT_NAME update <source>${RESET}"
+    fi
+  fi
+
+  # Verify source exists
+  if ! git -C "$target_dir" rev-parse --verify "refs/heads/$source_branch" &>/dev/null; then
+    die "Source branch '${source_branch}' not found in repository."
+  fi
+
+  [[ "$source_branch" == "$target_branch" ]] && \
+    die "Source and target branches are the same ('${source_branch}')."
+
+  # Already up to date?
+  local source_head target_head
+  source_head="$(git -C "$target_dir" rev-parse "refs/heads/$source_branch")"
+  target_head="$(git -C "$target_dir" rev-parse HEAD)"
+
+  if git -C "$target_dir" merge-base --is-ancestor "$source_head" "$target_head" 2>/dev/null; then
+    info "'${target_name}' is already up to date with '${source_branch}'."
+    return 0
+  fi
+
+  # Warn about uncommitted changes (let git refuse if they would conflict)
+  if _git_is_dirty "$target_dir"; then
+    warn "Target worktree '$target_name' has uncommitted changes."
+    warn "Merge will refuse if any of them conflict with incoming changes."
+  fi
+
+  echo -e "Updating ${BOLD}${target_name}${RESET} (${CYAN}${target_branch}${RESET}) from ${CYAN}${source_branch}${RESET}..."
+
+  if ! git -C "$target_dir" merge "$source_branch" --no-edit 2>/dev/null; then
+    # Merge failed — abort and dispatch
+    git -C "$target_dir" merge --abort 2>/dev/null || true
+
+    _merge_dispatch_conflict "update" "$parent_dir" "$target_dir" "$target_name" "$source_branch" \
+      "$target_dir" "$target_name" "$target_branch" "$session_name"
+    return 0
+  fi
+
+  info "Updated ${BOLD}${target_name}${RESET} from ${BOLD}${source_branch}${RESET}"
 }
 
 cmd_join() {
@@ -1500,7 +1727,7 @@ cmd_join() {
       # Merge failed — abort and send to agent
       git -C "$target_dir" merge --abort 2>/dev/null || true
 
-      _join_dispatch_conflict "$parent_dir" "$source_dir" "$source_name" "$source_branch" \
+      _merge_dispatch_conflict "join" "$parent_dir" "$source_dir" "$source_name" "$source_branch" \
         "$target_dir" "$target_name" "$target_branch" "$session_name"
       return 0
     fi
@@ -1530,9 +1757,16 @@ cmd_join() {
 }
 
 # Generate a conflict prompt and dispatch it to the target worktree's agent.
-_join_dispatch_conflict() {
-  local parent_dir="$1" source_dir="$2" source_name="$3" source_branch="$4"
-  local target_dir="$5" target_name="$6" target_branch="$7" session_name="$8"
+# Used by both `cmd_join` and `cmd_update`. The <action> argument selects the
+# wording in the dispatched prompt and the follow-up instructions:
+#   join   — source worktree is being merged into target; on completion the
+#            source is deleted by re-running `zproj join`.
+#   update — current worktree is pulling from its source branch; on completion
+#            no cleanup is needed (just keep working).
+_merge_dispatch_conflict() {
+  local action="$1"
+  local parent_dir="$2" source_dir="$3" source_name="$4" source_branch="$5"
+  local target_dir="$6" target_name="$7" target_branch="$8" session_name="$9"
 
   # Generate the diff of changes on source since it diverged from target
   local merge_base diff_content
@@ -1543,20 +1777,42 @@ _join_dispatch_conflict() {
     diff_content="$(git -C "$parent_dir" diff "$target_branch" "$source_branch" 2>/dev/null)" || diff_content=""
   fi
 
+  # Action-dependent wording
+  local cmd_label intro followup
+  if [[ "$action" == "join" ]]; then
+    cmd_label="join"
+    intro="A user wants to merge changes from the **${source_name}** worktree
+(branch \`${source_branch}\`) into this worktree. An automatic \`git merge\`
+was attempted but failed due to conflicts, so the merge was aborted.
+Your worktree is in a clean state — no partial merge is in progress."
+    followup="4. Complete the join by running from the project root (one directory up):
+   \`\`\`
+   cd .. && zproj join ${source_name} ${target_name}
+   \`\`\`
+   This re-runs the join. Since the merge commit is now in place, it will
+   succeed immediately and delete the **${source_name}** worktree and branch."
+  else
+    cmd_label="update"
+    intro="A user wants to update this worktree by pulling the latest commits
+from the **${source_branch}** branch (the branch this worktree was forked
+from). An automatic \`git merge\` was attempted but failed due to conflicts,
+so the merge was aborted. Your worktree is in a clean state — no partial
+merge is in progress."
+    followup="4. You are done. The **${target_name}** worktree is now up to date with
+   **${source_branch}**. No further \`zproj\` invocation is required."
+  fi
+
   # Build the conflict prompt
   local prompt
   printf -v prompt '%s' "\
-# zproj join — merge assistance
+# zproj ${cmd_label} — merge assistance
 
 ## Context
 
 zproj manages parallel git worktrees as separate directories. You are the
 coding agent running in the **${target_name}** worktree (branch \`${target_branch}\`).
 
-A user wants to merge changes from the **${source_name}** worktree
-(branch \`${source_branch}\`) into this worktree. An automatic \`git merge\`
-was attempted but failed due to conflicts, so the merge was aborted.
-Your worktree is in a clean state — no partial merge is in progress.
+${intro}
 
 ## What to do
 
@@ -1576,12 +1832,7 @@ Your worktree is in a clean state — no partial merge is in progress.
    git add -A && git commit --no-edit
    \`\`\`
 
-4. Complete the join by running from the project root (one directory up):
-   \`\`\`
-   cd .. && zproj join ${source_name} ${target_name}
-   \`\`\`
-   This re-runs the join. Since the merge commit is now in place, it will
-   succeed immediately and delete the **${source_name}** worktree and branch.
+${followup}
 
 ## Diff of source changes (for conflict resolution context)
 
@@ -1593,7 +1844,7 @@ ${diff_content}"
 
   # Save to temp file
   local tmp_prompt
-  tmp_prompt="$(mktemp "${TMPDIR:-/tmp}/zproj-join-XXXXXX")"
+  tmp_prompt="$(mktemp "${TMPDIR:-/tmp}/zproj-${cmd_label}-XXXXXX")"
   printf "%s" "$prompt" > "$tmp_prompt"
 
   # Try to send to target's agent pane
@@ -1640,7 +1891,9 @@ ${diff_content}"
   warn "Merge conflicts detected — automatic merge aborted."
   echo -e "  ${DIM}Sent changes to ${BOLD}${ai_name}${RESET}${DIM} in ${BOLD}${target_name}${RESET}"
   echo -e "  ${DIM}Prompt saved to: ${tmp_prompt}${RESET}"
-  echo -e "  ${DIM}After resolving, run: ${CYAN}cd .. && $SCRIPT_NAME join $source_name $target_name${RESET}"
+  if [[ "$action" == "join" ]]; then
+    echo -e "  ${DIM}After resolving, run: ${CYAN}cd .. && $SCRIPT_NAME join $source_name $target_name${RESET}"
+  fi
 }
 
 cmd_launch() {
@@ -2075,6 +2328,7 @@ ${BOLD}Usage:${RESET}
   $SCRIPT_NAME create <worktree-dir> [--from ref]  Create a new worktree
   $SCRIPT_NAME delete <worktree-dir> [--force]     Remove worktree, branch, and window
   $SCRIPT_NAME fork [<source>] <new-worktree>      Fork worktree at same commit
+  $SCRIPT_NAME update [<target>] [<source>]        Merge forked source branch into target
   $SCRIPT_NAME join [<source>] <target>            Merge source into target, delete source
   $SCRIPT_NAME launch <worktree-dir>               Start or switch to tmux window
   $SCRIPT_NAME list [dir]                          Show worktrees with status
@@ -2203,6 +2457,43 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME fork <new-worktree>
 ${BOLD}Examples:${RESET}
   $SCRIPT_NAME fork experiment     ${DIM}# fork CWD worktree → experiment${RESET}
   $SCRIPT_NAME fork main hotfix    ${DIM}# fork main → hotfix${RESET}
+
+EOF
+}
+
+usage_update() {
+  cat <<EOF
+
+${BOLD}Usage:${RESET} $SCRIPT_NAME update
+       $SCRIPT_NAME update <source>
+       $SCRIPT_NAME update <target> <source>
+
+  Update a worktree by merging the latest commits from the branch it was
+  forked from. Mirrors \`zproj join\`'s merge semantics — on conflict the
+  merge is aborted and a resolution prompt is dispatched to the worktree's
+  coding agent.
+
+  With no arguments, the target is the current worktree (CWD) and the source
+  is read from the branch's recorded fork-source (set automatically by
+  ${CYAN}$SCRIPT_NAME fork${RESET}). For pre-existing forks with no recorded
+  source, the source is auto-detected by finding a local ancestor branch
+  (preferring the bare repo's default branch); the result is then recorded
+  so subsequent runs are deterministic.
+
+  With one argument, the target is the current worktree (CWD) and the
+  argument is the source branch (this also self-records the source).
+
+  With two arguments, the first is the target worktree and the second is
+  the source branch.
+
+  If auto-detection finds multiple candidates and none is the default
+  branch, ${CYAN}$SCRIPT_NAME update${RESET} errors with the candidate list and
+  asks you to disambiguate by passing the source explicitly.
+
+${BOLD}Examples:${RESET}
+  $SCRIPT_NAME update                      ${DIM}# CWD worktree from recorded source${RESET}
+  $SCRIPT_NAME update main                 ${DIM}# CWD worktree from main (records main)${RESET}
+  $SCRIPT_NAME update experiment main      ${DIM}# experiment from main${RESET}
 
 EOF
 }
@@ -3069,8 +3360,8 @@ zproj is a workflow manager that combines:
 The user opens a project with \`zproj launch <worktree>\` and gets all three
 tools in one window, already positioned in the worktree directory.
 
-tmux keybindings for worktree management (create, delete, fork, join) are
-installed automatically by \`zproj integrate\` — no editor-side action needed.
+tmux keybindings for worktree management (create, delete, fork, join, update)
+are installed automatically by \`zproj integrate\` — no editor-side action needed.
 
 ---
 
@@ -3253,11 +3544,12 @@ bind N command-prompt -p "new worktree name:" "run-shell 'cd #{pane_current_path
 bind X confirm-before -p "delete worktree '#{window_name}'? (y/n)" "run-shell 'cd #{pane_current_path}/.. && zproj delete #{window_name} --force > /dev/null 2>&1; tmux refresh-client'"
 bind F command-prompt -p "fork to new worktree:" "run-shell 'cd #{pane_current_path}/.. && zproj fork #{window_name} %% > /dev/null 2>&1'"
 bind J command-prompt -p "join into worktree:" "run-shell 'cd #{pane_current_path}/.. && zproj join #{window_name} %% > /dev/null 2>&1'"
+bind U confirm-before -p "update '#{window_name}' from forked source? (y/n)" "run-shell 'cd #{pane_current_path} && zproj update > /dev/null 2>&1'"
 TMUX_BINDINGS
 )"
 
   # Check which bindings are already present by grepping for each key+zproj
-  local -a bind_keys=( N X F J )
+  local -a bind_keys=( N X F J U )
   local -a missing_keys=() missing_lines=()
   local key line
   while IFS= read -r line; do
@@ -3745,7 +4037,7 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan]
   Bootstraps your machine with three integration steps:
 
     1. Installs tmux keybindings for worktree management (create, delete,
-       fork, join)
+       fork, join, update)
     2. Configures the notification pipeline — installs tmux alert hooks so
        that any coding agent pane that emits a bell triggers a desktop
        notification via OSC 777 (Ghostty) with session and window context.
@@ -4998,8 +5290,9 @@ NOTES
   # 'command -v tmux' finds the hashed path regardless of PATH.
   hash -d tmux 2>/dev/null || true
   if ! PATH="$b9_fakebin:/usr/bin:/bin" command -v tmux &>/dev/null 2>&1; then
-    b9_out="$( PATH="$b9_fakebin:/usr/bin:/bin" /bin/bash "$0" --diagnostics 2>/dev/null )" || true
-    b9_exit="$( (PATH="$b9_fakebin:/usr/bin:/bin" /bin/bash "$0" --diagnostics &>/dev/null); echo $? )"
+    # Clear CODING_AGENT/ZPROJ_EDITOR so user env doesn't add unrelated errors.
+    b9_out="$( env -u CODING_AGENT -u ZPROJ_EDITOR PATH="$b9_fakebin:/usr/bin:/bin" /bin/bash "$0" --diagnostics 2>/dev/null )" || true
+    b9_exit="$( (env -u CODING_AGENT -u ZPROJ_EDITOR PATH="$b9_fakebin:/usr/bin:/bin" /bin/bash "$0" --diagnostics &>/dev/null); echo $? )"
     _t_grep  "B9: reports exactly 1 error"          "^1 error"   echo "$b9_out"
     _t_check "B9: exits non-zero"                   test "$b9_exit" -ne 0
   else
@@ -5846,6 +6139,142 @@ NOTES
     bash -c '! git -C "$1/main" status --porcelain | grep -q .' -- "$fk_root"
   ( cd "$fk_root" && "$BASH" "$0" delete fj8-conflict --force &>/dev/null ) || true
 
+  # ── Section: UP — update ────────────────────────────────────────────────
+
+  # Fresh bare repo for update tests so they don't depend on FJ leftovers.
+  local up_root="$tmp/up"
+  rm -rf "$up_root" || true
+  ( cd "$tmp" && "$BASH" "$0" init up &>/dev/null ) || true
+  git -C "$up_root/main" config user.name "Test" || true
+  git -C "$up_root/main" config user.email "t@t.test" || true
+  echo "base" > "$up_root/main/base.txt"
+  git -C "$up_root/main" add . && git -C "$up_root/main" commit -q -m "base" || true
+
+  _section "UP1 — fork records branch.<n>.zprojSource"
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up1 &>/dev/null ) || true
+  _t_grep "UP1: source recorded as main"  "^main$" \
+    git -C "$up_root/up1" config branch.up1.zprojSource
+
+  _section "UP2 — update merges new commits from recorded source"
+  echo "from-main" > "$up_root/main/m2.txt"
+  git -C "$up_root/main" add . && git -C "$up_root/main" commit -q -m "m2" || true
+  local up2_exit
+  up2_exit="$( (cd "$up_root/up1" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update &>/dev/null); echo $? )"
+  _t_check "UP2: exits 0"                       test "$up2_exit" -eq 0
+  _t_check "UP2: m2.txt now in up1"             test -f "$up_root/up1/m2.txt"
+  local up2_main_head up2_up1_head
+  up2_main_head="$(git -C "$up_root/main" rev-parse HEAD)"
+  up2_up1_head="$(git -C "$up_root/up1" rev-parse HEAD)"
+  _t_check "UP2: up1 fast-forwarded to main"    test "$up2_main_head" = "$up2_up1_head"
+
+  _section "UP3 — update is idempotent when already up to date"
+  local up3_out
+  up3_out="$(cd "$up_root/up1" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update 2>&1)" || true
+  _t_grep "UP3: reports already up to date"     "already up to date"  echo "$up3_out"
+
+  _section "UP4 — update auto-detects + self-records when config is missing"
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up4 &>/dev/null ) || true
+  git -C "$up_root/up4" config --unset branch.up4.zprojSource 2>/dev/null || true
+  echo "m3" > "$up_root/main/m3.txt"
+  git -C "$up_root/main" add . && git -C "$up_root/main" commit -q -m "m3" || true
+  local up4_exit
+  up4_exit="$( (cd "$up_root/up4" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update &>/dev/null); echo $? )"
+  _t_check "UP4: exits 0"                       test "$up4_exit" -eq 0
+  _t_check "UP4: m3.txt now in up4"             test -f "$up_root/up4/m3.txt"
+  _t_grep "UP4: source self-recorded as main"   "^main$" \
+    git -C "$up_root/up4" config branch.up4.zprojSource
+
+  _section "UP5 — update auto-detect prefers default branch on ties"
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up5 &>/dev/null ) || true
+  git -C "$up_root/up5" config --unset branch.up5.zprojSource 2>/dev/null || true
+  # Create a sibling branch at the same commit as main
+  git -C "$up_root/main" branch sibling 2>/dev/null || true
+  # Commit on main so there's actually something to merge (and a clear "source")
+  echo "m4" > "$up_root/main/m4.txt"
+  git -C "$up_root/main" add . && git -C "$up_root/main" commit -q -m "m4" || true
+  local up5_exit
+  up5_exit="$( (cd "$up_root/up5" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update &>/dev/null); echo $? )"
+  _t_check "UP5: exits 0"                       test "$up5_exit" -eq 0
+  _t_grep "UP5: chose default branch (main)"    "^main$" \
+    git -C "$up_root/up5" config branch.up5.zprojSource
+  git -C "$up_root/main" branch -D sibling 2>/dev/null || true
+
+  _section "UP6 — update with explicit source (one-arg form)"
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up6 &>/dev/null ) || true
+  # Create a separate branch with a commit, fork up6 will pull from it
+  git -C "$up_root/main" branch other-src 2>/dev/null || true
+  # We need the new branch's tip ahead so the merge has effect
+  ( cd "$up_root" && git worktree add other-src-wt other-src --quiet 2>/dev/null ) || true
+  echo "from-other" > "$up_root/other-src-wt/other.txt"
+  git -C "$up_root/other-src-wt" add . && git -C "$up_root/other-src-wt" commit -q -m "other-src commit" || true
+  local up6_exit
+  up6_exit="$( (cd "$up_root/up6" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update other-src &>/dev/null); echo $? )"
+  _t_check "UP6: exits 0"                       test "$up6_exit" -eq 0
+  _t_check "UP6: other.txt merged into up6"     test -f "$up_root/up6/other.txt"
+  # Self-records when no recorded value existed — but here UP1's sibling 'up6'
+  # has its own recorded source from fork (main). Explicit only self-records
+  # when nothing is recorded; pre-existing record wins.
+  _t_grep "UP6: explicit does not overwrite existing record" "^main$" \
+    git -C "$up_root/up6" config branch.up6.zprojSource
+  ( cd "$up_root" && git worktree remove other-src-wt --force &>/dev/null ) || true
+  git -C "$up_root/main" branch -D other-src 2>/dev/null || true
+
+  _section "UP7 — update two-arg form: target + source from PARENT_DIR"
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up7 &>/dev/null ) || true
+  echo "m5" > "$up_root/main/m5.txt"
+  git -C "$up_root/main" add . && git -C "$up_root/main" commit -q -m "m5" || true
+  local up7_exit
+  up7_exit="$( (cd "$up_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update up7 main &>/dev/null); echo $? )"
+  _t_check "UP7: exits 0"                       test "$up7_exit" -eq 0
+  _t_check "UP7: m5.txt merged into up7"        test -f "$up_root/up7/m5.txt"
+
+  _section "UP8 — update from outside any worktree → error"
+  local up8_exit up8_out
+  up8_out="$( (cd "$tmp" && "$BASH" "$0" update 2>&1); true )"
+  up8_exit="$( (cd "$tmp" && "$BASH" "$0" update &>/dev/null); echo $? )"
+  _t_check "UP8: exits non-zero"                test "$up8_exit" -ne 0
+  _t_grep "UP8: suggests explicit form"         "update <target> <source>"  echo "$up8_out"
+
+  _section "UP9 — update with nonexistent source → error"
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up9 &>/dev/null ) || true
+  local up9_exit up9_out
+  up9_out="$(cd "$up_root/up9" && "$BASH" "$0" update no-such-branch 2>&1)" || true
+  up9_exit="$( (cd "$up_root/up9" && "$BASH" "$0" update no-such-branch &>/dev/null); echo $? )"
+  _t_check "UP9: exits non-zero"                test "$up9_exit" -ne 0
+  _t_grep "UP9: error mentions source not found" "not found"  echo "$up9_out"
+
+  _section "UP10 — update with conflict aborts merge cleanly"
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up10 &>/dev/null ) || true
+  git -C "$up_root/up10" config user.name "Test" || true
+  git -C "$up_root/up10" config user.email "t@t.test" || true
+  echo "fork-side" > "$up_root/up10/conflict.txt"
+  git -C "$up_root/up10" add . && git -C "$up_root/up10" commit -q -m "fork-side conflict" || true
+  echo "source-side" > "$up_root/main/conflict.txt"
+  git -C "$up_root/main" add . && git -C "$up_root/main" commit -q -m "source-side conflict" || true
+  local up10_out
+  up10_out="$(cd "$up_root/up10" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update 2>&1)" || true
+  _t_grep  "UP10: reports conflict"             "conflict"           echo "$up10_out"
+  _t_grep  "UP10: mentions update temp file"    "zproj-update-"      echo "$up10_out"
+  _t_check "UP10: target dir is clean (merge aborted)" \
+    bash -c '! test -f "$1/up10/.git/MERGE_HEAD"' -- "$up_root"
+
+  _section "UP11 — update on detached HEAD → error"
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up11 &>/dev/null ) || true
+  local up11_head
+  up11_head="$(git -C "$up_root/up11" rev-parse HEAD)"
+  git -C "$up_root/up11" checkout -q --detach "$up11_head" 2>/dev/null
+  local up11_exit
+  up11_exit="$( (cd "$up_root/up11" && "$BASH" "$0" update &>/dev/null); echo $? )"
+  _t_check "UP11: exits non-zero"               test "$up11_exit" -ne 0
+
+  _section "UP12 — update where source == target → error"
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up12 &>/dev/null ) || true
+  local up12_exit up12_out
+  up12_out="$(cd "$up_root/up12" && "$BASH" "$0" update up12 2>&1)" || true
+  up12_exit="$( (cd "$up_root/up12" && "$BASH" "$0" update up12 &>/dev/null); echo $? )"
+  _t_check "UP12: exits non-zero"               test "$up12_exit" -ne 0
+  _t_grep "UP12: error mentions same"           "same"  echo "$up12_out"
+
   # ── Section: TI — tmux binding installation ─────────────────────────────
 
   _section "TI1 — tmux bindings: fresh install (no config file)"
@@ -5859,6 +6288,7 @@ NOTES
   _t_grep  "TI1: has bind X"                   "bind X.*zproj"       cat "$ti1_conf"
   _t_grep  "TI1: has bind F"                   "bind F.*zproj"       cat "$ti1_conf"
   _t_grep  "TI1: has bind J"                   "bind J.*zproj"       cat "$ti1_conf"
+  _t_grep  "TI1: has bind U"                   "bind U.*zproj"       cat "$ti1_conf"
   rm -rf "$ti1_home" || true
 
   _section "TI2 — tmux bindings: append to existing config"
@@ -5870,6 +6300,7 @@ NOTES
   _t_grep  "TI2: original content preserved"   "set -g mouse on"     cat "$ti2_conf"
   _t_grep  "TI2: has bind N"                   "bind N.*zproj"       cat "$ti2_conf"
   _t_grep  "TI2: has bind F"                   "bind F.*zproj"       cat "$ti2_conf"
+  _t_grep  "TI2: has bind U"                   "bind U.*zproj"       cat "$ti2_conf"
   rm -rf "$ti2_home" || true
 
   _section "TI3 — tmux bindings: idempotent when all present"
@@ -5898,6 +6329,7 @@ TI4EOF
   _t_grep  "TI4: bind X still present"          "bind X.*zproj"       cat "$ti4_conf"
   _t_grep  "TI4: bind F added"                  "bind F.*zproj"       cat "$ti4_conf"
   _t_grep  "TI4: bind J added"                  "bind J.*zproj"       cat "$ti4_conf"
+  _t_grep  "TI4: bind U added"                  "bind U.*zproj"       cat "$ti4_conf"
   # Marker should not be duplicated
   local ti4_marker_count
   ti4_marker_count="$(grep -c 'zproj integration' "$ti4_conf")" || ti4_marker_count=0
@@ -6241,6 +6673,10 @@ main() {
   fork)
     shift
     cmd_fork "$@"
+    ;;
+  update)
+    shift
+    cmd_update "$@"
     ;;
   join)
     shift
