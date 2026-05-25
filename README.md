@@ -29,9 +29,10 @@ your coding agent to wire up your editor with the review workflow.
 | bash | 3.2+ | Runtime (bash 4+ preferred) |
 | git | 2.5+ | Worktree support |
 | tmux | 3.0+ | Named pane support |
+| [Lima](https://github.com/lima-vm/lima) | (any recent) | Optional: `limactl` on `PATH` for `--sandbox` (guest coding agent in a Linux VM) |
 
 One of the following coding agents is auto-discovered (or set `$CODING_AGENT`):
-`opencode`, `claude`, `codex`, `amp`, `aider`, `goose`, `gemini`, `agent` (Cursor)
+`opencode`, `claude`, `codex`, `amp`, `aider`, `goose`, `gemini`, `pi`, `hermes`, `agent` (Cursor)
 
 > **Cursor CLI Agent:** In repositories containing `.cursor/`, `.cursorrules`,
 > or `.cursorignore`, the Cursor CLI agent (`agent`) is automatically preferred
@@ -156,6 +157,25 @@ zproj --diagnostics  # check the full environment for problems
 | `CODING_AGENT` | Override coding agent (e.g. `export CODING_AGENT=claude`) |
 | `ZPROJ_EDITOR` | Override editor (e.g. `export ZPROJ_EDITOR=nvim`) |
 
+## Lima sandbox (optional)
+
+With [Lima](https://lima-vm.github.io/) installed (`limactl` on your `PATH`), you can run the **coding agent** in a persistent Linux VM while the **editor** stays on the host. The project directory is mounted at `/mnt/zproj` in the guest (see `$ZPROJ_LIMA_MOUNT`).
+
+**Canonical argv (v1):** put global sandbox flags **before** the subcommand.
+`--sandbox` and `--plan` may appear in either order:
+
+```bash
+zproj --sandbox --plan launch main    # dry-run: show instance name and mounts; no VM/tmux
+zproj --plan --sandbox launch main    # equivalent — order does not matter
+zproj --sandbox launch main           # create/start VM if needed, open tmux layout with guest agent pane
+```
+
+`zproj integrate` already has `--plan` for a **host-side** editor-integration dry run; that is unchanged. Combining **`--sandbox`** with **`integrate`** is not supported in v1 — use `zproj integrate --plan` on the host.
+
+Handoff prompts (review dispatch, merge-conflict context) are written under `<project-root>/.zproj/` **only** when `--sandbox` is active, so the Lima guest can read them via the bind mount. Without `--sandbox`, prompts go to `$TMPDIR` as before and never appear in `git status`.
+
+Unset `ZPROJ_DISABLE_LIMA` if you set it for diagnostics and expect `limactl` to be discovered.
+
 ## Fork, update, and join
 
 Fork creates a new worktree at the same commit as the source. Update pulls
@@ -219,7 +239,9 @@ The notes file is deleted after the temp file is safely written.
 
 ## Machine integration
 
-`zproj integrate` bootstraps a new machine in one step:
+`zproj integrate` bootstraps a new machine in one step. **Re-running it is safe:**
+worktree keybindings and desktop-notification hooks are rewritten from a clean
+slate (no duplicate `bind` lines or stacked `set-hook` entries in `tmux.conf`).
 
 1. **Installs tmux keybindings** for worktree management (create, delete,
    fork, join, update) into your tmux config
@@ -239,11 +261,21 @@ any coding agent finishes working in a tmux pane, you get a desktop
 notification with worktree context.
 
 **Agent layer**: configures each installed agent to emit BEL on idle (claude,
-aider, codex, gemini). Agents without a notification API (amp, goose, agent)
-use a `monitor-silence` fallback.
+aider, codex, gemini). Agents without a notification API (amp, goose, hermes,
+agent) use a `monitor-silence` fallback.
 
 **tmux layer**: installs `alert-bell` and `alert-silence` hooks that call
-`zproj notify` with session and window context.
+`zproj notify`. Installs use **`set-hook -g`** (replace one handler) so each
+`tmux source-file …` does **not** multiply copies. **`zproj integrate`** also
+rewrites any older **`-ga`** notifier lines in your tmux conf to **`-g`** so
+reloads stop stacking handlers. If your **server** already has a long stacked
+chain from previous reloads, reset once, then reload:
+
+```bash
+tmux set-hook -ug alert-bell
+tmux set-hook -ug alert-silence
+tmux source-file ~/.config/tmux/tmux.conf   # or ~/.tmux.conf
+```
 
 **Terminal layer**: add these to `~/.config/ghostty/config` for rich desktop
 notifications (not auto-configured):
@@ -256,6 +288,9 @@ bell-audio-path = /System/Library/Sounds/Glass.aiff
 
 tmux 3.3+ delivers full OSC 777 desktop notifications. tmux 3.0–3.2 delivers
 bell forwarding only (dock bounce + audio still work via `bell-features`).
+If a session or window name contains a semicolon, `zproj notify` rewrites it before
+emitting OSC 777 so the terminal does not mis-parse the sequence (which would
+otherwise show as junk in apps like Neovim until you redraw).
 
 Set `$ZPROJ_NOTIFY_COOLDOWN` to override the 5-second per-pane debounce.
 
@@ -273,6 +308,8 @@ zproj fork [<source>] <new-worktree>        Fork worktree at same commit
 zproj update [<target>] [<source>]          Merge forked source branch into target
 zproj join [<source>] <target>              Merge source into target, delete source
 zproj launch <worktree-dir>                 Start or switch to tmux window
+zproj --sandbox [--plan] launch <worktree-dir>
+                                            Guest coding agent via Lima (project at /mnt/zproj)
 zproj list [dir]                            Show worktrees with status
 zproj review <subcommand>                   Manage review notes (path/view/dispatch/clear)
 zproj integrate [--plan]                    tmux bindings + editor integration
@@ -290,9 +327,14 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-415 tests covering init, clone, upgrade, worktree management, fork/update/join,
-review workflow, tmux binding installation, diagnostics, integrate, and tool
-detection. Requires tmux, git, and bash in PATH.
+438 tests pass by default; the one slow Lima VM test (`LM5`) is skipped unless
+you set `ZPROJ_TEST_LIMA_VM=1` and have `limactl` installed, in which case all
+439 run with none skipped. Coverage includes init, clone, upgrade, worktree
+management, fork/update/join, review workflow, tmux binding installation,
+diagnostics, integrate, notify, Lima sandbox flags, and tool detection.
+Requires tmux, git, and bash in `PATH`. The suite uses a dedicated tmux server
+socket (`ZPROJ_TEST_TMUX_SOCKET`) so it does not attach to or mutate your
+normal tmux sessions.
 
 ## License
 

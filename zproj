@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.17.0"
+readonly VERSION="4.18.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -12,11 +12,23 @@ readonly MIN_TMUX_VERSION="3.0"
 readonly REVIEW_NOTES_RELPATH=".agents/plans/review-notes.md"
 
 # Known coding agents in discovery order (single source of truth)
-readonly _KNOWN_AGENTS=(opencode claude codex amp aider goose gemini agent)
+readonly _KNOWN_AGENTS=(opencode claude codex amp aider goose gemini pi hermes agent)
+
+# Review / merge prompts default under the project tree (mounted at ZPROJ_LIMA_MOUNT in guest).
+readonly ZPROJ_HANDOFF_DIRNAME=".zproj"
+readonly ZPROJ_LIMA_MOUNT="/mnt/zproj"
 
 # Cursor repo markers — presence of any of these in a worktree signals that
 # cursor has been used, so `agent` (Cursor's CLI agent) is preferred.
 readonly _CURSOR_MARKERS=(.cursor .cursorrules .cursorignore)
+
+# Global flags set by argv pre-pass (--sandbox companions). Defaults off each run.
+ZPROJ_SANDBOX=0
+ZPROJ_SANDBOX_PLAN=0
+
+# Absolute path for nested re-execs after `cd` (cmd_test uses a temp dir; relative $0 breaks).
+_ZPROJ_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+readonly _ZPROJ_SELF
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
@@ -76,6 +88,17 @@ _hint_next_steps() {
   echo -e "  ${DIM}$SCRIPT_NAME my-feature${RESET}  ${DIM}# create new worktree + window${RESET}"
 }
 
+# Invoke tmux(1). When ZPROJ_TEST_TMUX_SOCKET is set (self-test only), uses -L
+# so zproj --test never touches the user's default tmux server — same socket
+# for sessions *and* windows (kill-window, new-window, select-*, attach, etc.).
+_tmux() {
+  if [[ -n "${ZPROJ_TEST_TMUX_SOCKET:-}" ]]; then
+    command tmux -L "$ZPROJ_TEST_TMUX_SOCKET" "$@"
+  else
+    command tmux "$@"
+  fi
+}
+
 # Switch to or attach a tmux session, respecting ZPROJ_TEST_NO_ATTACH.
 # Skipped when _ZPROJ_DEFER_ATTACH is set (used by cmd_open to batch-launch
 # all worktree windows before attaching once at the end).
@@ -87,9 +110,9 @@ _tmux_attach_or_switch() {
   fi
   if [[ -z "${ZPROJ_TEST_NO_ATTACH:-}" ]]; then
     if [[ -n "${TMUX:-}" ]]; then
-      tmux switch-client -t "$session"
+      _tmux switch-client -t "$session"
     else
-      tmux attach -t "$session"
+      _tmux attach -t "$session"
     fi
   fi
 }
@@ -246,7 +269,7 @@ check_session_deps() {
   fi
 
   local tmux_version
-  tmux_version="$(tmux -V | sed 's/tmux //' | sed 's/[^0-9.].*$//')"
+  tmux_version="$(_tmux -V | sed 's/tmux //' | sed 's/[^0-9.].*$//')"
   if ! _version_gte "$tmux_version" "$MIN_TMUX_VERSION"; then
     die "tmux >= $MIN_TMUX_VERSION required for named pane support (found $tmux_version).\n  Named panes are used to target the coding agent pane correctly."
   fi
@@ -347,8 +370,21 @@ _notify_tmux_version_gte() {
   local want="$1"
   command -v tmux &>/dev/null || return 1
   local ver
-  ver="$(tmux -V 2>/dev/null | awk '{print $2}')" || return 1
+  ver="$(_tmux -V 2>/dev/null | awk '{print $2}')" || return 1
   _version_gte "$ver" "$want"
+}
+
+# OSC 777 is parsed as 777;notify;<title>;<body> with unescaped ';' in title/body.
+# Session or window names containing ';' break Ghostty/tmux passthrough: the tail
+# is left unconsumed and full-screen apps (nvim) show it as garbage until redraw.
+_notify_osc_sanitize_segment() {
+  local s="${1:-}"
+  s="${s//;/:}"
+  s="${s//$'\a'/ }"
+  s="${s//$'\n'/ }"
+  s="${s//$'\r'/ }"
+  s="${s//$'\033'/ }"
+  printf '%s' "$s"
 }
 
 # Send an OSC 777 desktop notification to $3 (default: /dev/stdout).
@@ -356,7 +392,9 @@ _notify_tmux_version_gte() {
 # Inside tmux < 3.2: emits plain BEL (only signal that passes through).
 # Outside tmux: emits plain OSC 777 (Ghostty handles directly).
 _notify_osc777() {
-  local title="$1" body="$2" tty="${3:-/dev/stdout}"
+  local title body tty="${3:-/dev/stdout}"
+  title="$(_notify_osc_sanitize_segment "${1:-}")"
+  body="$(_notify_osc_sanitize_segment "${2:-}")"
   if [[ -n "${TMUX:-}" ]]; then
     if _notify_tmux_version_gte "3.2"; then
       printf '\033Ptmux;\033\033]777;notify;%s;%s\a\033\\' "$title" "$body" > "$tty" 2>/dev/null || true
@@ -470,6 +508,250 @@ _resolve_ai() {
   return 0
 }
 
+# ─── Sandbox / Lima (global --sandbox …) ───────────────────────────────────
+
+# Peel the leading global-flag block (everything before the first non-flag
+# token, which is the subcommand). Within that block, --sandbox and --plan may
+# appear in any order: if --sandbox is present, any --plan in the block is
+# treated as a sandbox dry-run; otherwise --plan is passed through to the
+# subcommand (e.g. integrate --plan). Subcommand-specific flags after the
+# subcommand are never inspected here.
+_zproj_argv_peel() {
+  ZPROJ_SANDBOX=0
+  ZPROJ_SANDBOX_PLAN=0
+  _ZPROJ_ARGV_TAIL=()
+
+  local -a leading=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --sandbox|--plan) leading+=("$1"); shift ;;
+    *) break ;;
+    esac
+  done
+
+  local flag has_sandbox=0
+  for flag in ${leading[@]+"${leading[@]}"}; do
+    [[ "$flag" == "--sandbox" ]] && has_sandbox=1
+  done
+
+  if [[ "$has_sandbox" == 1 ]]; then
+    ZPROJ_SANDBOX=1
+    for flag in ${leading[@]+"${leading[@]}"}; do
+      [[ "$flag" == "--plan" ]] && ZPROJ_SANDBOX_PLAN=1
+    done
+  else
+    # No --sandbox: pass --plan back to the subcommand (integrate --plan still works).
+    _ZPROJ_ARGV_TAIL+=(${leading[@]+"${leading[@]}"})
+  fi
+
+  _ZPROJ_ARGV_TAIL+=("$@")
+}
+
+_limactl_bin() {
+  if [[ -n "${ZPROJ_DISABLE_LIMA:-}" ]]; then
+    return 1
+  fi
+  command -v limactl 2>/dev/null || return 1
+}
+
+_sandbox_require_limactl() {
+  [[ "${ZPROJ_SANDBOX:-0}" != "1" ]] && return 0
+  if ! _limactl_bin &>/dev/null; then
+    die "${SCRIPT_NAME} --sandbox requires limactl on PATH (install Lima).\n\
+  Docs: ${CYAN}https://github.com/lima-vm/lima${RESET}\n\
+  ${DIM}Tests: put a fake ${CYAN}limactl${DIM} on PATH; ${CYAN}ZPROJ_DISABLE_LIMA${DIM} forces absence for non-sandbox tests.${RESET}"
+  fi
+}
+
+_bare_repo_root_from_cwd() {
+  local d
+  d="$(pwd)"
+  while [[ "$d" != "/" ]]; do
+    if [[ -d "$d/$BARE_DIR" ]]; then
+      echo "$d"
+      return 0
+    fi
+    d="$(dirname "$d")"
+  done
+  return 1
+}
+
+_lima_canonical_parent() {
+  (cd "${1:?}" && pwd)
+}
+
+_lima_slug() {
+  local base
+  base="$(basename "${1%/}")"
+  [[ -z "$base" ]] && base="proj"
+  base="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs '[:alnum:]' '-')"
+  base="${base#-}"
+  base="${base%-}"
+  [[ -z "$base" ]] && base="proj"
+  [[ ${#base} -gt 32 ]] && base="${base:0:32}"
+  echo "$base"
+}
+
+_lima_path_hash_short() {
+  local s="$1" h
+  if command -v shasum &>/dev/null; then
+    h="$(printf '%s' "$s" | shasum -a 256 2>/dev/null | awk '{print $1}')" || h=""
+    [[ -n "$h" ]] && { echo "${h:0:6}"; return; }
+  elif command -v sha256sum &>/dev/null; then
+    h="$(printf '%s' "$s" | sha256sum 2>/dev/null | awk '{print $1}')" || h=""
+    [[ -n "$h" ]] && { echo "${h:0:6}"; return; }
+  fi
+  printf '%s' "$s" | cksum 2>/dev/null | awk '{printf "%06x", ($1 % 4294967295)}'
+}
+
+_lima_instance_name() {
+  local parent="$1" canon slug h
+  canon="$(_lima_canonical_parent "$parent")"
+  slug="$(_lima_slug "$canon")"
+  h="$(_lima_path_hash_short "$canon")"
+  printf 'zp-%s-%s\n' "$slug" "$h"
+}
+
+_ensure_handoff_dir() {
+  mkdir -p "${1:?}/${ZPROJ_HANDOFF_DIRNAME}"
+}
+
+_handoff_guest_visible_path() {
+  local host_path="$1" parent="$2"
+  if [[ "${ZPROJ_SANDBOX:-0}" != "1" ]]; then
+    echo "$host_path"
+    return
+  fi
+  # Literal length-based strip — avoids glob expansion if parent contains
+  # special chars (* ? [). Normalise to no trailing slash before comparing.
+  parent="${parent%/}"
+  if [[ "${host_path:0:${#parent}}" != "$parent" ]]; then
+    echo "$host_path"
+    return
+  fi
+  printf '%s%s\n' "${ZPROJ_LIMA_MOUNT}" "${host_path:${#parent}}"
+}
+
+_lima_yaml_for_instance() {
+  local parent="$1" instance="$2"
+  printf '%s/%s/lima-%s.yaml\n' "$parent" "$ZPROJ_HANDOFF_DIRNAME" "$instance"
+}
+
+_lima_write_template_file() {
+  local parent_abs="$1" outfile="$2"
+  # Preserve user edits — only render when the file does not yet exist.
+  # The instance is keyed by canonical parent path, so a stale YAML can't
+  # silently point at the wrong mount.
+  [[ -f "$outfile" ]] && return 0
+  local escaped="$parent_abs"
+  escaped="${escaped//\\/\\\\}"
+  escaped="${escaped//\"/\\\"}"
+  cat >"${outfile}" <<EOFYAML
+minimumLimaVersion: 2.0.0
+base:
+  - template:default
+mounts:
+  - location: "${escaped}"
+    mountPoint: ${ZPROJ_LIMA_MOUNT}
+    writable: true
+EOFYAML
+}
+
+# Guest agent resolution — do not die when CODING_AGENT is guest-only on the host.
+_resolve_ai_sandbox() {
+  local dir="${1:-}"
+
+  if [[ -n "${CODING_AGENT:-}" ]]; then
+    echo "$CODING_AGENT"
+    return 0
+  fi
+
+  local preferred
+  if [[ -n "$dir" ]] && preferred="$(_repo_preferred_cursor "$dir")"; then
+    echo "$preferred"
+    return 0
+  fi
+
+  local agent
+  for agent in "${_KNOWN_AGENTS[@]}"; do
+    if command -v "$agent" &>/dev/null; then
+      echo "$agent"
+      return 0
+    fi
+  done
+
+  local d candidate
+  for agent in "${_KNOWN_AGENTS[@]}"; do
+    for d in "${_AGENT_FALLBACK_DIRS[@]}"; do
+      candidate="$d/$agent"
+      if [[ -x "$candidate" ]]; then
+        warn "Found '${agent}' at ${candidate} (not in PATH)."
+        warn "Add '${d}' to your PATH — the guest PATH may still find the binary."
+        echo "$candidate"
+        return 0
+      fi
+    done
+  done
+
+  warn "No coding agent on host PATH (${_KNOWN_AGENTS[*]}). Set \$CODING_AGENT or install an agent inside the Lima VM."
+  echo ""
+  return 0
+}
+
+_lima_instance_exists() {
+  local lc="$1" inst="$2"
+  "$lc" show "$inst" &>/dev/null
+}
+
+_sandbox_ensure_limactl_vm() {
+  local instance="$1" yaml="$2"
+  local lc
+  lc="$(_limactl_bin)" || die "internal error: limactl missing after gate"
+  if ! _lima_instance_exists "$lc" "$instance"; then
+    "$lc" create --name="$instance" --tty=false "$yaml" ||
+      die "limactl create failed for '${instance}' (template: ${yaml})"
+  fi
+  "$lc" start "$instance" || die "limactl start failed for '${instance}'"
+}
+
+_sandbox_print_plan_launch() {
+  local parent="$1" instance="$2" yaml="$3"
+  echo ""
+  echo -e "${BOLD}Sandbox plan (dry run)${RESET}"
+  echo -e "  ${BOLD}instance${RESET}   ${CYAN}${instance}${RESET}"
+  echo -e "  ${BOLD}template${RESET}   ${yaml}"
+  echo -e "  ${BOLD}mount${RESET}      ${CYAN}${parent}${RESET}  →  ${CYAN}${ZPROJ_LIMA_MOUNT}${RESET} ${DIM}(writable)${RESET}"
+  echo -e "  ${BOLD}bind mounts${RESET}  ${DIM}none configured in v1 — no regex scan${RESET}"
+  echo ""
+}
+
+_sandbox_build_ai_limactl_command() {
+  local instance="$1" guest_cd="$2" ai_full="$3"
+  local lc inner qc
+  lc="$(_limactl_bin)"
+  if [[ -n "$ai_full" ]]; then
+    inner="cd $(printf '%q' "$guest_cd") && exec ${ai_full}"
+  else
+    inner="cd $(printf '%q' "$guest_cd") && exec bash -l"
+  fi
+  qc="$(printf '%q' "$inner")"
+  printf '%q shell %q -- bash -lc %s' "$lc" "$instance" "$qc"
+}
+
+_integrate_maybe_append_handoff_gitignore() {
+  local root gif marker
+  root="$(_bare_repo_root_from_cwd 2>/dev/null)" || return 0
+  gif="$root/.gitignore"
+  marker="# BEGIN zproj handoffs"
+  [[ -f "$gif" ]] && grep -qF "$marker" "$gif" 2>/dev/null && return 0
+  {
+    echo ""
+    echo "$marker (${SCRIPT_NAME} — ${ZPROJ_HANDOFF_DIRNAME}/ prompts)"
+    echo "${ZPROJ_HANDOFF_DIRNAME}/"
+    echo "# END zproj handoffs"
+  } >>"$gif"
+}
+
 # Print current tool resolution to stdout (used by --env).
 cmd_env() {
   local editor ai
@@ -477,7 +759,7 @@ cmd_env() {
   ai="$(_resolve_ai 2>/dev/null)" || ai=""
 
   echo ""
-  echo -e "${BOLD}zproj tool resolution:${RESET}"
+  echo -e "${BOLD}${SCRIPT_NAME} tool resolution:${RESET}"
   echo ""
 
   local editor_src
@@ -503,6 +785,10 @@ cmd_env() {
     fi
   fi
   echo -e "  ${BOLD}Agent${RESET}   (pane 1): ${ai_display}  ${DIM}[${ai_src}]${RESET}"
+
+  if [[ "${ZPROJ_SANDBOX:-0}" == "1" ]]; then
+    echo -e "  ${BOLD}Sandbox${RESET}  ${CYAN}enabled${RESET}  ${DIM}(use ${SCRIPT_NAME} --sandbox --plan launch … to inspect Lima plan)${RESET}"
+  fi
 
   echo ""
   echo -e "  ${DIM}Override: export ZPROJ_EDITOR=nvim${RESET}"
@@ -1290,13 +1576,13 @@ cmd_delete() {
   fi
 
   # Safety: check for tmux window
-  if tmux has-session -t "$SESSION_NAME" 2>/dev/null &&
-    tmux list-windows -t "$SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -qx "$WINDOW_NAME"; then
+  if _tmux has-session -t "$SESSION_NAME" 2>/dev/null &&
+    _tmux list-windows -t "$SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -qx "$WINDOW_NAME"; then
     if [[ "$force" != true ]]; then
       die "tmux window '${WINDOW_NAME}' in session '${SESSION_NAME}' is still open.\n  Close it first, or use ${CYAN}--force${RESET} to remove everything."
     fi
     echo -e "  Killing tmux window ${BOLD}${SESSION_NAME}:${WINDOW_NAME}${RESET}..."
-    tmux kill-window -t "$SESSION_NAME:$WINDOW_NAME" 2>/dev/null || true
+    _tmux kill-window -t "$SESSION_NAME:$WINDOW_NAME" 2>/dev/null || true
   fi
 
   # Safety: check for uncommitted changes
@@ -1794,11 +2080,11 @@ cmd_join() {
   fi
 
   # Switch to target window
-  if tmux has-session -t "$session_name" 2>/dev/null; then
+  if _tmux has-session -t "$session_name" 2>/dev/null; then
     local target_window="$target_name"
-    if tmux list-windows -t "$session_name" -F '#{window_name}' 2>/dev/null \
+    if _tmux list-windows -t "$session_name" -F '#{window_name}' 2>/dev/null \
         | grep -qx "$target_window"; then
-      tmux select-window -t "$session_name:$target_window" 2>/dev/null || true
+      _tmux select-window -t "$session_name:$target_window" 2>/dev/null || true
     fi
   fi
 
@@ -1891,10 +2177,18 @@ is trying to accomplish when resolving conflicts.
 
 ${diff_content}"
 
-  # Save to temp file
-  local tmp_prompt
-  tmp_prompt="$(mktemp "${TMPDIR:-/tmp}/zproj-${cmd_label}-XXXXXX")"
+  # Save handoff prompt. In sandbox mode the file must live inside the project
+  # tree so the Lima guest can read it via the bind mount; otherwise prefer
+  # $TMPDIR so prompt files don't accumulate in the user's repo / git status.
+  local tmp_prompt paste_path
+  if [[ "${ZPROJ_SANDBOX:-0}" == "1" ]]; then
+    _ensure_handoff_dir "$parent_dir"
+    tmp_prompt="$(mktemp "${parent_dir}/${ZPROJ_HANDOFF_DIRNAME}/zproj-${cmd_label}-XXXXXX")"
+  else
+    tmp_prompt="$(mktemp "${TMPDIR:-/tmp}/zproj-${cmd_label}-XXXXXX")"
+  fi
   printf "%s" "$prompt" > "$tmp_prompt"
+  paste_path="$(_handoff_guest_visible_path "$tmp_prompt" "$parent_dir")"
 
   # Try to send to target's agent pane
   local ai_name
@@ -1904,17 +2198,17 @@ ${diff_content}"
 
   local target_window="$target_name"
 
-  if ! tmux has-session -t "$session_name" 2>/dev/null; then
+  if ! _tmux has-session -t "$session_name" 2>/dev/null; then
     warn "tmux session '$session_name' not found."
-    echo -e "  ${DIM}Prompt saved to: ${CYAN}${tmp_prompt}${RESET}"
+    echo -e "  ${DIM}Prompt saved to: ${CYAN}${paste_path}${RESET}"
     echo -e "  ${DIM}Paste it manually into your coding agent.${RESET}"
     return 0
   fi
 
-  if ! tmux list-windows -t "$session_name" -F '#{window_name}' 2>/dev/null \
+  if ! _tmux list-windows -t "$session_name" -F '#{window_name}' 2>/dev/null \
       | grep -qx "$target_window"; then
     warn "tmux window '$target_window' not found in session '$session_name'."
-    echo -e "  ${DIM}Prompt saved to: ${CYAN}${tmp_prompt}${RESET}"
+    echo -e "  ${DIM}Prompt saved to: ${CYAN}${paste_path}${RESET}"
     echo -e "  ${DIM}Paste it manually into your coding agent.${RESET}"
     return 0
   fi
@@ -1926,20 +2220,20 @@ ${diff_content}"
     fi
   fi
 
-  local handoff_msg="I need you to merge branch ${source_branch} into this worktree. Full instructions and context are in: ${tmp_prompt}"
-  if ! tmux send-keys -t "$pane_target" "$handoff_msg" Enter 2>/dev/null; then
+  local handoff_msg="I need you to merge branch ${source_branch} into this worktree. Full instructions and context are in: ${paste_path}"
+  if ! _tmux send-keys -t "$pane_target" "$handoff_msg" Enter 2>/dev/null; then
     warn "Failed to send prompt to agent pane."
-    echo -e "  ${DIM}Prompt saved to: ${CYAN}${tmp_prompt}${RESET}"
+    echo -e "  ${DIM}Prompt saved to: ${CYAN}${paste_path}${RESET}"
     echo -e "  ${DIM}Paste it manually into your coding agent.${RESET}"
     return 0
   fi
 
-  tmux select-window -t "$session_name:$target_window" 2>/dev/null || true
-  tmux select-pane -t "$pane_target" 2>/dev/null || true
+  _tmux select-window -t "$session_name:$target_window" 2>/dev/null || true
+  _tmux select-pane -t "$pane_target" 2>/dev/null || true
 
   warn "Merge conflicts detected — automatic merge aborted."
   echo -e "  ${DIM}Sent changes to ${BOLD}${ai_name}${RESET}${DIM} in ${BOLD}${target_name}${RESET}"
-  echo -e "  ${DIM}Prompt saved to: ${tmp_prompt}${RESET}"
+  echo -e "  ${DIM}Prompt saved to: ${paste_path}${RESET}"
   if [[ "$action" == "join" ]]; then
     echo -e "  ${DIM}After resolving, run: ${CYAN}cd .. && $SCRIPT_NAME join $source_name $target_name${RESET}"
   fi
@@ -1967,6 +2261,7 @@ cmd_launch() {
 
   resolve_project_dir "$dir"
   check_session_deps
+  _sandbox_require_limactl
 
   [[ ! -d "$PROJECT_DIR" ]] && die "Worktree '$WORKTREE_NAME' does not exist.\n  Create it with: ${CYAN}$SCRIPT_NAME create $dir${RESET}"
 
@@ -1976,10 +2271,32 @@ cmd_launch() {
 
   _warn_branch_mismatch "$PROJECT_DIR"
 
-  # Resolve editor and AI agent
+  # Resolve editor and AI agent (host vs Lima guest).
   local editor ai
+  local instance="" yaml=""
+  local guest_dir=""
+
   editor="$(_resolve_editor)"
-  ai="$(_resolve_ai "$PROJECT_DIR")"
+
+  if [[ "${ZPROJ_SANDBOX:-0}" == "1" ]]; then
+    instance="$(_lima_instance_name "$PARENT_DIR")"
+    yaml="$(_lima_yaml_for_instance "$PARENT_DIR" "$instance")"
+    guest_dir="${ZPROJ_LIMA_MOUNT}/${WORKTREE_NAME}"
+
+    # --plan: dry-run only — no YAML write, no VM, no tmux mutation.
+    if [[ "${ZPROJ_SANDBOX_PLAN:-0}" == "1" ]]; then
+      _sandbox_print_plan_launch "$(_lima_canonical_parent "$PARENT_DIR")" "$instance" "$yaml"
+      return 0
+    fi
+
+    _ensure_handoff_dir "$PARENT_DIR"
+    _lima_write_template_file "$(_lima_canonical_parent "$PARENT_DIR")" "$yaml"
+    _sandbox_ensure_limactl_vm "$instance" "$yaml"
+
+    ai="$(_resolve_ai_sandbox "$PROJECT_DIR")"
+  else
+    ai="$(_resolve_ai "$PROJECT_DIR")"
+  fi
 
   # Derive pane names from the binary names
   local ai_pane_name editor_pane_name
@@ -1991,58 +2308,59 @@ cmd_launch() {
   local ai_cmd editor_cmd
   local quoted_dir
   printf -v quoted_dir '%q' "$PROJECT_DIR"
-  if [[ -n "$ai" ]]; then
+  if [[ "${ZPROJ_SANDBOX:-0}" == "1" ]]; then
+    ai_cmd="$(_sandbox_build_ai_limactl_command "$instance" "$guest_dir" "${ai}")"
+  elif [[ -n "$ai" ]]; then
     ai_cmd="cd $quoted_dir && $ai"
   else
     ai_cmd="cd $quoted_dir"   # no agent: just a shell in the left pane
   fi
   editor_cmd="cd $quoted_dir && $editor ."
-
   # Helper: create the 3-pane layout in the current window.
   # Captures pane IDs at creation time (not indices) so this works
   # regardless of the user's pane-base-index tmux setting.
   _setup_panes() {
     local _p1 _p2 _p3
     # Pane 1: the initial pane already exists after new-session/new-window
-    _p1="$(tmux list-panes -t "$SESSION_NAME:$WINDOW_NAME" -F '#{pane_id}' | head -1)"
-    tmux send-keys   -t "$_p1" "$ai_cmd" Enter
-    tmux select-pane -t "$_p1" -T "$ai_pane_name"
+    _p1="$(_tmux list-panes -t "$SESSION_NAME:$WINDOW_NAME" -F '#{pane_id}' | head -1)"
+    _tmux send-keys   -t "$_p1" "$ai_cmd" Enter
+    _tmux select-pane -t "$_p1" -T "$ai_pane_name"
 
     # Pane 2: horizontal split
-    _p2="$(tmux split-window -t "$SESSION_NAME:$WINDOW_NAME" -h \
+    _p2="$(_tmux split-window -t "$SESSION_NAME:$WINDOW_NAME" -h \
              -c "$PROJECT_DIR" -P -F '#{pane_id}')"
-    tmux send-keys   -t "$_p2" "$editor_cmd" Enter
-    tmux select-pane -t "$_p2" -T "$editor_pane_name"
+    _tmux send-keys   -t "$_p2" "$editor_cmd" Enter
+    _tmux select-pane -t "$_p2" -T "$editor_pane_name"
 
     # Pane 3: vertical split of pane 2
-    _p3="$(tmux split-window -t "$_p2" -v -c "$PROJECT_DIR" -P -F '#{pane_id}')"
-    tmux select-pane -t "$_p3" -T "shell"
+    _p3="$(_tmux split-window -t "$_p2" -v -c "$PROJECT_DIR" -P -F '#{pane_id}')"
+    _tmux select-pane -t "$_p3" -T "shell"
 
     # Focus the agent pane
-    tmux select-pane -t "$_p1"
+    _tmux select-pane -t "$_p1"
   }
 
   # Session exists?
-  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
 
     # Window already exists in this session?
-    if tmux list-windows -t "$SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -qx "$WINDOW_NAME"; then
+    if _tmux list-windows -t "$SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -qx "$WINDOW_NAME"; then
       info "Switching to ${BOLD}${SESSION_NAME}:${WINDOW_NAME}${RESET}"
     else
-      tmux new-window -t "$SESSION_NAME:" -n "$WINDOW_NAME" -c "$PROJECT_DIR"
+      _tmux new-window -t "$SESSION_NAME:" -n "$WINDOW_NAME" -c "$PROJECT_DIR"
       _setup_panes
       info "Created window ${BOLD}${SESSION_NAME}:${WINDOW_NAME}${RESET}"
     fi
 
   else
     # Create new session with this worktree as first window
-    tmux new-session -d -s "$SESSION_NAME" -n "$WINDOW_NAME" -c "$PROJECT_DIR" -x 220 -y 50
+    _tmux new-session -d -s "$SESSION_NAME" -n "$WINDOW_NAME" -c "$PROJECT_DIR" -x 220 -y 50
     _setup_panes
     info "Started session ${BOLD}${SESSION_NAME}${RESET} with window ${BOLD}${WINDOW_NAME}${RESET}"
   fi
 
   # Switch/attach to the session and select the window
-  tmux select-window -t "$SESSION_NAME:$WINDOW_NAME"
+  _tmux select-window -t "$SESSION_NAME:$WINDOW_NAME"
   _tmux_attach_or_switch "$SESSION_NAME"
 }
 
@@ -2092,10 +2410,10 @@ cmd_list() {
 
   # Get list of tmux windows for this session (if session exists)
   local -a tmux_windows=()
-  if tmux has-session -t "$root_name" 2>/dev/null; then
+  if _tmux has-session -t "$root_name" 2>/dev/null; then
     while IFS= read -r win; do
       tmux_windows+=("$win")
-    done < <(tmux list-windows -t "$root_name" -F '#{window_name}:#{window_active}' 2>/dev/null)
+    done < <(_tmux list-windows -t "$root_name" -F '#{window_name}:#{window_active}' 2>/dev/null)
   fi
 
   echo ""
@@ -2225,7 +2543,7 @@ cmd_open() {
   session_name="$(_tmux_session_name "$(basename "$root")")"
 
   # Session already exists — just attach/switch
-  if tmux has-session -t "$session_name" 2>/dev/null; then
+  if _tmux has-session -t "$session_name" 2>/dev/null; then
     info "Attaching to session ${BOLD}${session_name}${RESET}"
     _tmux_attach_or_switch "$session_name"
     return
@@ -2382,6 +2700,8 @@ ${BOLD}Usage:${RESET}
   $SCRIPT_NAME update [<target>] [<source>]        Merge forked source branch into target
   $SCRIPT_NAME join [<source>] <target>            Merge source into target, delete source
   $SCRIPT_NAME launch <worktree-dir>               Start or switch to tmux window
+  $SCRIPT_NAME --sandbox [--plan] launch <dir>     Guest coding agent via Lima (${ZPROJ_LIMA_MOUNT} mount)
+
   $SCRIPT_NAME list [dir]                          Show worktrees with status
   $SCRIPT_NAME review <subcommand>                 Manage review notes (path/view/dispatch/clear)
   $SCRIPT_NAME integrate [--plan]                  Generate editor integration prompt for coding agent
@@ -2594,7 +2914,7 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME launch <worktree-dir>
     Run ${CYAN}$SCRIPT_NAME --env${RESET} to see which editor and agent will be used.
 
   ${BOLD}Auto-discovered agents (in order):${RESET}
-    opencode, claude, codex, amp, aider, goose, gemini, agent (Cursor)
+    opencode, claude, codex, amp, aider, goose, gemini, pi, hermes, agent (Cursor)
 
   ${BOLD}Repo-preferred agent:${RESET}
     If the worktree contains .cursor/, .cursorrules, or .cursorignore,
@@ -2604,6 +2924,13 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME launch <worktree-dir>
     CODING_AGENT   Override the coding agent (e.g. ${CYAN}export CODING_AGENT=claude${RESET})
     ZPROJ_EDITOR   Override the editor      (e.g. ${CYAN}export ZPROJ_EDITOR=nvim${RESET})
     EDITOR         Standard editor fallback (after ZPROJ_EDITOR)
+
+  ${BOLD}Sandbox (--sandbox):${RESET}
+    Coding agent pane can run inside a Lima Linux VM; project root is mounted at
+    ${CYAN}${ZPROJ_LIMA_MOUNT}${RESET}. Canonical CLI:
+      ${CYAN}${SCRIPT_NAME} --sandbox [--plan] launch <worktree-dir>${RESET}
+    Requires ${CYAN}limactl${RESET}; ${CYAN}--plan${RESET} prints instance + mounts without touching the VM/tmux.
+    Global ${CYAN}--sandbox${RESET}/${CYAN}--plan${RESET} may appear in either order before the subcommand.
 
   ${BOLD}Note:${RESET} GUI editors (code, zed, cursor, etc.) will trigger a warning —
     they may not behave well inside a tmux pane.
@@ -2680,7 +3007,7 @@ _resolve_pane_target() {
   local session_window="$1"   # e.g. "myproj:main"
   local pane_title="$2"       # e.g. "opencode"
   local pane_id
-  pane_id="$(tmux list-panes -t "$session_window" \
+  pane_id="$(_tmux list-panes -t "$session_window" \
     -F '#{pane_title} #{pane_id}' 2>/dev/null \
     | awk -v t="$pane_title" '$1 == t { print $2; exit }')"
   if [[ -n "$pane_id" ]]; then
@@ -2689,7 +3016,7 @@ _resolve_pane_target() {
   else
     # Fallback: first pane by ID — avoids pane-base-index dependency.
     # Return 1 to signal to callers that the named lookup failed.
-    tmux list-panes -t "$session_window" -F '#{pane_id}' 2>/dev/null | head -1
+    _tmux list-panes -t "$session_window" -F '#{pane_id}' 2>/dev/null | head -1
     return 1
   fi
 }
@@ -2828,7 +3155,13 @@ cmd_review() {
   dispatch)
     [[ $# -gt 0 ]] && die "Too many arguments.\n  Usage: $SCRIPT_NAME review dispatch"
     local path
-    path="$(_review_find_path abs)"
+
+    # Must discover worktree globals in THIS shell — _review_find_path uses a
+    # $(...) subshell internally and would discard _REVIEW_REPO_ROOT / _REVIEW_WT_ROOT.
+    if ! _review_locate; then
+      die "Not inside a registered zproj worktree. Run from within a worktree directory."
+    fi
+    path="$_REVIEW_WT_ROOT/$REVIEW_NOTES_RELPATH"
 
     if [[ ! -f "$path" ]]; then
       die "No review notes to dispatch. ($path not found)"
@@ -2842,11 +3175,18 @@ cmd_review() {
     notes_content="$(cat "$path")"
     printf -v prompt "%b%s" "$_REVIEW_DISPATCH_PREAMBLE" "$notes_content"
 
-    # Save to temp file for safe-keeping (in case paste fails).
-    # No extension after XXXXXX — macOS mktemp requires Xs at the very end.
-    local tmp_prompt
-    tmp_prompt="$(mktemp "${TMPDIR:-/tmp}/zproj-review-XXXXXX")"
+    # Save the prompt for safety. In --sandbox mode the file must live inside
+    # the project tree so the Lima guest can read it via the bind mount;
+    # otherwise keep it in $TMPDIR so prompts don't pollute the user's repo.
+    local tmp_prompt paste_path
+    if [[ "${ZPROJ_SANDBOX:-0}" == "1" ]]; then
+      _ensure_handoff_dir "$_REVIEW_REPO_ROOT"
+      tmp_prompt="$(mktemp "${_REVIEW_REPO_ROOT}/${ZPROJ_HANDOFF_DIRNAME}/zproj-review-XXXXXX")"
+    else
+      tmp_prompt="$(mktemp "${TMPDIR:-/tmp}/zproj-review-XXXXXX")"
+    fi
     printf "%s" "$prompt" > "$tmp_prompt"
+    paste_path="$(_handoff_guest_visible_path "$tmp_prompt" "$_REVIEW_REPO_ROOT")"
 
     # Find the agent pane — addressed by name, not number
     _review_find_session || die "Not inside a zproj worktree. Run from within a worktree to dispatch."
@@ -2861,17 +3201,17 @@ cmd_review() {
     rm -f "$path"
 
     # Verify tmux session + window exist
-    if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if ! _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
       warn "tmux session '${SESSION_NAME}' not found."
-      echo -e "  ${DIM}Prompt saved to: ${CYAN}${tmp_prompt}${RESET}"
+      echo -e "  ${DIM}Prompt saved to: ${CYAN}${paste_path}${RESET}"
       echo -e "  ${DIM}Paste it manually into your coding agent.${RESET}"
       exit 0
     fi
 
-    if ! tmux list-windows -t "$SESSION_NAME" -F '#{window_name}' 2>/dev/null \
+    if ! _tmux list-windows -t "$SESSION_NAME" -F '#{window_name}' 2>/dev/null \
         | grep -qx "$WINDOW_NAME"; then
       warn "tmux window '${WINDOW_NAME}' not found in session '${SESSION_NAME}'."
-      echo -e "  ${DIM}Prompt saved to: ${CYAN}${tmp_prompt}${RESET}"
+      echo -e "  ${DIM}Prompt saved to: ${CYAN}${paste_path}${RESET}"
       echo -e "  ${DIM}Paste it manually into your coding agent.${RESET}"
       exit 0
     fi
@@ -2888,20 +3228,20 @@ cmd_review() {
 
     # Send a single-line handoff message pointing to the temp file.
     # The agent is already running — no delay needed, no multiline paste issues.
-    local handoff_msg="I have review notes for you to implement. Please read the file and implement every item exactly as described: ${tmp_prompt}"
-    if ! tmux send-keys -t "$pane_target" "$handoff_msg" Enter 2>/dev/null; then
+    local handoff_msg="I have review notes for you to implement. Please read the file and implement every item exactly as described: ${paste_path}"
+    if ! _tmux send-keys -t "$pane_target" "$handoff_msg" Enter 2>/dev/null; then
       warn "Failed to send prompt to agent pane."
-      echo -e "  ${DIM}Prompt saved to: ${CYAN}${tmp_prompt}${RESET}"
+      echo -e "  ${DIM}Prompt saved to: ${CYAN}${paste_path}${RESET}"
       echo -e "  ${DIM}Paste it manually into your coding agent.${RESET}"
       exit 0
     fi
 
     # Focus the agent pane so the user sees it working
-    tmux select-window -t "$SESSION_NAME:$WINDOW_NAME"
-    tmux select-pane -t "$pane_target" 2>/dev/null || true
+    _tmux select-window -t "$SESSION_NAME:$WINDOW_NAME"
+    _tmux select-pane -t "$pane_target" 2>/dev/null || true
 
     info "Dispatched ${BOLD}${count}${RESET} note$(_plural "$count") to ${BOLD}${ai_name}${RESET}"
-    echo -e "  ${DIM}Prompt saved to: ${tmp_prompt}${RESET}"
+    echo -e "  ${DIM}Prompt saved to: ${paste_path}${RESET}"
     echo -e "  ${DIM}Review notes deleted.${RESET}"
     ;;
 
@@ -2942,7 +3282,7 @@ cmd_diagnostics() {
   _section_header() { echo ""; echo -e "${BOLD}$*${RESET}"; }
 
   echo ""
-  echo -e "${BOLD}zproj ${VERSION} — diagnostics${RESET}"
+  echo -e "${BOLD}${SCRIPT_NAME} ${VERSION} — diagnostics${RESET}"
 
   # ── Section: Required tools ─────────────────────────────────────────────
   _section_header "Required tools"
@@ -2990,11 +3330,11 @@ cmd_diagnostics() {
     _diag_info "tmux" "  install: https://github.com/tmux/tmux/wiki/Installing"
   else
     local tmux_ver
-    tmux_ver="$(tmux -V | sed 's/tmux //' | sed 's/[^0-9.].*$//')"
+    tmux_ver="$(_tmux -V | sed 's/tmux //' | sed 's/[^0-9.].*$//')"
     if ! _version_gte "$tmux_ver" "$MIN_TMUX_VERSION"; then
       _diag_err "tmux $tmux_ver" "< ${MIN_TMUX_VERSION} — named pane support requires ${MIN_TMUX_VERSION}+"
     else
-      _diag_ok "tmux $(tmux -V | sed 's/tmux //')" "$(command -v tmux)"
+      _diag_ok "tmux $(_tmux -V | sed 's/tmux //')" "$(command -v tmux)"
     fi
   fi
 
@@ -3037,7 +3377,11 @@ cmd_diagnostics() {
   if [[ -n "${CODING_AGENT:-}" ]]; then
     local ca_bin="${CODING_AGENT%% *}"
     if ! command -v "$ca_bin" &>/dev/null; then
-      _diag_err "\$CODING_AGENT=$CODING_AGENT" "binary '$ca_bin' not found in PATH"
+      if [[ "${ZPROJ_SANDBOX:-0}" == "1" ]]; then
+        _diag_warn "\$CODING_AGENT=$CODING_AGENT" "missing on host — expected if the binary exists only inside the Lima guest"
+      else
+        _diag_err "\$CODING_AGENT=$CODING_AGENT" "binary '$ca_bin' not found in PATH"
+      fi
     else
       _diag_ok "$CODING_AGENT" "$(command -v "$ca_bin")  [\$CODING_AGENT]"
     fi
@@ -3066,15 +3410,26 @@ cmd_diagnostics() {
     fi
   fi
 
+  if [[ "${ZPROJ_SANDBOX:-0}" == "1" ]]; then
+    _section_header "Sandbox (--sandbox)"
+    local _lc=""
+    _lc="$(_limactl_bin)" || true
+    if [[ -n "${_lc:-}" ]]; then
+      _diag_ok "limactl" "$_lc"
+    else
+      _diag_err "limactl missing" "--sandbox requires limactl on PATH (unset ZPROJ_DISABLE_LIMA if testing discovery)"
+    fi
+  fi
+
   # ── Section: tmux environment ────────────────────────────────────────────
   _section_header "tmux environment"
 
   if ! command -v tmux &>/dev/null; then
     _diag_info "tmux environment" "skipped (tmux not installed)"
   else
-    if tmux list-sessions &>/dev/null; then
+    if _tmux list-sessions &>/dev/null; then
       local session_count
-      session_count="$(tmux list-sessions 2>/dev/null | wc -l | tr -d ' ')"
+      session_count="$(_tmux list-sessions 2>/dev/null | wc -l | tr -d ' ')"
       _diag_ok "tmux server running" "${session_count} session(s) active"
     else
       _diag_info "tmux server not running" "no sessions yet (normal if you haven't started one)"
@@ -3082,7 +3437,7 @@ cmd_diagnostics() {
 
     if [[ -n "${TMUX:-}" ]]; then
       local cur_session
-      cur_session="$(tmux display-message -p '#S' 2>/dev/null || echo unknown)"
+      cur_session="$(_tmux display-message -p '#S' 2>/dev/null || echo unknown)"
       _diag_info "inside tmux" "current session: $cur_session"
     else
       _diag_info "not inside tmux" "'zproj launch' will run 'tmux attach' (opens new terminal tab/window)"
@@ -3090,7 +3445,7 @@ cmd_diagnostics() {
 
     # Check remain-on-exit — should be off so dead panes don't block sessions
     local remain
-    remain="$(tmux show-options -g remain-on-exit 2>/dev/null | awk '{print $2}')" || remain=""
+    remain="$(_tmux show-options -g remain-on-exit 2>/dev/null | awk '{print $2}')" || remain=""
     if [[ "$remain" == "on" ]]; then
       _diag_warn "remain-on-exit on" "dead panes will linger; consider 'tmux set -g remain-on-exit off'"
     fi
@@ -3102,9 +3457,9 @@ cmd_diagnostics() {
   local _np_tmux_ver=""
   local _np_server_running=false
   if command -v tmux &>/dev/null; then
-    _np_tmux_ver="$(tmux -V 2>/dev/null | awk '{print $2}')" || _np_tmux_ver=""
+    _np_tmux_ver="$(_tmux -V 2>/dev/null | awk '{print $2}')" || _np_tmux_ver=""
   fi
-  if tmux list-sessions &>/dev/null; then
+  if _tmux list-sessions &>/dev/null; then
     _np_server_running=true
   fi
 
@@ -3118,32 +3473,32 @@ cmd_diagnostics() {
     local _np_conf
     _np_conf="$(_tmux_config_path)"
     local _np_conf_has_bell=false _np_server_has_bell=false
-    grep -qE "alert-bell.*zproj notify" "$_np_conf" 2>/dev/null && _np_conf_has_bell=true
-    tmux show-hooks -g 2>/dev/null | grep -qE "alert-bell.*zproj notify" && _np_server_has_bell=true
+    grep -qE "alert-bell.*${SCRIPT_NAME} notify" "$_np_conf" 2>/dev/null && _np_conf_has_bell=true
+    _tmux show-hooks -g 2>/dev/null | grep -qE "alert-bell.*${SCRIPT_NAME} notify" && _np_server_has_bell=true
     if $_np_server_has_bell; then
       _diag_ok "alert-bell hook" "loaded in server"
     elif $_np_conf_has_bell; then
       _diag_warn "alert-bell hook" "in config but not loaded — run: tmux source-file ${_np_conf}"
     else
-      _diag_info "alert-bell hook" "not configured — run 'zproj integrate' to set up"
+      _diag_info "alert-bell hook" "not configured — run '${SCRIPT_NAME} integrate' to set up"
     fi
 
     # Check alert-silence hook
     local _np_conf_has_silence=false _np_server_has_silence=false
-    grep -qE "alert-silence.*zproj notify" "$_np_conf" 2>/dev/null && _np_conf_has_silence=true
-    tmux show-hooks -g 2>/dev/null | grep -qE "alert-silence.*zproj notify" && _np_server_has_silence=true
+    grep -qE "alert-silence.*${SCRIPT_NAME} notify" "$_np_conf" 2>/dev/null && _np_conf_has_silence=true
+    _tmux show-hooks -g 2>/dev/null | grep -qE "alert-silence.*${SCRIPT_NAME} notify" && _np_server_has_silence=true
     if $_np_server_has_silence; then
       _diag_ok "alert-silence hook" "loaded in server"
     elif $_np_conf_has_silence; then
       _diag_warn "alert-silence hook" "in config but not loaded — run: tmux source-file ${_np_conf}"
     else
-      _diag_info "alert-silence hook" "not configured — run 'zproj integrate' to set up"
+      _diag_info "alert-silence hook" "not configured — run '${SCRIPT_NAME} integrate' to set up"
     fi
 
     # Check allow-passthrough (tmux 3.2+ only)
     if [[ -n "$_np_tmux_ver" ]] && _version_gte "$_np_tmux_ver" "3.2"; then
       local _np_live_pt
-      _np_live_pt="$(tmux show -gv allow-passthrough 2>/dev/null)" || _np_live_pt=""
+      _np_live_pt="$(_tmux show -gv allow-passthrough 2>/dev/null)" || _np_live_pt=""
       local _np_conf_has_pt=false
       grep -qE "allow-passthrough[[:space:]]+all" "$(_tmux_config_path)" 2>/dev/null && _np_conf_has_pt=true
       if [[ "$_np_live_pt" == "all" ]]; then
@@ -3151,7 +3506,7 @@ cmd_diagnostics() {
       elif $_np_conf_has_pt; then
         _diag_warn "allow-passthrough" "config has 'all' but server has '${_np_live_pt:-off}' — run: tmux source-file $(_tmux_config_path)"
       else
-        _diag_info "allow-passthrough" "not set — run 'zproj integrate' to configure"
+        _diag_info "allow-passthrough" "not set — run '${SCRIPT_NAME} integrate' to configure"
       fi
     else
       _diag_info "allow-passthrough" "requires tmux 3.2+ (have ${_np_tmux_ver:-unknown}) — OSC 777 unavailable"
@@ -3208,6 +3563,20 @@ cmd_diagnostics() {
     _diag_warn "user.email not set" "set with: git config --global user.email 'you@example.com'"
   fi
 
+  _section_header "Git portability"
+
+  local _repair_ok=false
+  if GIT_TERMINAL_PROMPT=0 git worktree repair -h &>/dev/null || \
+       GIT_TERMINAL_PROMPT=0 git worktree repair --help &>/dev/null; then
+    _repair_ok=true
+  fi
+  if $_repair_ok; then
+    _diag_ok "git worktree repair" "available — run from repo root if worktree paths break after moves/clones"
+  else
+    _diag_info "git worktree repair" "not advertised by this Git — upgrade Git for portability repairs"
+  fi
+  _diag_info "relative paths" "consider: git config worktree.useRelativePaths true across machines"
+
   # ── Section: runtime environment ────────────────────────────────────────
   _section_header "Runtime environment"
 
@@ -3253,9 +3622,9 @@ cmd_diagnostics() {
   local zproj_path
   zproj_path="$(command -v "$SCRIPT_NAME" 2>/dev/null || echo "$0")"
   if [[ -x "$zproj_path" ]]; then
-    _diag_ok "zproj binary" "$zproj_path"
+    _diag_ok "${SCRIPT_NAME} binary" "$zproj_path"
   else
-    _diag_err "zproj binary" "$zproj_path is not executable"
+    _diag_err "${SCRIPT_NAME} binary" "$zproj_path is not executable"
   fi
 
   # ── Summary ─────────────────────────────────────────────────────────────
@@ -3264,7 +3633,7 @@ cmd_diagnostics() {
   if [[ $errors -eq 0 && $warnings -eq 0 ]]; then
     echo -e "${GREEN}${BOLD}All checks passed.${RESET}"
   else
-    [[ $errors -gt 0 ]]   && echo -e "${RED}${BOLD}${errors} error(s)${RESET} — these will prevent zproj from working correctly."
+    [[ $errors -gt 0 ]]   && echo -e "${RED}${BOLD}${errors} error(s)${RESET} — these will prevent ${SCRIPT_NAME} from working correctly."
     [[ $warnings -gt 0 ]] && echo -e "${YELLOW}${BOLD}${warnings} warning(s)${RESET} — these may cause degraded behaviour."
   fi
   echo ""
@@ -3294,7 +3663,8 @@ _integrate_build_prompt() {
   review_path_abs="$("$zproj_path" review path --abs 2>/dev/null)" \
     || review_path_abs="(run from inside a worktree)"
 
-  keymaps_lua_contents="$(cat <<'KEYMAPS_LUA'
+  local KM
+  KM="$(cat <<'KEYMAPS_LUA'
 -- lua/config/keymaps.lua
 
 vim.keymap.set("n", "<leader>rn", function()
@@ -3359,14 +3729,16 @@ vim.keymap.set("n", "<leader>rc", function()
 end, { desc = "Clear review notes" })
 KEYMAPS_LUA
 )"
+  KM="${KM//zproj/${SCRIPT_NAME}}"
+  keymaps_lua_contents="$KM"
 
   cat <<PROMPT
-# zproj Editor Integration Task
+# ${SCRIPT_NAME} Editor Integration Task
 
 ## Your mission
 
 You are a coding agent helping a developer integrate their text editor with the
-**zproj** workflow tool. This task has a precise, testable definition of "done".
+**${SCRIPT_NAME}** workflow tool. This task has a precise, testable definition of "done".
 Read all sections carefully before taking any action.
 
 ---
@@ -3379,28 +3751,28 @@ Use them as context and cross-check against the actual environment.
 
 | Item | Value |
 |------|-------|
-| zproj version | \`${zproj_version}\` |
+| ${SCRIPT_NAME} version | \`${zproj_version}\` |
 | Reference editor | \`${editor}\` |
 | Reference coding agent | \`${ai_binary}\` |
 | Review notes path (relative to worktree root) | \`${review_path_rel}\` |
 
-**On the target machine**, verify zproj is installed and in PATH:
+**On the target machine**, verify ${SCRIPT_NAME} is installed and in PATH:
 \`\`\`
-zproj --version
+${SCRIPT_NAME} --version
 \`\`\`
 
 **Important:** Never hardcode the review notes path. Always obtain it at
 runtime by shelling out to:
 \`\`\`
-zproj review path --abs
+${SCRIPT_NAME} review path --abs
 \`\`\`
 This ensures the path stays correct regardless of which worktree is active.
 
 ---
 
-## What is zproj?
+## What is ${SCRIPT_NAME}?
 
-zproj is a workflow manager that combines:
+${SCRIPT_NAME} is a workflow manager that combines:
 - **Bare git worktrees** — each feature/branch gets its own directory
 - **tmux sessions** — one session per project, one window per worktree
 - **3-pane tmux layout** per window:
@@ -3408,11 +3780,11 @@ zproj is a workflow manager that combines:
   - Pane 2 (right-top): editor (named after its binary, e.g. \`nvim\`)
   - Pane 3 (right-bottom): shell
 
-The user opens a project with \`zproj launch <worktree>\` and gets all three
+The user opens a project with \`${SCRIPT_NAME} launch <worktree>\` and gets all three
 tools in one window, already positioned in the worktree directory.
 
-tmux keybindings for worktree management (create, delete, fork, join, update)
-are installed automatically by \`zproj integrate\` — no editor-side action needed.
+- **tmux keybindings** for worktree management (create, delete, fork, join, update)
+are installed automatically by \`${SCRIPT_NAME} integrate\` — no editor-side action needed.
 
 ---
 
@@ -3435,22 +3807,22 @@ with directed notes for the coding agent. The workflow is:
 2. **View notes** — the user can open/display the notes file to review what
    has been accumulated.
 
-3. **Dispatch** — the user triggers \`zproj review dispatch\`, which:
+3. **Dispatch** — the user triggers \`${SCRIPT_NAME} review dispatch\`, which:
    - Assembles the notes into a full prompt and saves it to a temp file
    - Sends a one-line handoff message to the coding agent pane via tmux,
      pointing the agent at the temp file
    - Deletes the notes file (the temp file is kept for safety)
 
-4. **Clear** — the user can clear all notes with \`zproj review clear\`.
+4. **Clear** — the user can clear all notes with \`${SCRIPT_NAME} review clear\`.
 
 The four editor actions that must be bound are:
 
 | Action | Shell command / behaviour | Suggested key |
 |--------|--------------------------|---------------|
-| Add note | Prompt user for text; get current file + line number; append formatted entry to \`\$(zproj review path --abs)\` | editor-appropriate |
-| View notes | Open/display \`\$(zproj review path --abs)\` | editor-appropriate |
-| Dispatch | \`zproj review dispatch\` | editor-appropriate |
-| Clear | \`zproj review clear\` | editor-appropriate |
+| Add note | Prompt user for text; get current file + line number; append formatted entry to \`\$(${SCRIPT_NAME} review path --abs)\` | editor-appropriate |
+| View notes | Open/display \`\$(${SCRIPT_NAME} review path --abs)\` | editor-appropriate |
+| Dispatch | \`${SCRIPT_NAME} review dispatch\` | editor-appropriate |
+| Clear | \`${SCRIPT_NAME} review clear\` | editor-appropriate |
 
 ---
 
@@ -3467,7 +3839,7 @@ something equivalent) is already present before adding anything.
 implement the four actions using that editor's native idioms. The only
 invariants that must hold regardless of editor are:
 - The file path recorded in each note must be absolute
-- The review notes path must be obtained at runtime via \`zproj review path --abs\`
+- The review notes path must be obtained at runtime via \`${SCRIPT_NAME} review path --abs\`
 - The note entry format must be exactly:
   \`\`\`
   ### \`<abs-file>\` line <n> -- <YYYY-MM-DD HH:MM>
@@ -3487,15 +3859,15 @@ ${keymaps_lua_contents}
 
 Key observations from this implementation:
 - File path is recorded as absolute (\`vim.fn.expand("%:p")\`), never relative
-- The review notes path is obtained via \`zproj review path --abs\` (shelled
+- The review notes path is obtained via \`${SCRIPT_NAME} review path --abs\` (shelled
   out), never hardcoded
 - All four bindings are permanent global keymaps in \`keymaps.lua\` — available
   in any buffer at all times
 - \`<leader>rn\` checks both \`vim.v.shell_error\` and the empty-string to detect
-  \`zproj\` failures robustly
+  \`${SCRIPT_NAME}\` failures robustly
 - \`<leader>rv\` opens the notes file in a split for inspection
-- \`<leader>rd\` calls \`zproj review dispatch\` — one line, no tmux knowledge
-- \`<leader>rc\` calls \`zproj review clear\`, then wipes the buffer if open
+- \`<leader>rd\` calls \`${SCRIPT_NAME} review dispatch\` — one line, no tmux knowledge
+- \`<leader>rc\` calls \`${SCRIPT_NAME} review clear\`, then wipes the buffer if open
 
 ---
 
@@ -3515,13 +3887,13 @@ The editor binary is \`${editor_binary}\`. Research it thoroughly:
 
 ### Step 2 — Check for existing integration
 
-Search the editor's config files for any evidence of zproj review integration:
-- Look for references to \`zproj review\`, \`review-notes\`, \`.agents/plans\`
+Search the editor's config files for any evidence of ${SCRIPT_NAME} review integration:
+- Look for references to \`${SCRIPT_NAME} review\`, \`review-notes\`, \`.agents/plans\`
 - Look for the four actions (add note, view, dispatch, clear) in any form
 
 Report one of three states:
 
-**A. Fully integrated** — all four actions are present and use \`zproj review\`
+**A. Fully integrated** — all four actions are present and use \`${SCRIPT_NAME} review\`
 correctly. Report what you found. Do nothing further. Explain how the user
 can test it (see Step 4).
 
@@ -3529,7 +3901,7 @@ can test it (see Step 4).
 
 **C. Partially integrated or different implementation** — some actions exist
 but use hardcoded paths, or only some actions are present, or the
-implementation differs materially from the zproj approach. **Stop and ask
+implementation differs materially from the ${SCRIPT_NAME} approach. **Stop and ask
 the user** before making any changes. Describe exactly what you found and
 what you would change, and wait for explicit confirmation before proceeding.
 
@@ -3539,11 +3911,11 @@ If state B: implement all four actions in a way that is idiomatic for
 \`${editor_binary}\`. Specifically:
 - Use the editor's native plugin/keymap mechanism
 - Never hardcode the review notes path — always shell out to
-  \`zproj review path --abs\`
+  \`${SCRIPT_NAME} review path --abs\`
 - Do not remove or alter any existing keymaps or config unrelated to
   the review workflow
 - Make the implementation minimal and focused — only the four actions
-- Prefer graceful error handling: if zproj is not found or returns an
+- Prefer graceful error handling: if ${SCRIPT_NAME} is not found or returns an
   error, notify the user clearly
 
 ### Step 4 — Explain how to test
@@ -3577,86 +3949,172 @@ When done, provide a structured summary:
 PROMPT
 }
 
-# Install skill files directly from the bundled skills/ directory into the
-# agent's global skills directory. No agent involvement needed.
-#
-# Install ck and cqs if not already present.
-# With dry_run=true: prints what would be run without executing anything.
-# Picks the best available installer: npm preferred for ck, cargo for cqs.
+# Write $1 to $2 with ${SCRIPT_NAME} worktree binds (NXFJU) removed: marker line plus
+# any bind/bind-key invoking this script via #{pane_current_path} (canonical integrate shape).
+_integrate_bindings_filtered_to_tmpfile() {
+  local src="$1" dst="$2"
+  awk -v s="$SCRIPT_NAME" '
+    $0 == "# " s " integration" { next }
+    ((/^bind[[:space:]]+[NXFJU][[:space:]]/) || (/^bind-key[[:space:]]+[NXFJU][[:space:]]/)) \
+      && index($0, "pane_current_path") > 0 \
+      && index($0, s) > 0 { next }
+    { print }
+  ' "$src" > "$dst"
+}
+
+# Count integrated worktree binds (pane_current_path + SCRIPT_NAME) per NXFJU.
+_integrate_count_zproj_worktree_binds_file() {
+  local file="$1" key c=0
+  [[ -f "$file" ]] || { echo 0; return 0; }
+  for key in N X F J U; do
+    if grep -qE '^bind(-key)?[[:space:]]+'"$key"'[[:space:]].*pane_current_path.*'"$SCRIPT_NAME" "$file" 2>/dev/null; then
+      ((c++)) || true
+    fi
+  done
+  echo "$c"
+}
+
+# Remove notification marker and alert-bell / alert-silence notifier hooks so integrate
+# can re-add a single canonical copy (avoid duplicate set-hook chains in tmux.conf).
+_integrate_notify_marker_and_hooks_filtered_to_tmpfile() {
+  local src="$1" dst="$2"
+  awk -v s="$SCRIPT_NAME" '
+    $0 == "# " s " notification" { next }
+    /^set-hook / && index($0, "alert-bell") > 0 \
+      && index($0, s " notify") > 0 { next }
+    /^set-hook / && index($0, "alert-silence") > 0 \
+      && index($0, s " notify") > 0 { next }
+    { print }
+  ' "$src" > "$dst"
+}
+
+# Append canonical zproj tmux binds (prefix+N/X/F/J/U). Removes any prior integrated
+# block matching this script + #{pane_current_path} before re-append so integrate is idempotent.
 _integrate_install_tmux_bindings() {
   local dry_run="${1:-false}"
-  local conf
+  local conf marker _bind_block stripped_preview="" cnt
   conf="$(_tmux_config_path)"
-
-  # The full binding block. Written as a heredoc to avoid quote-escaping hell.
-  local _bind_block
-  _bind_block="$(cat <<'TMUX_BINDINGS'
-bind N command-prompt -p "new worktree name:" "run-shell 'cd #{pane_current_path}/.. && zproj %% > /dev/null 2>&1'"
-bind X confirm-before -p "delete worktree '#{window_name}'? (y/n)" "run-shell 'cd #{pane_current_path}/.. && zproj delete #{window_name} --force > /dev/null 2>&1; tmux refresh-client'"
-bind F command-prompt -p "fork to new worktree:" "run-shell 'cd #{pane_current_path}/.. && zproj fork #{window_name} %% > /dev/null 2>&1'"
-bind J command-prompt -p "join into worktree:" "run-shell 'cd #{pane_current_path}/.. && zproj join #{window_name} %% > /dev/null 2>&1'"
-bind U confirm-before -p "update '#{window_name}' from forked source? (y/n)" "run-shell 'cd #{pane_current_path} && zproj update > /dev/null 2>&1'"
-TMUX_BINDINGS
+  marker="# ${SCRIPT_NAME} integration"
+  _bind_block="$(cat <<TMUX_B
+bind N command-prompt -p "new worktree name:" "run-shell 'cd #{pane_current_path}/.. && ${SCRIPT_NAME} %% > /dev/null 2>&1'"
+bind X confirm-before -p "delete worktree '#{window_name}'? (y/n)" "run-shell 'cd #{pane_current_path}/.. && ${SCRIPT_NAME} delete #{window_name} --force > /dev/null 2>&1; tmux refresh-client'"
+bind F command-prompt -p "fork to new worktree:" "run-shell 'cd #{pane_current_path}/.. && ${SCRIPT_NAME} fork #{window_name} %% > /dev/null 2>&1'"
+bind J command-prompt -p "join into worktree:" "run-shell 'cd #{pane_current_path}/.. && ${SCRIPT_NAME} join #{window_name} %% > /dev/null 2>&1'"
+bind U confirm-before -p "update '#{window_name}' from forked source? (y/n)" "run-shell 'cd #{pane_current_path} && ${SCRIPT_NAME} update > /dev/null 2>&1'"
+TMUX_B
 )"
 
-  # Check which bindings are already present by grepping for each key+zproj
-  local -a bind_keys=( N X F J U )
-  local -a missing_keys=() missing_lines=()
-  local key line
-  while IFS= read -r line; do
-    key="${line#bind }"
-    key="${key%% *}"
-    if [[ -f "$conf" ]] && grep -q "bind ${key} .*zproj" "$conf" 2>/dev/null; then
-      dim "  [already present]  bind ${key}  (${conf})"
-    else
-      missing_keys+=("$key")
-      missing_lines+=("$line")
-    fi
-  done <<< "$_bind_block"
-
-  if [[ ${#missing_keys[@]} -eq 0 ]]; then
-    return 0
-  fi
-
-  if $dry_run; then
-    local mk
-    for mk in "${missing_keys[@]}"; do
-      echo "  [would add]  bind ${mk}  (${conf})"
+  local _bk
+  if $dry_run && [[ ! -f "$conf" ]]; then
+    for _bk in N X F J U; do
+      echo "  [would add]  bind ${_bk}  (${conf})"
     done
     return 0
   fi
 
-  # Append missing bindings
-  local marker="# zproj integration"
+  if [[ -f "$conf" ]]; then
+    stripped_preview="$(mktemp)"
+    _integrate_bindings_filtered_to_tmpfile "$conf" "$stripped_preview"
+
+    if $dry_run; then
+      if ! cmp -s "$conf" "$stripped_preview" 2>/dev/null; then
+        echo "  [would refresh] zproj-managed tmux binds (${conf})"
+      fi
+      for _bk in N X F J U; do
+        grep -qE '^bind(-key)?[[:space:]]+'"$_bk"'[[:space:]].*pane_current_path.*'"$SCRIPT_NAME" "$stripped_preview" && continue
+        echo "  [would add]  bind ${_bk}  (${conf})"
+      done
+      rm -f -- "$stripped_preview"
+      return 0
+    fi
+
+    if ! cmp -s "$conf" "$stripped_preview" 2>/dev/null; then
+      if ! mv "$stripped_preview" "$conf"; then
+        rm -f -- "$stripped_preview"
+        _err "tmux binds refresh failed (${conf})"
+        return 1
+      fi
+      stripped_preview=""
+      step "  [refreshed] removed stale zproj-managed tmux binds (${conf})"
+    else
+      rm -f -- "$stripped_preview"
+      stripped_preview=""
+    fi
+    cnt="$(_integrate_count_zproj_worktree_binds_file "$conf")"
+  else
+    cnt=0
+  fi
+
+  if [[ "$cnt" -ge 5 ]]; then
+    return 0
+  fi
+
   if [[ ! -f "$conf" ]]; then
     mkdir -p "$(dirname "$conf")"
     {
       echo "$marker"
-      local ml
-      for ml in "${missing_lines[@]}"; do
-        echo "$ml"
-      done
+      printf '%s\n' "$_bind_block"
     } > "$conf"
     step "  [created]  ${conf}"
-  else
-    local needs_marker=true
-    grep -qF "$marker" "$conf" && needs_marker=false
-    {
-      echo ""
-      if $needs_marker; then
-        echo "$marker"
-      fi
-      local ml
-      for ml in "${missing_lines[@]}"; do
-        echo "$ml"
-      done
-    } >> "$conf"
+    for _bk in N X F J U; do
+      step "  [added]  bind ${_bk}  (${conf})"
+    done
+    return 0
   fi
 
-  local mk
-  for mk in "${missing_keys[@]}"; do
-    step "  [added]  bind ${mk}  (${conf})"
-  done
+  {
+    echo ""
+    echo "$marker"
+    printf '%s\n' "$_bind_block"
+  } >> "$conf"
+  step "  [added]  zproj worktree binds (${conf})"
+}
+
+# Old installs used `set-hook -ga` for notify hooks. Each `tmux source-file`
+# appended another duplicate handler (-ga stacks). Rewrite our notifier lines to
+# `set-hook -g` so reloads replace the hook instead.
+_integrate_notify_hooks_normalize_set_g_in_conf() {
+  local dry_run="${1:-false}"
+  local conf="$(_tmux_config_path)"
+  [[ -f "$conf" ]] || return 0
+  if ! grep -qE "set-hook -ga alert-(bell|silence).*${SCRIPT_NAME} notify" "$conf" 2>/dev/null; then
+    return 0
+  fi
+  if $dry_run; then
+    echo "  [would migrate] notifier hooks: replace set-hook -ga → set-hook -g in (${conf})"
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp)"
+  if ! awk -v s="$SCRIPT_NAME" '
+    {
+      line = $0
+      idx = index(line, s " notify")
+      if (idx > 0) {
+        if (line ~ /set-hook -ga alert-bell/) {
+          gsub(/set-hook -ga alert-bell/, "set-hook -g alert-bell", line)
+        }
+        if (line ~ /set-hook -ga alert-silence/) {
+          gsub(/set-hook -ga alert-silence/, "set-hook -g alert-silence", line)
+        }
+      }
+      print line
+    }
+  ' "$conf" > "$tmp"; then
+    rm -f "$tmp"
+    _err "normalize notify hooks (-ga→-g) failed (awk)"
+    return 1
+  fi
+  if cmp -s "$conf" "$tmp"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  if ! mv "$tmp" "$conf"; then
+    rm -f "$tmp"
+    _err "normalize notify hooks (-ga→-g) failed (mv)"
+    return 1
+  fi
+  step "  [migrated]  notify hooks → set-hook -g (no stacking on source-file) (${conf})"
 }
 
 _integrate_install_notify_hooks() {
@@ -3664,9 +4122,34 @@ _integrate_install_notify_hooks() {
   local conf
   conf="$(_tmux_config_path)"
 
+  # Strip notifier hooks + marker so repeating integrate never stacks duplicate hooks in tmux.conf.
+  if [[ -f "$conf" ]]; then
+    if $dry_run; then
+      if grep -qFx "# ${SCRIPT_NAME} notification" "$conf" 2>/dev/null \
+        || grep -qE 'set-hook .*alert-(bell|silence).*'"$SCRIPT_NAME"' notify' "$conf" 2>/dev/null; then
+        echo "  [would refresh] notifier marker + bell/silence hooks (${conf})"
+      fi
+    else
+      local _nz_tmp
+      _nz_tmp="$(mktemp)"
+      _integrate_notify_marker_and_hooks_filtered_to_tmpfile "$conf" "$_nz_tmp"
+      if ! cmp -s "$conf" "$_nz_tmp" 2>/dev/null; then
+        if ! mv "$_nz_tmp" "$conf"; then
+          rm -f -- "$_nz_tmp"
+          _err "Notifier hook strip failed (${conf})"; return 1
+        fi
+        step "  [refreshed] removed notifier marker/hooks for rewrite (${conf})"
+      else
+        rm -f -- "$_nz_tmp"
+      fi
+    fi
+  fi
+
+  _integrate_notify_hooks_normalize_set_g_in_conf "$dry_run"
+
   local tmux_ver=""
   if command -v tmux &>/dev/null; then
-    tmux_ver="$(tmux -V 2>/dev/null | awk '{print $2}')" || tmux_ver=""
+    tmux_ver="$(_tmux -V 2>/dev/null | awk '{print $2}')" || tmux_ver=""
   fi
 
   # Version-adaptive hook commands.
@@ -3676,9 +4159,9 @@ _integrate_install_notify_hooks() {
   fi
 
   local _bell_hook
-  _bell_hook="set-hook -ga alert-bell '${run_shell_cmd} \"zproj notify \\\"#{hook_session}\\\" \\\"#{hook_window}\\\" \\\"#{hook_pane}\\\"\"'"
+  _bell_hook="set-hook -g alert-bell '${run_shell_cmd} \"${SCRIPT_NAME} notify \\\"#{hook_session}\\\" \\\"#{hook_window}\\\" \\\"#{hook_pane}\\\"\"'"
   local _silence_hook
-  _silence_hook="set-hook -ga alert-silence '${run_shell_cmd} \"zproj notify \\\"#{hook_session}\\\" \\\"#{hook_window}\\\" \\\"#{hook_pane}\\\" silence\"'"
+  _silence_hook="set-hook -g alert-silence '${run_shell_cmd} \"${SCRIPT_NAME} notify \\\"#{hook_session}\\\" \\\"#{hook_window}\\\" \\\"#{hook_pane}\\\" silence\"'"
 
   # Settings to install — each checked independently.
   # Format: "grep_pattern|||line_to_append"
@@ -3688,8 +4171,8 @@ _integrate_install_notify_hooks() {
     "bell-action any|||set -g bell-action any"
     "window-status-bell-style|||set -g window-status-bell-style fg=white,bg=red,bold"
     "monitor-silence|||setw -g monitor-silence 45"
-    "alert-bell.*zproj notify|||${_bell_hook}"
-    "alert-silence.*zproj notify|||${_silence_hook}"
+    "alert-bell.*${SCRIPT_NAME} notify|||${_bell_hook}"
+    "alert-silence.*${SCRIPT_NAME} notify|||${_silence_hook}"
   )
 
   # allow-passthrough only on tmux 3.2+
@@ -3728,7 +4211,7 @@ _integrate_install_notify_hooks() {
     return 0
   fi
 
-  local marker="# zproj notification"
+  local marker="# ${SCRIPT_NAME} notification"
   if [[ ! -f "$conf" ]]; then
     mkdir -p "$(dirname "$conf")"
     {
@@ -3767,7 +4250,7 @@ _integrate_install_notify_hooks() {
 # With dry_run=true: prints what would be done without executing.
 _integrate_configure_agents() {
   local dry_run="${1:-false}"
-  local marker="# zproj notification"
+  local marker="# ${SCRIPT_NAME} notification"
 
   # ── Claude Code ───────────────────────────────────────────────────────────
   if command -v claude &>/dev/null; then
@@ -3893,9 +4376,10 @@ _integrate_configure_agents() {
 
   # ── Silence-fallback agents (no terminal notification API) ────────────────
   local _silence_agents=()
-  command -v amp   &>/dev/null && _silence_agents+=(amp)
-  command -v goose &>/dev/null && _silence_agents+=(goose)
-  command -v agent &>/dev/null && _silence_agents+=(agent)
+  command -v amp    &>/dev/null && _silence_agents+=(amp)
+  command -v goose  &>/dev/null && _silence_agents+=(goose)
+  command -v hermes &>/dev/null && _silence_agents+=(hermes)
+  command -v agent  &>/dev/null && _silence_agents+=(agent)
 
   if [[ ${#_silence_agents[@]} -gt 0 ]]; then
     local ag
@@ -3932,17 +4416,17 @@ cmd_integrate() {
      _integrate_install_notify_hooks true
       dim "  Note: run 'tmux source-file $(_tmux_config_path)' to activate in the current server"
       # Warn if running tmux server diverges from config
-      if command -v tmux &>/dev/null && tmux list-sessions &>/dev/null; then
+      if command -v tmux &>/dev/null && _tmux list-sessions &>/dev/null; then
         local _pi_conf
         _pi_conf="$(_tmux_config_path)"
         local _pi_conf_has_bell=false _pi_server_has_bell=false
-        grep -qE "alert-bell.*zproj notify" "$_pi_conf" 2>/dev/null && _pi_conf_has_bell=true
-        tmux show-hooks -g 2>/dev/null | grep -qE "alert-bell.*zproj notify" && _pi_server_has_bell=true
+        grep -qE "alert-bell.*${SCRIPT_NAME} notify" "$_pi_conf" 2>/dev/null && _pi_conf_has_bell=true
+        _tmux show-hooks -g 2>/dev/null | grep -qE "alert-bell.*${SCRIPT_NAME} notify" && _pi_server_has_bell=true
         if $_pi_conf_has_bell && ! $_pi_server_has_bell; then
           warn "  ⚠ hooks in config but not loaded in running tmux server — run: tmux source-file ${_pi_conf}"
         fi
         local _pi_live_pt
-        _pi_live_pt="$(tmux show -gv allow-passthrough 2>/dev/null)" || _pi_live_pt=""
+        _pi_live_pt="$(_tmux show -gv allow-passthrough 2>/dev/null)" || _pi_live_pt=""
         if grep -qE "allow-passthrough[[:space:]]+all" "$_pi_conf" 2>/dev/null && [[ "$_pi_live_pt" != "all" ]]; then
           warn "  ⚠ allow-passthrough: config has 'all' but server has '${_pi_live_pt:-off}' — run: tmux source-file ${_pi_conf}"
         fi
@@ -3955,6 +4439,8 @@ cmd_integrate() {
 
   # ── Live run ─────────────────────────────────────────────────────────────
 
+  _integrate_maybe_append_handoff_gitignore
+
   check_session_deps
 
   local editor ai ai_binary
@@ -3963,7 +4449,7 @@ cmd_integrate() {
   ai_binary="${ai%% *}"
 
   echo ""
-  echo -e "${BOLD}zproj integrate${RESET}"
+  echo -e "${BOLD}${SCRIPT_NAME} integrate${RESET}"
   echo -e "  Editor:  ${CYAN}${editor}${RESET}"
   echo -e "  Agent:   ${CYAN}${ai_binary:-none}${RESET}"
   echo ""
@@ -4008,21 +4494,21 @@ cmd_integrate() {
   local window="$ai_binary"
 
   # Kill any previous integrate session for a clean slate
-  if tmux has-session -t "$session" 2>/dev/null; then
+  if _tmux has-session -t "$session" 2>/dev/null; then
     step "Replacing existing integrate session..."
-    tmux kill-session -t "$session"
+    _tmux kill-session -t "$session"
   fi
 
   step "Launching ${CYAN}${ai_binary}${RESET}..."
-  tmux new-session -d -s "$session" -n "$window" -c "$HOME" -x 220 -y 50
+  _tmux new-session -d -s "$session" -n "$window" -c "$HOME" -x 220 -y 50
 
   # Capture the pane ID at creation time — avoids pane-base-index dependency
   local pane_target
-  pane_target="$(tmux list-panes -t "${session}:${window}" -F '#{pane_id}' | head -1)"
-  tmux select-pane -t "$pane_target" -T "$ai_binary"
+  pane_target="$(_tmux list-panes -t "${session}:${window}" -F '#{pane_id}' | head -1)"
+  _tmux select-pane -t "$pane_target" -T "$ai_binary"
 
   # Launch the agent
-  tmux send-keys -t "$pane_target" "$ai" Enter
+  _tmux send-keys -t "$pane_target" "$ai" Enter
 
   # Schedule the handoff message asynchronously — background subshell so the
   # calling process is not blocked and attach happens immediately.
@@ -4030,7 +4516,7 @@ cmd_integrate() {
   if ! [[ "$delay" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     die "\$ZPROJ_INTEGRATE_DELAY must be a non-negative number (got '${delay}')."
   fi
-  ( sleep "$delay" && tmux send-keys -t "$pane_target" "$handoff_msg" Enter ) &
+  ( sleep "$delay" && _tmux send-keys -t "$pane_target" "$handoff_msg" Enter ) &
   disown
 
   dim "  Handoff scheduled in ${delay}s"
@@ -4045,8 +4531,8 @@ cmd_integrate() {
 }
 
 cmd_notify() {
-  # Called by tmux alert-bell hook: zproj notify <session> <window> <pane> [type]
-  # Also supports: zproj notify --help
+  # Called by tmux alert-bell hook: ${SCRIPT_NAME} notify <session> <window> <pane> [type]
+  # Also supports: ${SCRIPT_NAME} notify --help
   case "${1:-}" in
   --help|-h) usage_notify; return 0 ;;
   esac
@@ -4077,7 +4563,7 @@ cmd_notify() {
   while IFS= read -r tty; do
     [[ -z "$tty" ]] && continue
     _notify_osc777 "$title" "$body" "$tty"
-  done < <(tmux list-clients -F '#{client_tty}' 2>/dev/null)
+  done < <(_tmux list-clients -F '#{client_tty}' 2>/dev/null)
 }
 
 usage_integrate() {
@@ -4085,15 +4571,16 @@ usage_integrate() {
 
 ${BOLD}Usage:${RESET} $SCRIPT_NAME integrate [--plan]
 
-  Bootstraps your machine with three integration steps:
+  Bootstraps your machine with three integration steps. Safe to run multiple
+  times: worktree key binds and notifier hooks are stripped and re-written in
+  tmux.conf instead of appending duplicates.
 
     1. Installs tmux keybindings for worktree management (create, delete,
        fork, join, update)
-    2. Configures the notification pipeline — installs tmux alert hooks so
-       that any coding agent pane that emits a bell triggers a desktop
-       notification via OSC 777 (Ghostty) with session and window context.
-       Also configures each installed agent (claude, aider, codex, gemini)
-       to emit BEL when idle.
+    2. Installs tmux alert hooks so bells from a coding agent pane run
+       ${SCRIPT_NAME} notify (OSC 777 desktop notification on supported hosts).
+       Older ${SCRIPT_NAME} configs that used set-hook -ga (which stacks
+       handlers on every tmux source-file reload) are rewritten to -g.
     3. Asks your coding agent to implement the review workflow in your editor
        (add note / view / dispatch / clear)
 
@@ -4131,6 +4618,9 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME notify [session] [window] [pane] [type]
 
   Notifications are debounced per pane (default 5s).
   Set \$ZPROJ_NOTIFY_COOLDOWN to override the debounce period.
+  Session/window names containing ';' or control characters are sanitized for
+  OSC 777 — raw ';' in those names would break the terminal notifier and can
+  litter full-screen apps until they redraw.
 
   Outside tmux with no arguments: exits silently (safe to call from scripts).
 
@@ -4140,8 +4630,8 @@ ${BOLD}Options:${RESET}
 ${BOLD}Environment:${RESET}
   ZPROJ_NOTIFY_COOLDOWN   Debounce cooldown in seconds (default: 5)
 
-${BOLD}Example tmux hook (installed by zproj integrate):${RESET}
-  set-hook -ga alert-bell 'run-shell -b "zproj notify \\"#{hook_session}\\" \\"#{hook_window}\\" \\"#{hook_pane}\\""'
+${BOLD}Example tmux hook (installed by ${SCRIPT_NAME} integrate):${RESET}
+  set-hook -g alert-bell 'run-shell -b "'"'"${SCRIPT_NAME}"'"' notify \\"#{hook_session}\\" \\"#{hook_window}\\" \\"#{hook_pane}\\""'
 
 EOF
 }
@@ -4151,11 +4641,22 @@ EOF
 cmd_test() {
   local tmp
   tmp="$(mktemp -d)"
-  # Clean up temp dir when the script exits.
+
+  # Dedicated tmux server socket — isolates sessions and windows (including
+  # cmd_delete's kill-window) from the developer's live tmux.
+  ZPROJ_TEST_TMUX_SOCKET="zproj-selftest-$$-${RANDOM}"
+  export ZPROJ_TEST_TMUX_SOCKET
+  _tmux new-session -d -s zproj-selftest-boot -n _b_ -c / -x 80 -y 24 2>/dev/null || true
+  # So plain `bash -c '_tmux …'` in assertions can reach the same isolated server.
+  # bash always supports `export -f`; if this ever fails we want the test run to
+  # abort loudly rather than silently lose isolation between subshells.
+  export -f _tmux
+
+  # Clean up temp dir and our dedicated tmux server when the test run exits.
   # Double-quotes expand $tmp now (definition time). The inner single-quotes
   # protect the already-expanded path from word-splitting when the trap fires.
   # shellcheck disable=SC2064
-  trap "rm -rf -- '$tmp'" EXIT
+  trap "command tmux -L \"${ZPROJ_TEST_TMUX_SOCKET}\" kill-server 2>/dev/null || true; rm -rf -- '$tmp'" EXIT
 
   local passed=0 failed=0 skipped=0
 
@@ -4190,11 +4691,11 @@ cmd_test() {
   # Run zproj in isolation using a subshell so set -e doesn't kill the test runner.
   # Captures stdout+stderr; returns the exit code.
   _zproj() {
-    (cd "$tmp" && "$BASH" "$0" "$@" 2>&1)
+    (cd "$tmp" && "$BASH" "$_ZPROJ_SELF" "$@" 2>&1)
   }
   _zproj_exit() {
     local _ec=0
-    (cd "$tmp" && "$BASH" "$0" "$@" &>/dev/null) || _ec=$?
+    (cd "$tmp" && "$BASH" "$_ZPROJ_SELF" "$@" &>/dev/null) || _ec=$?
     echo $_ec
   }
 
@@ -4279,7 +4780,7 @@ cmd_test() {
   rm -rf "$tmp/c6"
   mkdir "$tmp/c6" && echo "dot test" > "$tmp/c6/dot.txt"
   local c6_out
-  c6_out="$(cd "$tmp/c6" && "$BASH" "$0" init . 2>&1)"
+  c6_out="$(cd "$tmp/c6" && "$BASH" "$_ZPROJ_SELF" init . 2>&1)"
   _t_check "dot.txt in main/"    test -f "$tmp/c6/main/dot.txt"
   _t_check "backup cleaned up"   test ! -e "$tmp/c6.bak"
   _t_grep  "warns about stale cwd" "still in the old directory" echo "$c6_out"
@@ -4668,6 +5169,18 @@ STUB
 
   fi  # end: command -v opencode
 
+  _section "A10 — agent: hermes is a known agent and gets the silence fallback"
+  # `hermes` is in _KNOWN_AGENTS so auto-discovery picks it up when present,
+  # and integrate routes it through the monitor-silence fallback (no BEL API).
+  local a10_in_known=1
+  local a10_ag
+  for a10_ag in "${_KNOWN_AGENTS[@]}"; do
+    [[ "$a10_ag" == hermes ]] && a10_in_known=0
+  done
+  _t_check "A10: hermes listed in _KNOWN_AGENTS" test "$a10_in_known" -eq 0
+  _t_check "A10: hermes is wired into the silence-fallback block" \
+    grep -qE 'command -v hermes.*_silence_agents\+=\(hermes\)' "$_ZPROJ_SELF"
+
   # ── Section: _repo_preferred_cursor / cursor repo detection ──────────────
 
   _section "RP1 — _repo_preferred_cursor: .cursor/ marker detected"
@@ -4813,7 +5326,7 @@ NOTES
   # Dispatch without a live tmux session — should save temp file and warn
   local d1_out
   d1_out="$(cd "$review_wt" && TMUX="" cmd_review dispatch 2>/dev/null)" || true
-  # It should either paste (if tmux is running) or warn about no session
+  # It should either paste (if _tmux is running) or warn about no session
   # Either way the temp file path should be mentioned
   _t_grep "mentions temp file path" "zproj-review-" echo "$d1_out"
 
@@ -4880,7 +5393,7 @@ NOTES
   _t_grep "asks user before change" "ask the user\|explicit confirm\|wait for"  echo "$i1_out"
 
   _section "I7 — integrate --plan: does not hardcode review notes path"
-  _t_grep "uses zproj review path" "zproj review path"  echo "$i1_out"
+  _t_grep "uses SCRIPT_NAME review path" "${SCRIPT_NAME} review path"  echo "$i1_out"
 
   # ── Section: --diagnostics ───────────────────────────────────────────────
 
@@ -4937,7 +5450,7 @@ NOTES
   # Use zproj init (tests the fixed bootstrap) rather than manual setup.
   local lt_root="$tmp/lt"
   rm -rf "$lt_root" || true
-  ( cd "$tmp" && "$BASH" "$0" init lt &>/dev/null ) || true
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init lt &>/dev/null ) || true
 
   local t_editor t_agent
   t_editor="$(_resolve_editor 2>/dev/null)"
@@ -4955,28 +5468,28 @@ NOTES
   local lt_editor_cmd="tail -f /dev/null ."  # "." simulates how editor gets called
   local _ltp1 _ltp2 _ltp3
 
-  tmux new-session -d -s "$lt_session" -n "main" -c "$tmp" -x 220 -y 50
-  _ltp1="$(tmux list-panes -t "$lt_session:main" -F '#{pane_id}' | head -1)"
-  tmux send-keys   -t "$_ltp1" "$lt_agent_cmd" Enter
-  tmux select-pane -t "$_ltp1" -T "$t_agent_bin"
-  _ltp2="$(tmux split-window -t "$lt_session:main" -h -c "$tmp" -P -F '#{pane_id}')"
-  tmux send-keys   -t "$_ltp2" "$lt_editor_cmd" Enter
-  tmux select-pane -t "$_ltp2" -T "$t_editor_bin"
-  _ltp3="$(tmux split-window -t "$_ltp2" -v -c "$tmp" -P -F '#{pane_id}')"
-  tmux select-pane -t "$_ltp3" -T "shell"
-  tmux select-pane -t "$_ltp1"
+  _tmux new-session -d -s "$lt_session" -n "main" -c "$tmp" -x 220 -y 50
+  _ltp1="$(_tmux list-panes -t "$lt_session:main" -F '#{pane_id}' | head -1)"
+  _tmux send-keys   -t "$_ltp1" "$lt_agent_cmd" Enter
+  _tmux select-pane -t "$_ltp1" -T "$t_agent_bin"
+  _ltp2="$(_tmux split-window -t "$lt_session:main" -h -c "$tmp" -P -F '#{pane_id}')"
+  _tmux send-keys   -t "$_ltp2" "$lt_editor_cmd" Enter
+  _tmux select-pane -t "$_ltp2" -T "$t_editor_bin"
+  _ltp3="$(_tmux split-window -t "$_ltp2" -v -c "$tmp" -P -F '#{pane_id}')"
+  _tmux select-pane -t "$_ltp3" -T "shell"
+  _tmux select-pane -t "$_ltp1"
 
   sleep 0.3
 
   local pane_titles
-  pane_titles="$(tmux list-panes -t "$lt_session:main" -F '#{pane_title}' 2>/dev/null)"
+  pane_titles="$(_tmux list-panes -t "$lt_session:main" -F '#{pane_title}' 2>/dev/null)"
 
   _t_check "T1: 3 panes created"                              test "$(echo "$pane_titles" | wc -l | tr -d ' ')" -eq 3
   _t_grep  "T2: pane 1 named after agent ('${t_agent_bin}')"  "$t_agent_bin"  echo "$pane_titles"
   _t_grep  "T3: pane 2 named after editor ('${t_editor_bin}')" "$t_editor_bin" echo "$pane_titles"
   _t_grep  "T4: pane 3 named 'shell'"                         "^shell$"       echo "$pane_titles"
 
-  tmux kill-session -t "$lt_session" 2>/dev/null || true
+  _tmux kill-session -t "$lt_session" 2>/dev/null || true
 
   # ── T5: review dispatch — sends handoff to named pane ────────────────────
 
@@ -4991,12 +5504,12 @@ NOTES
   local dt_session
   dt_session="$(basename "$lt_root")"   # same as _review_find_session would derive
 
-  tmux new-session -d -s "$dt_session" -n "main" -c "$dt_wt" -x 220 -y 50
+  _tmux new-session -d -s "$dt_session" -n "main" -c "$dt_wt" -x 220 -y 50
   # Capture pane ID (not index) — avoids pane-base-index dependency
   local _dtp1
-  _dtp1="$(tmux list-panes -t "$dt_session:main" -F '#{pane_id}' | head -1)"
-  tmux select-pane -t "$_dtp1" -T "$t_agent_bin"
-  tmux send-keys -t "$_dtp1" "cat" Enter
+  _dtp1="$(_tmux list-panes -t "$dt_session:main" -F '#{pane_id}' | head -1)"
+  _tmux select-pane -t "$_dtp1" -T "$t_agent_bin"
+  _tmux send-keys -t "$_dtp1" "cat" Enter
 
   # Write review notes
   mkdir -p "$dt_wt/.agents/plans"
@@ -5005,25 +5518,25 @@ NOTES
 
   # Run dispatch from within the worktree — _review_find_session will derive
   # the correct session/window names from the directory structure
-  ( cd "$dt_wt" && "$BASH" "$0" review dispatch 2>/dev/null ) || true
+  ( cd "$dt_wt" && "$BASH" "$_ZPROJ_SELF" review dispatch 2>/dev/null ) || true
 
   sleep 0.3
 
   local pane_content
-  pane_content="$(tmux capture-pane -t "$_dtp1" -p 2>/dev/null)"
+  pane_content="$(_tmux capture-pane -t "$_dtp1" -p 2>/dev/null)"
 
   _t_check "T5: notes file deleted after dispatch" \
     test ! -f "$dt_wt/.agents/plans/review-notes.md"
   _t_grep  "T5: pane received handoff message" "zproj-review-" echo "$pane_content"
 
-  tmux kill-session -t "$dt_session" 2>/dev/null || true
+  _tmux kill-session -t "$dt_session" 2>/dev/null || true
 
   # ── T6-T7: cmd_create and cmd_delete ─────────────────────────────────────
 
   _section "T6 — create: creates worktree and branch"
 
   # cmd_create doesn't call tmux at all — purely git + filesystem
-  (cd "$lt_root" && "$BASH" "$0" create feature-x 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" create feature-x 2>/dev/null) || true
 
   _t_check "T6: feature-x/ worktree directory created" \
     test -d "$lt_root/feature-x"
@@ -5033,7 +5546,7 @@ NOTES
   _section "T7 — delete: removes worktree and branch"
 
   # cmd_delete checks for tmux window; session doesn't exist so it skips that
-  (cd "$lt_root" && "$BASH" "$0" delete feature-x 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" delete feature-x 2>/dev/null) || true
 
   _t_check "T7: feature-x/ directory removed" \
     test ! -d "$lt_root/feature-x"
@@ -5046,27 +5559,28 @@ NOTES
 
   local open_session
   open_session="$(basename "$lt_root")"
-  tmux new-session -d -s "$open_session" -n "main" -c "$lt_root/main" \
+  _tmux kill-session -t "$open_session" 2>/dev/null || true
+  _tmux new-session -d -s "$open_session" -n "main" -c "$lt_root/main" \
     -x 220 -y 50 2>/dev/null || true
 
   # ZPROJ_TEST_NO_ATTACH=1 skips the attach/switch-client call so we can
   # inspect the output without blocking on a terminal attach.
   local open_out
-  open_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1 || true)"
+  open_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" 2>&1 || true)"
 
   _t_check "T8: no 'not in a bare worktree' error" \
     bash -c '! echo "$1" | grep -q "Not in a bare worktree"' -- "$open_out"
   _t_grep  "T8: prints 'Attaching to session'" "Attaching to session" echo "$open_out"
 
-  tmux kill-session -t "$open_session" 2>/dev/null || true
+  _tmux kill-session -t "$open_session" 2>/dev/null || true
 
   # ── T9: cmd_open launches windows for ALL worktrees ──────────────────────
 
   _section "T9 — cmd_open: launches a window for every worktree"
 
   # Create two additional worktrees alongside main
-  (cd "$lt_root" && "$BASH" "$0" create feature-a 2>/dev/null) || true
-  (cd "$lt_root" && "$BASH" "$0" create feature-b 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" create feature-a 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" create feature-b 2>/dev/null) || true
 
   _t_check "T9: feature-a/ exists"  test -d "$lt_root/feature-a"
   _t_check "T9: feature-b/ exists"  test -d "$lt_root/feature-b"
@@ -5075,18 +5589,18 @@ NOTES
   local t9_session
   t9_session="$(basename "$lt_root")"
   # Ensure no pre-existing session
-  tmux kill-session -t "$t9_session" 2>/dev/null || true
+  _tmux kill-session -t "$t9_session" 2>/dev/null || true
 
   local t9_out
-  t9_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1 || true)"
+  t9_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" 2>&1 || true)"
 
   # Verify the session was created
   _t_check "T9: session exists" \
-    tmux has-session -t "$t9_session"
+    _tmux has-session -t "$t9_session"
 
   # List all window names in the session
   local t9_windows
-  t9_windows="$(tmux list-windows -t "$t9_session" -F '#{window_name}' 2>/dev/null)"
+  t9_windows="$(_tmux list-windows -t "$t9_session" -F '#{window_name}' 2>/dev/null)"
 
   _t_grep  "T9: main window exists"      "^main$"       echo "$t9_windows"
   _t_grep  "T9: feature-a window exists"  "^feature-a$"  echo "$t9_windows"
@@ -5097,23 +5611,23 @@ NOTES
   t9_count="$(echo "$t9_windows" | wc -l | tr -d ' ')"
   _t_check "T9: exactly 3 windows created" test "$t9_count" -eq 3
 
-  tmux kill-session -t "$t9_session" 2>/dev/null || true
+  _tmux kill-session -t "$t9_session" 2>/dev/null || true
 
   # Clean up the extra worktrees
-  (cd "$lt_root" && "$BASH" "$0" delete feature-a 2>/dev/null) || true
-  (cd "$lt_root" && "$BASH" "$0" delete feature-b 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" delete feature-a 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" delete feature-b 2>/dev/null) || true
 
   # ── T10: cmd_open defers attach (does not block after first window) ──────
 
   _section "T10 — cmd_open: defers attach until all windows are created"
 
   # Recreate worktrees for this test
-  (cd "$lt_root" && "$BASH" "$0" create wt-alpha 2>/dev/null) || true
-  (cd "$lt_root" && "$BASH" "$0" create wt-beta 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" create wt-alpha 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" create wt-beta 2>/dev/null) || true
 
   local t10_session
   t10_session="$(basename "$lt_root")"
-  tmux kill-session -t "$t10_session" 2>/dev/null || true
+  _tmux kill-session -t "$t10_session" 2>/dev/null || true
 
   # Run cmd_open with TMUX="" (simulating outside-tmux invocation).
   # If _ZPROJ_DEFER_ATTACH works correctly, all windows are created before
@@ -5121,10 +5635,10 @@ NOTES
   # the test doesn't block, but the intermediate launches must NOT attach
   # (that's the bug this tests).
   local t10_out
-  t10_out="$(cd "$lt_root" && TMUX="" ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1 || true)"
+  t10_out="$(cd "$lt_root" && TMUX="" ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" 2>&1 || true)"
 
   local t10_windows
-  t10_windows="$(tmux list-windows -t "$t10_session" -F '#{window_name}' 2>/dev/null)"
+  t10_windows="$(_tmux list-windows -t "$t10_session" -F '#{window_name}' 2>/dev/null)"
 
   _t_grep  "T10: main window exists"      "^main$"       echo "$t10_windows"
   _t_grep  "T10: wt-alpha window exists"   "^wt-alpha$"   echo "$t10_windows"
@@ -5134,31 +5648,31 @@ NOTES
   t10_count="$(echo "$t10_windows" | wc -l | tr -d ' ')"
   _t_check "T10: exactly 3 windows created" test "$t10_count" -eq 3
 
-  tmux kill-session -t "$t10_session" 2>/dev/null || true
-  (cd "$lt_root" && "$BASH" "$0" delete wt-alpha 2>/dev/null) || true
-  (cd "$lt_root" && "$BASH" "$0" delete wt-beta 2>/dev/null) || true
+  _tmux kill-session -t "$t10_session" 2>/dev/null || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" delete wt-alpha 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" delete wt-beta 2>/dev/null) || true
 
   # ── T11: cmd_open orders worktrees by mtime (most recent first) ──────────
 
   _section "T11 — cmd_open: orders non-main worktrees by mtime (recent first)"
 
-  (cd "$lt_root" && "$BASH" "$0" create wt-old 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" create wt-old 2>/dev/null) || true
   sleep 1
-  (cd "$lt_root" && "$BASH" "$0" create wt-new 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" create wt-new 2>/dev/null) || true
   # Touch wt-new to ensure its mtime is newer
   touch "$lt_root/wt-new" 2>/dev/null || true
 
   local t11_session
   t11_session="$(basename "$lt_root")"
-  tmux kill-session -t "$t11_session" 2>/dev/null || true
+  _tmux kill-session -t "$t11_session" 2>/dev/null || true
 
   local t11_out
-  t11_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1 || true)"
+  t11_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" 2>&1 || true)"
 
   # Windows are listed in creation order (which reflects launch order).
   # main must be first; wt-new (more recent mtime) before wt-old.
   local t11_windows
-  t11_windows="$(tmux list-windows -t "$t11_session" -F '#{window_name}' 2>/dev/null)"
+  t11_windows="$(_tmux list-windows -t "$t11_session" -F '#{window_name}' 2>/dev/null)"
 
   # Extract window positions (1-indexed)
   local t11_main_pos t11_new_pos t11_old_pos
@@ -5169,17 +5683,17 @@ NOTES
   _t_check "T11: main is first window"         test "$t11_main_pos" -eq 1
   _t_check "T11: wt-new comes before wt-old"   test "$t11_new_pos" -lt "$t11_old_pos"
 
-  tmux kill-session -t "$t11_session" 2>/dev/null || true
-  (cd "$lt_root" && "$BASH" "$0" delete wt-old 2>/dev/null) || true
-  (cd "$lt_root" && "$BASH" "$0" delete wt-new 2>/dev/null) || true
+  _tmux kill-session -t "$t11_session" 2>/dev/null || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" delete wt-old 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" delete wt-new 2>/dev/null) || true
 
   # ── T12: cmd_open skips worktrees whose directory doesn't exist ──────────
 
   _section "T12 — cmd_open: skips registered worktrees with no directory on disk"
 
   # Create two additional worktrees alongside main
-  (cd "$lt_root" && "$BASH" "$0" create wt-present 2>/dev/null) || true
-  (cd "$lt_root" && "$BASH" "$0" create wt-ghost 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" create wt-present 2>/dev/null) || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" create wt-ghost 2>/dev/null) || true
 
   _t_check "T12: wt-present/ exists"  test -d "$lt_root/wt-present"
   _t_check "T12: wt-ghost/ exists"    test -d "$lt_root/wt-ghost"
@@ -5195,12 +5709,12 @@ NOTES
 
   local t12_session
   t12_session="$(basename "$lt_root")"
-  tmux kill-session -t "$t12_session" 2>/dev/null || true
+  _tmux kill-session -t "$t12_session" 2>/dev/null || true
 
   # Run cmd_open — should succeed and NOT error about wt-ghost
   local t12_out t12_exit
   t12_exit=0
-  t12_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" 2>&1)" || t12_exit=$?
+  t12_out="$(cd "$lt_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" 2>&1)" || t12_exit=$?
 
   _t_check "T12: cmd_open exits successfully" test "$t12_exit" -eq 0
   _t_check "T12: no error about wt-ghost" \
@@ -5208,7 +5722,7 @@ NOTES
 
   # Verify windows were created only for materialized worktrees
   local t12_windows
-  t12_windows="$(tmux list-windows -t "$t12_session" -F '#{window_name}' 2>/dev/null)"
+  t12_windows="$(_tmux list-windows -t "$t12_session" -F '#{window_name}' 2>/dev/null)"
 
   _t_grep  "T12: main window exists"        "^main$"        echo "$t12_windows"
   _t_grep  "T12: wt-present window exists"   "^wt-present$"  echo "$t12_windows"
@@ -5220,8 +5734,8 @@ NOTES
   t12_count="$(echo "$t12_windows" | wc -l | tr -d ' ')"
   _t_check "T12: exactly 2 windows created" test "$t12_count" -eq 2
 
-  tmux kill-session -t "$t12_session" 2>/dev/null || true
-  (cd "$lt_root" && "$BASH" "$0" delete wt-present 2>/dev/null) || true
+  _tmux kill-session -t "$t12_session" 2>/dev/null || true
+  (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" delete wt-present 2>/dev/null) || true
   # Prune the ghost worktree from git's registry
   git -C "$lt_root" worktree prune 2>/dev/null || true
 
@@ -5237,7 +5751,7 @@ NOTES
   b1_home="$(mktemp -d)"
   # HOME with no .gitconfig → no global identity
   local b1_out
-  b1_out="$( HOME="$b1_home" "$BASH" "$0" init "$tmp/b1" 2>&1 )" || true
+  b1_out="$( HOME="$b1_home" "$BASH" "$_ZPROJ_SELF" init "$tmp/b1" 2>&1 )" || true
   _t_check "B1: .bare/ created without global identity"  test -d "$tmp/b1/.bare"
   _t_check "B1: main/ worktree created"                  test -d "$tmp/b1/main"
   _t_check "B1: initial commit exists"                   git -C "$tmp/b1/main" log --oneline &>/dev/null
@@ -5249,11 +5763,11 @@ NOTES
   _section "B2 — delete: preserves branch when name differs from worktree dir"
   local b2_root="$tmp/b2"
   rm -rf "$b2_root" || true
-  ( cd "$tmp" && "$BASH" "$0" init b2 &>/dev/null ) || true
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init b2 &>/dev/null ) || true
   # Create a worktree on a branch with a different name
   ( cd "$b2_root" && git worktree add scratch -b shared main --quiet 2>/dev/null ) || true
   # Delete the 'scratch' worktree — should NOT delete 'shared' branch
-  ( cd "$b2_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" delete scratch &>/dev/null ) || true
+  ( cd "$b2_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" delete scratch &>/dev/null ) || true
   _t_check "B2: scratch/ worktree removed"        test ! -d "$b2_root/scratch"
   _t_grep  "B2: shared branch still exists"       "shared"  git -C "$b2_root" branch
 
@@ -5263,10 +5777,10 @@ NOTES
   _section "B3 — delete: refuses non-worktree sibling directory"
   local b3_root="$tmp/b3"
   rm -rf "$b3_root" || true
-  ( cd "$tmp" && "$BASH" "$0" init b3 &>/dev/null ) || true
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init b3 &>/dev/null ) || true
   mkdir -p "$b3_root/docs"         # plain directory, not a worktree
   local b3_exit
-  b3_exit="$( (cd "$b3_root" && "$BASH" "$0" delete docs &>/dev/null); echo $? )"
+  b3_exit="$( (cd "$b3_root" && "$BASH" "$_ZPROJ_SELF" delete docs &>/dev/null); echo $? )"
   _t_check "B3: exits non-zero for non-worktree dir" test "$b3_exit" -ne 0
   _t_check "B3: docs/ directory not deleted"         test -d "$b3_root/docs"
 
@@ -5276,7 +5790,7 @@ NOTES
   _section "B4 — init: absolute path creates repo at that exact location"
   local b4_dir
   b4_dir="$(mktemp -d)/b4proj"
-  ( "$BASH" "$0" init "$b4_dir" &>/dev/null ) || true
+  ( "$BASH" "$_ZPROJ_SELF" init "$b4_dir" &>/dev/null ) || true
   _t_check "B4: .bare/ at absolute path"   test -d "$b4_dir/.bare"
   _t_check "B4: main/ at absolute path"    test -d "$b4_dir/main"
   _t_check "B4: NOT created under cwd"     test ! -d "$(pwd)/$(basename "$b4_dir")"
@@ -5290,7 +5804,7 @@ NOTES
   local b5_wt="$tmp/b2/main"   # reuse b2 bare worktree
   mkdir -p "$b5_wt/src/module" || true
   local b5_path
-  b5_path="$( cd "$b5_wt/src/module" && "$BASH" "$0" review path --abs 2>/dev/null )" || true
+  b5_path="$( cd "$b5_wt/src/module" && "$BASH" "$_ZPROJ_SELF" review path --abs 2>/dev/null )" || true
   # Must end with main/.agents/plans/review-notes.md, not src/module/...
   _t_check "B5: path anchored at worktree root, not subdir" \
     bash -c 'echo "$1" | grep -q "/main/'"${REVIEW_NOTES_RELPATH}"'$"' -- "$b5_path"
@@ -5312,9 +5826,9 @@ NOTES
   _section "B7 — list: handles spaces in worktree path"
   local b7_root
   b7_root="$(mktemp -d)/my project"   # space in path
-  ( "$BASH" "$0" init "$b7_root" &>/dev/null ) || true
+  ( "$BASH" "$_ZPROJ_SELF" init "$b7_root" &>/dev/null ) || true
   local b7_out
-  b7_out="$( cd "$b7_root" && "$BASH" "$0" list 2>/dev/null )" || true
+  b7_out="$( cd "$b7_root" && "$BASH" "$_ZPROJ_SELF" list 2>/dev/null )" || true
   _t_check "B7: .bare created with space in path" test -d "$b7_root/.bare"
   _t_grep  "B7: list shows 'main' worktree"       "main"  echo "$b7_out"
   # Verify the branch column isn't a commit hash (which happened with awk split)
@@ -5329,8 +5843,8 @@ NOTES
   local b8_home
   b8_home="$(mktemp -d)"
   local b8_out b8_exit
-  b8_out="$( HOME="$b8_home" "$BASH" "$0" --diagnostics 2>/dev/null )" || true
-  b8_exit="$( (HOME="$b8_home" "$BASH" "$0" --diagnostics &>/dev/null); echo $? )"
+  b8_out="$( HOME="$b8_home" "$BASH" "$_ZPROJ_SELF" --diagnostics 2>/dev/null )" || true
+  b8_exit="$( (HOME="$b8_home" "$BASH" "$_ZPROJ_SELF" --diagnostics &>/dev/null); echo $? )"
   _t_check "B8: diagnostics exits 0 (not aborted)" test "$b8_exit" -eq 0
   _t_grep  "B8: reports warning about missing identity" \
     "user\.name not set\|user\.email not set"  echo "$b8_out"
@@ -5381,7 +5895,7 @@ NOTES
   mkdir -p "$b10_dir" || true
   echo "spaced" > "$b10_dir/data.txt" || true
   touch "$b10_dir/.env" || true
-  ( "$BASH" "$0" init "$b10_dir" &>/dev/null ) || true
+  ( "$BASH" "$_ZPROJ_SELF" init "$b10_dir" &>/dev/null ) || true
   _t_check "B10: .bare/ created in spaced path"   test -d "$b10_dir/.bare"
   _t_check "B10: main/ created in spaced path"    test -d "$b10_dir/main"
   _t_check "B10: data.txt moved into main/"       test -f "$b10_dir/main/data.txt"
@@ -5392,7 +5906,7 @@ NOTES
   local b10b_dir
   b10b_dir="$(mktemp -d)/my repo"
   _make_repo "$b10b_dir"
-  ( "$BASH" "$0" init "$b10b_dir" &>/dev/null ) || true
+  ( "$BASH" "$_ZPROJ_SELF" init "$b10b_dir" &>/dev/null ) || true
   _t_check "B10b: .bare/ created in spaced path"  test -d "$b10b_dir/.bare"
   _t_check "B10b: main/ created in spaced path"   test -d "$b10b_dir/main"
   _t_check "B10b: README.md moved into main/"     test -f "$b10b_dir/main/README.md"
@@ -5408,23 +5922,23 @@ NOTES
   local b11_parent b11_root
   b11_parent="$(mktemp -d)"
   b11_root="$b11_parent/b11proj"
-  ( cd "$b11_parent" && "$BASH" "$0" init b11proj &>/dev/null ) || true
-  tmux kill-session -t "b11proj" 2>/dev/null || true
+  ( cd "$b11_parent" && "$BASH" "$_ZPROJ_SELF" init b11proj &>/dev/null ) || true
+  _tmux kill-session -t "b11proj" 2>/dev/null || true
   local b11_out b11_exit=0
-  b11_out="$(cd "$b11_parent" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" b11proj 2>&1)" || b11_exit=$?
+  b11_out="$(cd "$b11_parent" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" b11proj 2>&1)" || b11_exit=$?
   _t_check "B11: exits 0 for bare-root arg from parent" test "$b11_exit" -eq 0
   _t_check "B11: no 'not a bare worktree root' error" \
     bash -c '! echo "$1" | grep -q "is not a bare worktree root"' -- "$b11_out"
   _t_check "B11: session created for bare-root arg" \
-    tmux has-session -t "b11proj"
-  tmux kill-session -t "b11proj" 2>/dev/null || true
+    _tmux has-session -t "b11proj"
+  _tmux kill-session -t "b11proj" 2>/dev/null || true
   # Also verify the absolute-path form works identically
   local b11_abs_out b11_abs_exit=0
-  b11_abs_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" "$b11_root" 2>&1)" || b11_abs_exit=$?
+  b11_abs_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" "$b11_root" 2>&1)" || b11_abs_exit=$?
   _t_check "B11: exits 0 for absolute bare-root arg" test "$b11_abs_exit" -eq 0
   _t_check "B11: session created for absolute bare-root arg" \
-    tmux has-session -t "b11proj"
-  tmux kill-session -t "b11proj" 2>/dev/null || true
+    _tmux has-session -t "b11proj"
+  _tmux kill-session -t "b11proj" 2>/dev/null || true
   rm -rf "$b11_parent" || true
 
   # ── Section: TM — tmux session name sanitisation ─────────────────────────
@@ -5459,20 +5973,20 @@ NOTES
   tm5_root="${tm5_parent}/clank.sh"
   tm5_session="clank-sh"   # expected sanitised name
 
-  ( "$BASH" "$0" init "$tm5_root" &>/dev/null ) || true
+  ( "$BASH" "$_ZPROJ_SELF" init "$tm5_root" &>/dev/null ) || true
   _t_check "TM5: bare repo created" test -d "$tm5_root/.bare"
 
-  (cd "$tm5_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" launch main &>/dev/null) || true
+  (cd "$tm5_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" launch main &>/dev/null) || true
 
   _t_check "TM5: tmux session exists with sanitised name" \
-    tmux has-session -t "$tm5_session"
+    _tmux has-session -t "$tm5_session"
 
   # Verify the raw dotted name was NOT used (it would have been stored as
   # clank_sh by tmux, which is distinct from clank-sh).
   _t_check "TM5: raw dotted name not used as session" \
-    bash -c '! tmux has-session -t "clank_sh" 2>/dev/null'
+    bash -c '! _tmux has-session -t "clank_sh" 2>/dev/null'
 
-  tmux kill-session -t "$tm5_session" 2>/dev/null || true
+  _tmux kill-session -t "$tm5_session" 2>/dev/null || true
   rm -rf "$tm5_parent" || true
 
   _section "TM6 — review dispatch: dotted project dir session found correctly"
@@ -5484,30 +5998,30 @@ NOTES
   tm6_session="my-proj"
   tm6_wt="${tm6_root}/main"
 
-  ( "$BASH" "$0" init "$tm6_root" &>/dev/null ) || true
+  ( "$BASH" "$_ZPROJ_SELF" init "$tm6_root" &>/dev/null ) || true
 
-  tmux new-session -d -s "$tm6_session" -n "main" -c "$tm6_wt" -x 220 -y 50 2>/dev/null || true
+  _tmux new-session -d -s "$tm6_session" -n "main" -c "$tm6_wt" -x 220 -y 50 2>/dev/null || true
   local tm6_pane
-  tm6_pane="$(tmux list-panes -t "$tm6_session:main" -F '#{pane_id}' | head -1)"
-  tmux send-keys -t "$tm6_pane" "cat" Enter 2>/dev/null || true
+  tm6_pane="$(_tmux list-panes -t "$tm6_session:main" -F '#{pane_id}' | head -1)"
+  _tmux send-keys -t "$tm6_pane" "cat" Enter 2>/dev/null || true
 
   mkdir -p "$tm6_wt/.agents/plans" || true
   printf "### \`src/X.scala\` line 1 -- 2026-01-01 00:00\nFix it.\n\n" \
     > "$tm6_wt/.agents/plans/review-notes.md"
 
   local tm6_dispatch_exit
-  tm6_dispatch_exit="$( (cd "$tm6_wt" && "$BASH" "$0" review dispatch &>/dev/null); echo $? )"
+  tm6_dispatch_exit="$( (cd "$tm6_wt" && "$BASH" "$_ZPROJ_SELF" review dispatch &>/dev/null); echo $? )"
   sleep 0.3
 
   local tm6_content
-  tm6_content="$(tmux capture-pane -t "$tm6_pane" -p 2>/dev/null)"
+  tm6_content="$(_tmux capture-pane -t "$tm6_pane" -p 2>/dev/null)"
 
   _t_check "TM6: dispatch exits 0"                   test "$tm6_dispatch_exit" -eq 0
   _t_grep  "TM6: pane received handoff message"      "zproj-review-"  echo "$tm6_content"
   _t_check "TM6: notes file deleted after dispatch"  \
     test ! -f "$tm6_wt/.agents/plans/review-notes.md"
 
-  tmux kill-session -t "$tm6_session" 2>/dev/null || true
+  _tmux kill-session -t "$tm6_session" 2>/dev/null || true
   rm -rf "$tm6_parent" || true
 
   else
@@ -5567,14 +6081,14 @@ NOTES
   _section "S4 — list: column structure is correct (no ANSI bleed)"
   local s4_root="$tmp/s4"
   rm -rf "$s4_root" || true
-  ( cd "$tmp" && "$BASH" "$0" init s4 &>/dev/null ) || true
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init s4 &>/dev/null ) || true
   # Ensure there's a commit so we can branch from it
   git -C "$s4_root/main" commit --allow-empty -q -m "init" \
     --author "Test <t@t.com>" 2>/dev/null || true
-  ( cd "$s4_root" && "$BASH" "$0" create feature-long-branch-name &>/dev/null ) || true
+  ( cd "$s4_root" && "$BASH" "$_ZPROJ_SELF" create feature-long-branch-name &>/dev/null ) || true
 
   local s4_out
-  s4_out="$(cd "$s4_root" && "$BASH" "$0" list 2>/dev/null \
+  s4_out="$(cd "$s4_root" && "$BASH" "$_ZPROJ_SELF" list 2>/dev/null \
     | sed 's/\x1b\[[0-9;]*m//g')" || true   # strip ANSI codes
 
   _t_grep  "S4: main row present"    "main"                    echo "$s4_out"
@@ -5585,7 +6099,7 @@ NOTES
   _t_check "S4: no column bleed (branch+status not adjacent)" \
     bash -c '! echo "$1" | grep -qE "[a-zA-Z](clean|dirty)"' -- "$s4_out"
 
-  ( cd "$s4_root" && "$BASH" "$0" delete feature-long-branch-name &>/dev/null ) || true
+  ( cd "$s4_root" && "$BASH" "$_ZPROJ_SELF" delete feature-long-branch-name &>/dev/null ) || true
 
   # ── Section: S5 — dead function meta-test ────────────────────────────────
   # Heuristic: flag any function defined in this script that is never referenced
@@ -5634,14 +6148,14 @@ NOTES
   _section "S6 — launch: refuses non-worktree sibling directory"
   local s6_root="$tmp/s6"
   rm -rf "$s6_root" || true
-  ( cd "$tmp" && "$BASH" "$0" init s6 &>/dev/null ) || true
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init s6 &>/dev/null ) || true
   mkdir -p "$s6_root/docs" || true
   local s6_exit
-  s6_exit="$( (cd "$s6_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" launch docs &>/dev/null); echo $? )"
+  s6_exit="$( (cd "$s6_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" launch docs &>/dev/null); echo $? )"
   _t_check "S6: exits non-zero for non-worktree dir" test "$s6_exit" -ne 0
   _t_check "S6: docs/ directory not removed"         test -d "$s6_root/docs"
   local s6_out
-  s6_out="$(cd "$s6_root" && "$BASH" "$0" launch docs 2>&1 || true)"
+  s6_out="$(cd "$s6_root" && "$BASH" "$_ZPROJ_SELF" launch docs 2>&1 || true)"
   _t_grep  "S6: error mentions not a worktree"       "not a registered" echo "$s6_out"
 
   # ── Section: S7 — _review_locate rejects non-worktree sibling ────────────
@@ -5649,14 +6163,14 @@ NOTES
   _section "S7 — review: refuses non-worktree sibling directory"
   local s7_root="$tmp/s7"
   rm -rf "$s7_root" || true
-  ( cd "$tmp" && "$BASH" "$0" init s7 &>/dev/null ) || true
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init s7 &>/dev/null ) || true
   mkdir -p "$s7_root/docs/sub" || true
   local s7_exit
-  s7_exit="$( (cd "$s7_root/docs/sub" && "$BASH" "$0" review path --abs &>/dev/null); echo $? )"
+  s7_exit="$( (cd "$s7_root/docs/sub" && "$BASH" "$_ZPROJ_SELF" review path --abs &>/dev/null); echo $? )"
   _t_check "S7: exits non-zero from non-worktree subdir" test "$s7_exit" -ne 0
 
   local s7_good
-  s7_good="$(cd "$s7_root/main" && "$BASH" "$0" review path --abs 2>/dev/null)" || true
+  s7_good="$(cd "$s7_root/main" && "$BASH" "$_ZPROJ_SELF" review path --abs 2>/dev/null)" || true
   _t_check "S7: still works from real worktree"   test -n "$s7_good"
   _t_grep  "S7: path contains main/"              "/main/" echo "$s7_good"
 
@@ -5679,9 +6193,9 @@ NOTES
   _section "S8c — create: rejects nonexistent from-ref"
   local s8c_root="$tmp/s8c"
   rm -rf "$s8c_root" || true
-  ( cd "$tmp" && "$BASH" "$0" init s8c &>/dev/null ) || true
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init s8c &>/dev/null ) || true
   local s8c_exit
-  s8c_exit="$( (cd "$s8c_root" && "$BASH" "$0" create feat --from nonexistent-ref &>/dev/null); echo $? )"
+  s8c_exit="$( (cd "$s8c_root" && "$BASH" "$_ZPROJ_SELF" create feat --from nonexistent-ref &>/dev/null); echo $? )"
   _t_check "S8c: exits non-zero for bad ref"       test "$s8c_exit" -ne 0
   _t_check "S8c: no worktree directory created"    test ! -d "$s8c_root/feat"
 
@@ -5703,7 +6217,7 @@ NOTES
   local s9_dir="$tmp/s9-newproj"
   rm -rf "$s9_dir" || true
   local s9_exit
-  s9_exit="$( (PATH="$s9_bin:$PATH" "$BASH" "$0" init "$s9_dir" &>/dev/null); echo $? )"
+  s9_exit="$( (PATH="$s9_bin:$PATH" "$BASH" "$_ZPROJ_SELF" init "$s9_dir" &>/dev/null); echo $? )"
   _t_check "S9: exits non-zero"          test "$s9_exit" -ne 0
   _t_check "S9: no directory left behind" test ! -d "$s9_dir"
   rm -rf "$s9_bin" "$s9_dir" || true
@@ -5713,15 +6227,15 @@ NOTES
   _section "S10 — default branch: detects non-main/master default"
   local s10_root="$tmp/s10"
   rm -rf "$s10_root" || true
-  ( cd "$tmp" && "$BASH" "$0" init s10 --main trunk &>/dev/null ) || true
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init s10 --main trunk &>/dev/null ) || true
   local s10_branch
   s10_branch="$(_git_default_branch "$s10_root" 2>/dev/null)" || true
   _t_check "S10: detects 'trunk' as default branch" test "$s10_branch" = "trunk"
 
   _section "S10b — create: works with non-main default branch (no --from)"
-  ( cd "$s10_root" && "$BASH" "$0" create feature-x &>/dev/null ) || true
+  ( cd "$s10_root" && "$BASH" "$_ZPROJ_SELF" create feature-x &>/dev/null ) || true
   _t_check "S10b: feature-x/ worktree created"  test -d "$s10_root/feature-x"
-  ( cd "$s10_root" && "$BASH" "$0" delete feature-x &>/dev/null ) || true
+  ( cd "$s10_root" && "$BASH" "$_ZPROJ_SELF" delete feature-x &>/dev/null ) || true
 
   # ── Section: S11 — cmd_list: clean error for nonexistent path ────────────
 
@@ -5754,7 +6268,7 @@ NOTES
   local n1_dir="$tmp/n1"
   rm -rf "$n1_dir" || true
   local n1_exit
-  n1_exit="$( (PATH="$n1_bin:$PATH" "$BASH" "$0" init "$n1_dir" &>/dev/null); echo $? )"
+  n1_exit="$( (PATH="$n1_bin:$PATH" "$BASH" "$_ZPROJ_SELF" init "$n1_dir" &>/dev/null); echo $? )"
   _t_check "N1: exits non-zero"            test "$n1_exit" -ne 0
   _t_check "N1: directory cleaned up"      test ! -d "$n1_dir"
   rm -rf "$n1_bin" || true
@@ -5782,7 +6296,7 @@ NOTES
   local n2_dir="$tmp/n2-clone"
   rm -rf "$n2_dir" || true
   local n2_exit
-  n2_exit="$( (cd "$tmp" && PATH="$n2_bin:$PATH" "$BASH" "$0" clone "$n2_remote" n2-clone &>/dev/null); echo $? )"
+  n2_exit="$( (cd "$tmp" && PATH="$n2_bin:$PATH" "$BASH" "$_ZPROJ_SELF" clone "$n2_remote" n2-clone &>/dev/null); echo $? )"
   _t_check "N2: exits non-zero"           test "$n2_exit" -ne 0
   _t_check "N2: directory cleaned up"     test ! -d "$n2_dir"
   rm -rf "$n2_bin" "$n2_src" "$n2_remote" || true
@@ -5835,20 +6349,20 @@ NOTES
   else
     _section "N6 — launch: pane-base-index compatibility"
     local n6_pbi
-    n6_pbi="$(tmux show-options -gv pane-base-index 2>/dev/null)" || n6_pbi="0"
+    n6_pbi="$(_tmux show-options -gv pane-base-index 2>/dev/null)" || n6_pbi="0"
     local n6_root="$tmp/n6"
     rm -rf "$n6_root" || true
-    ( cd "$tmp" && "$BASH" "$0" init n6 &>/dev/null ) || true
+    ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init n6 &>/dev/null ) || true
     local n6_exit
-    n6_exit="$( (cd "$n6_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" launch main &>/dev/null); echo $? )"
+    n6_exit="$( (cd "$n6_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" launch main &>/dev/null); echo $? )"
     if [[ "$n6_exit" -eq 0 ]]; then
       _t_pass "N6: launch succeeds with pane-base-index=$n6_pbi"
     else
       local n6_out
-      n6_out="$(cd "$n6_root" && "$BASH" "$0" launch main 2>&1 || true)"
+      n6_out="$(cd "$n6_root" && "$BASH" "$_ZPROJ_SELF" launch main 2>&1 || true)"
       _t_grep "N6: error mentions pane-base-index" "pane-base-index" echo "$n6_out"
     fi
-    tmux kill-session -t n6 2>/dev/null || true
+    _tmux kill-session -t n6 2>/dev/null || true
   fi
 
   # ── Section: RT1 — _resolve_pane_target fallback returns pane ID ─────────
@@ -5856,13 +6370,13 @@ NOTES
   if command -v tmux &>/dev/null; then
     _section "RT1 — _resolve_pane_target: fallback returns pane ID not .1"
     local rt1_session="zproj-test-rt1-$$"
-    tmux new-session -d -s "$rt1_session" -n "win" -x 80 -y 24 2>/dev/null || true
+    _tmux new-session -d -s "$rt1_session" -n "win" -x 80 -y 24 2>/dev/null || true
     # Do NOT set any pane title — force the fallback path
     local rt1_result
     rt1_result="$(_resolve_pane_target "$rt1_session:win" "nonexistent-agent" 2>/dev/null)" || true
     _t_check "RT1: fallback result starts with %"        bash -c '[[ "$1" == %* ]]' -- "$rt1_result"
     _t_check "RT1: fallback result has no dot-index"     bash -c '[[ "$1" != *"."[0-9]* ]]' -- "$rt1_result"
-    tmux kill-session -t "$rt1_session" 2>/dev/null || true
+    _tmux kill-session -t "$rt1_session" 2>/dev/null || true
   else
     _t_skip "RT1: tmux not installed"
     _t_skip "RT1: (skipped)"
@@ -5883,7 +6397,7 @@ NOTES
   local rt3_dir="$tmp/rt3-clone"
   rm -rf "$rt3_dir" || true
   local rt3_out
-  rt3_out="$( ("$BASH" "$0" clone /nonexistent/repo/url rt3-clone 2>&1) || true)"
+  rt3_out="$( ("$BASH" "$_ZPROJ_SELF" clone /nonexistent/repo/url rt3-clone 2>&1) || true)"
   _t_check "RT3: no 'Created .git pointer' after failed clone" \
       bash -c '! echo "$1" | grep -q "Created .git pointer"' -- "$rt3_out"
   _t_check "RT3: no 'Fixed fetch refspec' after failed clone" \
@@ -5898,18 +6412,18 @@ NOTES
     _section "RT4 — review dispatch: works when named pane is absent (fallback)"
     local rt4_root="$tmp/rt4"
     rm -rf "$rt4_root" || true
-    ( cd "$tmp" && "$BASH" "$0" init rt4 &>/dev/null ) || true
+    ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init rt4 &>/dev/null ) || true
 
     local rt4_wt="$rt4_root/main"
     local rt4_session
     rt4_session="$(basename "$rt4_root")"
 
     # Create session with an UNNAMED pane — forces _resolve_pane_target fallback
-    tmux new-session -d -s "$rt4_session" -n "main" -c "$rt4_wt" -x 220 -y 50 2>/dev/null || true
+    _tmux new-session -d -s "$rt4_session" -n "main" -c "$rt4_wt" -x 220 -y 50 2>/dev/null || true
     local rt4_pane
-    rt4_pane="$(tmux list-panes -t "$rt4_session:main" -F '#{pane_id}' | head -1)"
+    rt4_pane="$(_tmux list-panes -t "$rt4_session:main" -F '#{pane_id}' | head -1)"
     # Deliberately do NOT set pane title — fallback path will be used
-    tmux send-keys -t "$rt4_pane" "cat" Enter 2>/dev/null || true
+    _tmux send-keys -t "$rt4_pane" "cat" Enter 2>/dev/null || true
 
     # Write review notes
     mkdir -p "$rt4_wt/.agents/plans" || true
@@ -5917,16 +6431,16 @@ NOTES
         > "$rt4_wt/.agents/plans/review-notes.md"
 
     local rt4_exit
-    rt4_exit="$( (cd "$rt4_wt" && "$BASH" "$0" review dispatch &>/dev/null); echo $? )"
+    rt4_exit="$( (cd "$rt4_wt" && "$BASH" "$_ZPROJ_SELF" review dispatch &>/dev/null); echo $? )"
     sleep 0.3
 
     local rt4_content
-    rt4_content="$(tmux capture-pane -t "$rt4_pane" -p 2>/dev/null)"
+    rt4_content="$(_tmux capture-pane -t "$rt4_pane" -p 2>/dev/null)"
     _t_check "RT4: dispatch exits 0"              test "$rt4_exit" -eq 0
     _t_grep  "RT4: pane received handoff message"  "zproj-review-"  echo "$rt4_content"
     _t_check "RT4: notes file deleted"             test ! -f "$rt4_wt/.agents/plans/review-notes.md"
 
-    tmux kill-session -t "$rt4_session" 2>/dev/null || true
+    _tmux kill-session -t "$rt4_session" 2>/dev/null || true
   else
     _t_skip "RT4: tmux not installed"
     _t_skip "RT4: (skipped)"
@@ -5968,11 +6482,11 @@ NOTES
   _section "B3 — review subcommands reject extra arguments"
   local b3_wt="$tmp/u1/main"
   local b3_1 b3_2 b3_3
-  b3_1="$( (cd "$b3_wt" && "$BASH" "$0" review path --abs extra &>/dev/null); echo $? )"
+  b3_1="$( (cd "$b3_wt" && "$BASH" "$_ZPROJ_SELF" review path --abs extra &>/dev/null); echo $? )"
   _t_check "B3: review path rejects extra arg"  test "$b3_1" -ne 0
-  b3_2="$( (cd "$b3_wt" && "$BASH" "$0" review view extra &>/dev/null); echo $? )"
+  b3_2="$( (cd "$b3_wt" && "$BASH" "$_ZPROJ_SELF" review view extra &>/dev/null); echo $? )"
   _t_check "B3: review view rejects extra arg"  test "$b3_2" -ne 0
-  b3_3="$( (cd "$b3_wt" && "$BASH" "$0" review clear extra &>/dev/null); echo $? )"
+  b3_3="$( (cd "$b3_wt" && "$BASH" "$_ZPROJ_SELF" review clear extra &>/dev/null); echo $? )"
   _t_check "B3: review clear rejects extra arg" test "$b3_3" -ne 0
 
   # ── Section: B4 — missing option args produce clean errors ────────────────
@@ -5986,8 +6500,8 @@ NOTES
   rm -rf "$tmp/foo" || true
 
   local b4_err2
-  b4_err2="$( (cd "$tmp" && "$BASH" "$0" init tmp-b4 2>/dev/null && \
-    "$BASH" "$0" create x --from 2>&1 || true) )"
+  b4_err2="$( (cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init tmp-b4 2>/dev/null && \
+    "$BASH" "$_ZPROJ_SELF" create x --from 2>&1 || true) )"
   _t_grep "B4: --from error mentions --from" "error:.*--from\|--from.*error:" echo "$b4_err2"
   rm -rf "$tmp/tmp-b4" || true
 
@@ -6063,7 +6577,7 @@ NOTES
   # Shared bare worktree for fork/join tests
   local fk_root="$tmp/fk"
   rm -rf "$fk_root" || true
-  ( cd "$tmp" && "$BASH" "$0" init fk &>/dev/null ) || true
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init fk &>/dev/null ) || true
   # Add a real commit so branches have content
   git -C "$fk_root/main" config user.name "Test" || true
   git -C "$fk_root/main" config user.email "t@t.test" || true
@@ -6072,7 +6586,7 @@ NOTES
 
   _section "FK1 — fork: creates worktree at same commit"
   local fk1_exit
-  fk1_exit="$( (cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork experiment &>/dev/null); echo $? )"
+  fk1_exit="$( (cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork experiment &>/dev/null); echo $? )"
   _t_check "FK1: exits 0"                    test "$fk1_exit" -eq 0
   _t_check "FK1: experiment/ exists"          test -d "$fk_root/experiment"
   _t_check "FK1: file.txt in experiment"      test -f "$fk_root/experiment/file.txt"
@@ -6087,7 +6601,7 @@ NOTES
 
   _section "FK2 — fork: explicit source creates worktree"
   local fk2_exit
-  fk2_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork main from-main &>/dev/null); echo $? )"
+  fk2_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork main from-main &>/dev/null); echo $? )"
   _t_check "FK2: exits 0"                    test "$fk2_exit" -eq 0
   _t_check "FK2: from-main/ exists"           test -d "$fk_root/from-main"
   local fk2_main_head fk2_fm_head
@@ -6098,7 +6612,7 @@ NOTES
   _section "FK3 — fork: dirty source warns but proceeds"
   echo "dirty" > "$fk_root/main/dirty.txt"
   local fk3_out
-  fk3_out="$(cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork dirty-fork 2>&1)" || true
+  fk3_out="$(cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork dirty-fork 2>&1)" || true
   _t_grep  "FK3: warns about uncommitted"     "uncommitted"  echo "$fk3_out"
   _t_check "FK3: dirty-fork/ created"         test -d "$fk_root/dirty-fork"
   # dirty.txt should NOT be in the fork (only committed state)
@@ -6107,91 +6621,91 @@ NOTES
 
   _section "FK4 — fork: target already exists → error"
   local fk4_exit
-  fk4_exit="$( (cd "$fk_root/main" && "$BASH" "$0" fork experiment &>/dev/null); echo $? )"
+  fk4_exit="$( (cd "$fk_root/main" && "$BASH" "$_ZPROJ_SELF" fork experiment &>/dev/null); echo $? )"
   _t_check "FK4: exits non-zero"              test "$fk4_exit" -ne 0
 
   _section "FK5 — fork: invalid branch name → error"
   local fk5_exit
-  fk5_exit="$( (cd "$fk_root/main" && "$BASH" "$0" fork 'bad name' &>/dev/null); echo $? )"
+  fk5_exit="$( (cd "$fk_root/main" && "$BASH" "$_ZPROJ_SELF" fork 'bad name' &>/dev/null); echo $? )"
   _t_check "FK5: exits non-zero"              test "$fk5_exit" -ne 0
   _t_check "FK5: no directory created"        test ! -d "$fk_root/bad name"
 
   _section "FK6 — fork: from non-worktree dir → error"
   local fk6_exit
-  fk6_exit="$( (cd "$tmp" && "$BASH" "$0" fork new-wt &>/dev/null); echo $? )"
+  fk6_exit="$( (cd "$tmp" && "$BASH" "$_ZPROJ_SELF" fork new-wt &>/dev/null); echo $? )"
   _t_check "FK6: exits non-zero"              test "$fk6_exit" -ne 0
 
   # Clean up extra worktrees
-  ( cd "$fk_root" && "$BASH" "$0" delete experiment --force &>/dev/null ) || true
-  ( cd "$fk_root" && "$BASH" "$0" delete from-main --force &>/dev/null ) || true
-  ( cd "$fk_root" && "$BASH" "$0" delete dirty-fork --force &>/dev/null ) || true
+  ( cd "$fk_root" && "$BASH" "$_ZPROJ_SELF" delete experiment --force &>/dev/null ) || true
+  ( cd "$fk_root" && "$BASH" "$_ZPROJ_SELF" delete from-main --force &>/dev/null ) || true
+  ( cd "$fk_root" && "$BASH" "$_ZPROJ_SELF" delete dirty-fork --force &>/dev/null ) || true
 
   # ── Section: FJ — join ──────────────────────────────────────────────────
 
   _section "FJ1 — join: same commit → deletes source"
-  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork fj1-src &>/dev/null ) || true
+  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork fj1-src &>/dev/null ) || true
   _t_check "FJ1: fj1-src created"             test -d "$fk_root/fj1-src"
   local fj1_exit
-  fj1_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" join fj1-src main &>/dev/null); echo $? )"
+  fj1_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" join fj1-src main &>/dev/null); echo $? )"
   _t_check "FJ1: exits 0"                     test "$fj1_exit" -eq 0
   _t_check "FJ1: source deleted"               test ! -d "$fk_root/fj1-src"
   _t_check "FJ1: source branch deleted"        bash -c '! git -C "$1" branch 2>/dev/null | grep -q fj1-src' -- "$fk_root"
 
   _section "FJ2 — join: diverged commits, clean merge"
-  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork fj2-src &>/dev/null ) || true
+  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork fj2-src &>/dev/null ) || true
   # Add a commit to source
   git -C "$fk_root/fj2-src" config user.name "Test" || true
   git -C "$fk_root/fj2-src" config user.email "t@t.test" || true
   echo "new content" > "$fk_root/fj2-src/new.txt"
   git -C "$fk_root/fj2-src" add . && git -C "$fk_root/fj2-src" commit -q -m "add new.txt" || true
   local fj2_exit
-  fj2_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" join fj2-src main &>/dev/null); echo $? )"
+  fj2_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" join fj2-src main &>/dev/null); echo $? )"
   _t_check "FJ2: exits 0"                     test "$fj2_exit" -eq 0
   _t_check "FJ2: new.txt merged into main"    test -f "$fk_root/main/new.txt"
   _t_check "FJ2: source deleted"               test ! -d "$fk_root/fj2-src"
 
   _section "FJ3 — join: dirty source → warns, merges, preserves source"
-  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork fj3-src &>/dev/null ) || true
+  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork fj3-src &>/dev/null ) || true
   git -C "$fk_root/fj3-src" config user.name "Test" || true
   git -C "$fk_root/fj3-src" config user.email "t@t.test" || true
   echo "committed" > "$fk_root/fj3-src/committed.txt"
   git -C "$fk_root/fj3-src" add . && git -C "$fk_root/fj3-src" commit -q -m "add committed" || true
   echo "uncommitted" > "$fk_root/fj3-src/uncommitted.txt"
   local fj3_out
-  fj3_out="$(cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" join fj3-src main 2>&1)" || true
+  fj3_out="$(cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" join fj3-src main 2>&1)" || true
   _t_grep  "FJ3: warns about uncommitted"     "uncommitted"      echo "$fj3_out"
   _t_check "FJ3: committed.txt merged"        test -f "$fk_root/main/committed.txt"
   _t_check "FJ3: source NOT deleted"           test -d "$fk_root/fj3-src"
-  ( cd "$fk_root" && "$BASH" "$0" delete fj3-src --force &>/dev/null ) || true
+  ( cd "$fk_root" && "$BASH" "$_ZPROJ_SELF" delete fj3-src --force &>/dev/null ) || true
 
   _section "FJ4 — join: source = target → error"
   local fj4_exit
-  fj4_exit="$( (cd "$fk_root" && "$BASH" "$0" join main main &>/dev/null); echo $? )"
+  fj4_exit="$( (cd "$fk_root" && "$BASH" "$_ZPROJ_SELF" join main main &>/dev/null); echo $? )"
   _t_check "FJ4: exits non-zero"              test "$fj4_exit" -ne 0
 
   _section "FJ5 — join: target does not exist → error"
   local fj5_exit
-  fj5_exit="$( (cd "$fk_root/main" && "$BASH" "$0" join nonexistent &>/dev/null); echo $? )"
+  fj5_exit="$( (cd "$fk_root/main" && "$BASH" "$_ZPROJ_SELF" join nonexistent &>/dev/null); echo $? )"
   _t_check "FJ5: exits non-zero"              test "$fj5_exit" -ne 0
 
   _section "FJ6 — join: source does not exist → error"
   local fj6_exit
-  fj6_exit="$( (cd "$fk_root" && "$BASH" "$0" join nonexistent main &>/dev/null); echo $? )"
+  fj6_exit="$( (cd "$fk_root" && "$BASH" "$_ZPROJ_SELF" join nonexistent main &>/dev/null); echo $? )"
   _t_check "FJ6: exits non-zero"              test "$fj6_exit" -ne 0
 
   _section "FJ7 — fork/join identity: fork then immediate join"
-  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork fj7-roundtrip &>/dev/null ) || true
+  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork fj7-roundtrip &>/dev/null ) || true
   local fj7_before fj7_after
   fj7_before="$(git -C "$fk_root/main" rev-parse HEAD)"
   local fj7_exit
-  fj7_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" join fj7-roundtrip main &>/dev/null); echo $? )"
+  fj7_exit="$( (cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" join fj7-roundtrip main &>/dev/null); echo $? )"
   fj7_after="$(git -C "$fk_root/main" rev-parse HEAD)"
   _t_check "FJ7: exits 0"                     test "$fj7_exit" -eq 0
   _t_check "FJ7: main HEAD unchanged"         test "$fj7_before" = "$fj7_after"
   _t_check "FJ7: source deleted"               test ! -d "$fk_root/fj7-roundtrip"
 
   _section "FJ8 — join: conflicting changes → aborts, saves prompt"
-  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork fj8-conflict &>/dev/null ) || true
+  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork fj8-conflict &>/dev/null ) || true
   # Create conflicting changes
   git -C "$fk_root/fj8-conflict" config user.name "Test" || true
   git -C "$fk_root/fj8-conflict" config user.email "t@t.test" || true
@@ -6200,28 +6714,28 @@ NOTES
   echo "target version" > "$fk_root/main/file.txt"
   git -C "$fk_root/main" add . && git -C "$fk_root/main" commit -q -m "conflict tgt" || true
   local fj8_out
-  fj8_out="$(cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" join fj8-conflict main 2>&1)" || true
+  fj8_out="$(cd "$fk_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" join fj8-conflict main 2>&1)" || true
   _t_grep  "FJ8: reports conflict"             "conflict"           echo "$fj8_out"
   _t_grep  "FJ8: mentions temp file"           "zproj-join-"        echo "$fj8_out"
   _t_check "FJ8: source NOT deleted"           test -d "$fk_root/fj8-conflict"
   # Target should be clean (merge was aborted)
   _t_check "FJ8: target is clean (merge aborted)" \
     bash -c '! git -C "$1/main" status --porcelain | grep -q .' -- "$fk_root"
-  ( cd "$fk_root" && "$BASH" "$0" delete fj8-conflict --force &>/dev/null ) || true
+  ( cd "$fk_root" && "$BASH" "$_ZPROJ_SELF" delete fj8-conflict --force &>/dev/null ) || true
 
   # ── Section: UP — update ────────────────────────────────────────────────
 
   # Fresh bare repo for update tests so they don't depend on FJ leftovers.
   local up_root="$tmp/up"
   rm -rf "$up_root" || true
-  ( cd "$tmp" && "$BASH" "$0" init up &>/dev/null ) || true
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init up &>/dev/null ) || true
   git -C "$up_root/main" config user.name "Test" || true
   git -C "$up_root/main" config user.email "t@t.test" || true
   echo "base" > "$up_root/main/base.txt"
   git -C "$up_root/main" add . && git -C "$up_root/main" commit -q -m "base" || true
 
   _section "UP1 — fork records branch.<n>.zprojSource"
-  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up1 &>/dev/null ) || true
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork up1 &>/dev/null ) || true
   _t_grep "UP1: source recorded as main"  "^main$" \
     git -C "$up_root/up1" config branch.up1.zprojSource
 
@@ -6229,7 +6743,7 @@ NOTES
   echo "from-main" > "$up_root/main/m2.txt"
   git -C "$up_root/main" add . && git -C "$up_root/main" commit -q -m "m2" || true
   local up2_exit
-  up2_exit="$( (cd "$up_root/up1" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update &>/dev/null); echo $? )"
+  up2_exit="$( (cd "$up_root/up1" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" update &>/dev/null); echo $? )"
   _t_check "UP2: exits 0"                       test "$up2_exit" -eq 0
   _t_check "UP2: m2.txt now in up1"             test -f "$up_root/up1/m2.txt"
   local up2_main_head up2_up1_head
@@ -6239,23 +6753,23 @@ NOTES
 
   _section "UP3 — update is idempotent when already up to date"
   local up3_out
-  up3_out="$(cd "$up_root/up1" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update 2>&1)" || true
+  up3_out="$(cd "$up_root/up1" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" update 2>&1)" || true
   _t_grep "UP3: reports already up to date"     "already up to date"  echo "$up3_out"
 
   _section "UP4 — update auto-detects + self-records when config is missing"
-  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up4 &>/dev/null ) || true
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork up4 &>/dev/null ) || true
   git -C "$up_root/up4" config --unset branch.up4.zprojSource 2>/dev/null || true
   echo "m3" > "$up_root/main/m3.txt"
   git -C "$up_root/main" add . && git -C "$up_root/main" commit -q -m "m3" || true
   local up4_exit
-  up4_exit="$( (cd "$up_root/up4" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update &>/dev/null); echo $? )"
+  up4_exit="$( (cd "$up_root/up4" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" update &>/dev/null); echo $? )"
   _t_check "UP4: exits 0"                       test "$up4_exit" -eq 0
   _t_check "UP4: m3.txt now in up4"             test -f "$up_root/up4/m3.txt"
   _t_grep "UP4: source self-recorded as main"   "^main$" \
     git -C "$up_root/up4" config branch.up4.zprojSource
 
   _section "UP5 — update auto-detect prefers default branch on ties"
-  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up5 &>/dev/null ) || true
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork up5 &>/dev/null ) || true
   git -C "$up_root/up5" config --unset branch.up5.zprojSource 2>/dev/null || true
   # Create a sibling branch at the same commit as main
   git -C "$up_root/main" branch sibling 2>/dev/null || true
@@ -6263,14 +6777,14 @@ NOTES
   echo "m4" > "$up_root/main/m4.txt"
   git -C "$up_root/main" add . && git -C "$up_root/main" commit -q -m "m4" || true
   local up5_exit
-  up5_exit="$( (cd "$up_root/up5" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update &>/dev/null); echo $? )"
+  up5_exit="$( (cd "$up_root/up5" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" update &>/dev/null); echo $? )"
   _t_check "UP5: exits 0"                       test "$up5_exit" -eq 0
   _t_grep "UP5: chose default branch (main)"    "^main$" \
     git -C "$up_root/up5" config branch.up5.zprojSource
   git -C "$up_root/main" branch -D sibling 2>/dev/null || true
 
   _section "UP6 — update with explicit source (one-arg form)"
-  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up6 &>/dev/null ) || true
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork up6 &>/dev/null ) || true
   # Create a separate branch with a commit, fork up6 will pull from it
   git -C "$up_root/main" branch other-src 2>/dev/null || true
   # We need the new branch's tip ahead so the merge has effect
@@ -6278,7 +6792,7 @@ NOTES
   echo "from-other" > "$up_root/other-src-wt/other.txt"
   git -C "$up_root/other-src-wt" add . && git -C "$up_root/other-src-wt" commit -q -m "other-src commit" || true
   local up6_exit
-  up6_exit="$( (cd "$up_root/up6" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update other-src &>/dev/null); echo $? )"
+  up6_exit="$( (cd "$up_root/up6" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" update other-src &>/dev/null); echo $? )"
   _t_check "UP6: exits 0"                       test "$up6_exit" -eq 0
   _t_check "UP6: other.txt merged into up6"     test -f "$up_root/up6/other.txt"
   # Self-records when no recorded value existed — but here UP1's sibling 'up6'
@@ -6290,31 +6804,31 @@ NOTES
   git -C "$up_root/main" branch -D other-src 2>/dev/null || true
 
   _section "UP7 — update two-arg form: target + source from PARENT_DIR"
-  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up7 &>/dev/null ) || true
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork up7 &>/dev/null ) || true
   echo "m5" > "$up_root/main/m5.txt"
   git -C "$up_root/main" add . && git -C "$up_root/main" commit -q -m "m5" || true
   local up7_exit
-  up7_exit="$( (cd "$up_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update up7 main &>/dev/null); echo $? )"
+  up7_exit="$( (cd "$up_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" update up7 main &>/dev/null); echo $? )"
   _t_check "UP7: exits 0"                       test "$up7_exit" -eq 0
   _t_check "UP7: m5.txt merged into up7"        test -f "$up_root/up7/m5.txt"
 
   _section "UP8 — update from outside any worktree → error"
   local up8_exit up8_out
-  up8_out="$( (cd "$tmp" && "$BASH" "$0" update 2>&1); true )"
-  up8_exit="$( (cd "$tmp" && "$BASH" "$0" update &>/dev/null); echo $? )"
+  up8_out="$( (cd "$tmp" && "$BASH" "$_ZPROJ_SELF" update 2>&1); true )"
+  up8_exit="$( (cd "$tmp" && "$BASH" "$_ZPROJ_SELF" update &>/dev/null); echo $? )"
   _t_check "UP8: exits non-zero"                test "$up8_exit" -ne 0
   _t_grep "UP8: suggests explicit form"         "update <target> <source>"  echo "$up8_out"
 
   _section "UP9 — update with nonexistent source → error"
-  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up9 &>/dev/null ) || true
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork up9 &>/dev/null ) || true
   local up9_exit up9_out
-  up9_out="$(cd "$up_root/up9" && "$BASH" "$0" update no-such-branch 2>&1)" || true
-  up9_exit="$( (cd "$up_root/up9" && "$BASH" "$0" update no-such-branch &>/dev/null); echo $? )"
+  up9_out="$(cd "$up_root/up9" && "$BASH" "$_ZPROJ_SELF" update no-such-branch 2>&1)" || true
+  up9_exit="$( (cd "$up_root/up9" && "$BASH" "$_ZPROJ_SELF" update no-such-branch &>/dev/null); echo $? )"
   _t_check "UP9: exits non-zero"                test "$up9_exit" -ne 0
   _t_grep "UP9: error mentions source not found" "not found"  echo "$up9_out"
 
   _section "UP10 — update with conflict aborts merge cleanly"
-  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up10 &>/dev/null ) || true
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork up10 &>/dev/null ) || true
   git -C "$up_root/up10" config user.name "Test" || true
   git -C "$up_root/up10" config user.email "t@t.test" || true
   echo "fork-side" > "$up_root/up10/conflict.txt"
@@ -6322,26 +6836,26 @@ NOTES
   echo "source-side" > "$up_root/main/conflict.txt"
   git -C "$up_root/main" add . && git -C "$up_root/main" commit -q -m "source-side conflict" || true
   local up10_out
-  up10_out="$(cd "$up_root/up10" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update 2>&1)" || true
+  up10_out="$(cd "$up_root/up10" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" update 2>&1)" || true
   _t_grep  "UP10: reports conflict"             "conflict"           echo "$up10_out"
   _t_grep  "UP10: mentions update temp file"    "zproj-update-"      echo "$up10_out"
   _t_check "UP10: target dir is clean (merge aborted)" \
     bash -c '! test -f "$1/up10/.git/MERGE_HEAD"' -- "$up_root"
 
   _section "UP11 — update on detached HEAD → error"
-  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up11 &>/dev/null ) || true
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork up11 &>/dev/null ) || true
   local up11_head
   up11_head="$(git -C "$up_root/up11" rev-parse HEAD)"
   git -C "$up_root/up11" checkout -q --detach "$up11_head" 2>/dev/null
   local up11_exit
-  up11_exit="$( (cd "$up_root/up11" && "$BASH" "$0" update &>/dev/null); echo $? )"
+  up11_exit="$( (cd "$up_root/up11" && "$BASH" "$_ZPROJ_SELF" update &>/dev/null); echo $? )"
   _t_check "UP11: exits non-zero"               test "$up11_exit" -ne 0
 
   _section "UP12 — update where source == target → error"
-  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork up12 &>/dev/null ) || true
+  ( cd "$up_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork up12 &>/dev/null ) || true
   local up12_exit up12_out
-  up12_out="$(cd "$up_root/up12" && "$BASH" "$0" update up12 2>&1)" || true
-  up12_exit="$( (cd "$up_root/up12" && "$BASH" "$0" update up12 &>/dev/null); echo $? )"
+  up12_out="$(cd "$up_root/up12" && "$BASH" "$_ZPROJ_SELF" update up12 2>&1)" || true
+  up12_exit="$( (cd "$up_root/up12" && "$BASH" "$_ZPROJ_SELF" update up12 &>/dev/null); echo $? )"
   _t_check "UP12: exits non-zero"               test "$up12_exit" -ne 0
   _t_grep "UP12: error mentions same"           "same"  echo "$up12_out"
 
@@ -6350,38 +6864,38 @@ NOTES
   # Fresh bare repo so BM tests don't interact with UP/FK leftovers.
   local bm_root="$tmp/bm"
   rm -rf "$bm_root" || true
-  ( cd "$tmp" && "$BASH" "$0" init bm &>/dev/null ) || true
+  ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init bm &>/dev/null ) || true
   git -C "$bm_root/main" config user.name "Test" || true
   git -C "$bm_root/main" config user.email "t@t.test" || true
   echo "base" > "$bm_root/main/file.txt"
   git -C "$bm_root/main" add . && git -C "$bm_root/main" commit -q -m "base" || true
 
   _section "BM1 — cmd_update on matching branch: no mismatch warning"
-  ( cd "$bm_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork bm1 &>/dev/null ) || true
+  ( cd "$bm_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork bm1 &>/dev/null ) || true
   echo "src" > "$bm_root/main/src1.txt"
   git -C "$bm_root/main" add . && git -C "$bm_root/main" commit -q -m "src1" || true
   local bm1_out
-  bm1_out="$(cd "$bm_root/bm1" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update 2>&1)" || true
+  bm1_out="$(cd "$bm_root/bm1" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" update 2>&1)" || true
   _t_check "BM1: no 'is on branch' warning"     bash -c '! grep -q "is on branch" <<< "$1"' -- "$bm1_out"
 
   _section "BM2 — cmd_update warns when target worktree is on a stray branch"
-  ( cd "$bm_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork bm2 &>/dev/null ) || true
+  ( cd "$bm_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork bm2 &>/dev/null ) || true
   ( cd "$bm_root/bm2" && git checkout -q -b stray-branch ) 2>/dev/null
   local bm2_out
-  bm2_out="$(cd "$bm_root/bm2" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update 2>&1)" || true
+  bm2_out="$(cd "$bm_root/bm2" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" update 2>&1)" || true
   _t_grep "BM2: warns about stray-branch"       "stray-branch"             echo "$bm2_out"
   _t_grep "BM2: suggests git checkout"          "git -C .* checkout bm2"   echo "$bm2_out"
   ( cd "$bm_root/bm2" && git checkout -q bm2 ) 2>/dev/null
   git -C "$bm_root/bm2" branch -D stray-branch 2>/dev/null || true
 
   _section "BM3 — cmd_update warns when source worktree is on a different branch (user's scenario)"
-  ( cd "$bm_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork bm3 &>/dev/null ) || true
+  ( cd "$bm_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork bm3 &>/dev/null ) || true
   # Switch the main worktree to a different branch — reflect-vs-main scenario
   ( cd "$bm_root/main" && git checkout -q -b drifted ) 2>/dev/null
   echo "drift" > "$bm_root/main/drift.txt"
   git -C "$bm_root/main" add . && git -C "$bm_root/main" commit -q -m "drift" || true
   local bm3_out
-  bm3_out="$(cd "$bm_root/bm3" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" update 2>&1)" || true
+  bm3_out="$(cd "$bm_root/bm3" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" update 2>&1)" || true
   _t_grep "BM3: warns about source mismatch"    "Worktree 'main' is on branch 'drifted'"  echo "$bm3_out"
   _t_grep "BM3: still reports up to date"       "already up to date"  echo "$bm3_out"
   ( cd "$bm_root/main" && git checkout -q main ) 2>/dev/null
@@ -6392,7 +6906,7 @@ NOTES
   echo "d2" > "$bm_root/main/d2.txt"
   git -C "$bm_root/main" add . && git -C "$bm_root/main" commit -q -m "d2" || true
   local bm4_out
-  bm4_out="$(cd "$bm_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" fork bm4 2>&1)" || true
+  bm4_out="$(cd "$bm_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork bm4 2>&1)" || true
   _t_grep "BM4: fork warns about source mismatch"  "Worktree 'main' is on branch 'drifted2'"  echo "$bm4_out"
   ( cd "$bm_root/main" && git checkout -q main ) 2>/dev/null
   git -C "$bm_root/main" branch -D drifted2 2>/dev/null || true
@@ -6405,12 +6919,12 @@ NOTES
   ti1_conf="${ti1_home}/.tmux.conf"
   ( HOME="$ti1_home" _integrate_install_tmux_bindings false &>/dev/null )
   _t_check "TI1: config file created"          test -f "$ti1_conf"
-  _t_grep  "TI1: has marker comment"           "zproj integration"   cat "$ti1_conf"
-  _t_grep  "TI1: has bind N"                   "bind N.*zproj"       cat "$ti1_conf"
-  _t_grep  "TI1: has bind X"                   "bind X.*zproj"       cat "$ti1_conf"
-  _t_grep  "TI1: has bind F"                   "bind F.*zproj"       cat "$ti1_conf"
-  _t_grep  "TI1: has bind J"                   "bind J.*zproj"       cat "$ti1_conf"
-  _t_grep  "TI1: has bind U"                   "bind U.*zproj"       cat "$ti1_conf"
+  _t_grep  "TI1: has marker comment"           "${SCRIPT_NAME} integration"   cat "$ti1_conf"
+  _t_grep  "TI1: has bind N"                   "bind N.*${SCRIPT_NAME}"       cat "$ti1_conf"
+  _t_grep  "TI1: has bind X"                   "bind X.*${SCRIPT_NAME}"       cat "$ti1_conf"
+  _t_grep  "TI1: has bind F"                   "bind F.*${SCRIPT_NAME}"       cat "$ti1_conf"
+  _t_grep  "TI1: has bind J"                   "bind J.*${SCRIPT_NAME}"       cat "$ti1_conf"
+  _t_grep  "TI1: has bind U"                   "bind U.*${SCRIPT_NAME}"       cat "$ti1_conf"
   rm -rf "$ti1_home" || true
 
   _section "TI2 — tmux bindings: append to existing config"
@@ -6420,41 +6934,46 @@ NOTES
   echo "set -g mouse on" > "$ti2_conf"
   ( HOME="$ti2_home" _integrate_install_tmux_bindings false &>/dev/null )
   _t_grep  "TI2: original content preserved"   "set -g mouse on"     cat "$ti2_conf"
-  _t_grep  "TI2: has bind N"                   "bind N.*zproj"       cat "$ti2_conf"
-  _t_grep  "TI2: has bind F"                   "bind F.*zproj"       cat "$ti2_conf"
-  _t_grep  "TI2: has bind U"                   "bind U.*zproj"       cat "$ti2_conf"
+  _t_grep  "TI2: has bind N"                   "bind N.*${SCRIPT_NAME}"       cat "$ti2_conf"
+  _t_grep  "TI2: has bind F"                   "bind F.*${SCRIPT_NAME}"       cat "$ti2_conf"
+  _t_grep  "TI2: has bind U"                   "bind U.*${SCRIPT_NAME}"       cat "$ti2_conf"
   rm -rf "$ti2_home" || true
 
   _section "TI3 — tmux bindings: idempotent when all present"
-  local ti3_home ti3_conf ti3_before ti3_after
+  local ti3_home ti3_conf ti3_n1 ti3_n2 ti3_mc1 ti3_mc2
   ti3_home="$(mktemp -d)"
   ti3_conf="${ti3_home}/.tmux.conf"
   ( HOME="$ti3_home" _integrate_install_tmux_bindings false &>/dev/null )
-  ti3_before="$(wc -l < "$ti3_conf")"
+  ti3_n1="$(grep -cE '^bind[[:space:]]+N ' "$ti3_conf" || true)"
+  ti3_mc1="$(grep -cF "# ${SCRIPT_NAME} integration" "$ti3_conf" || true)"
   ( HOME="$ti3_home" _integrate_install_tmux_bindings false &>/dev/null )
-  ti3_after="$(wc -l < "$ti3_conf")"
-  _t_check "TI3: line count unchanged"          test "$ti3_before" -eq "$ti3_after"
+  ti3_n2="$(grep -cE '^bind[[:space:]]+N ' "$ti3_conf" || true)"
+  ti3_mc2="$(grep -cF "# ${SCRIPT_NAME} integration" "$ti3_conf" || true)"
+  _t_check "TI3: one bind N after first install"      test "$ti3_n1" -eq 1
+  _t_check "TI3: one bind N after second integrate"   test "$ti3_n2" -eq 1
+  _t_check "TI3: integration marker not duplicated"   test "$ti3_mc1" -eq 1
+  _t_check "TI3: marker still unique after rerun"      test "$ti3_mc2" -eq 1
   rm -rf "$ti3_home" || true
 
   _section "TI4 — tmux bindings: upgrade adds missing F and J"
   local ti4_home ti4_conf
   ti4_home="$(mktemp -d)"
   ti4_conf="${ti4_home}/.tmux.conf"
-  # Simulate old config with only N and X
-  cat > "$ti4_conf" <<'TI4EOF'
-# zproj integration
-bind N command-prompt -p "new worktree name:" "run-shell 'cd #{pane_current_path}/.. && zproj %% > /dev/null 2>&1'"
-bind X confirm-before -p "delete worktree '#{window_name}'? (y/n)" "run-shell 'cd #{pane_current_path}/.. && zproj delete #{window_name} --force > /dev/null 2>&1; tmux refresh-client'"
+  # Simulate old config with only N and X (same binary name as current SCRIPT_NAME).
+  cat > "$ti4_conf" <<TI4EOF
+# ${SCRIPT_NAME} integration
+bind N command-prompt -p "new worktree name:" "run-shell 'cd #{pane_current_path}/.. && ${SCRIPT_NAME} %% > /dev/null 2>&1'"
+bind X confirm-before -p "delete worktree '#{window_name}'? (y/n)" "run-shell 'cd #{pane_current_path}/.. && ${SCRIPT_NAME} delete #{window_name} --force > /dev/null 2>&1; tmux refresh-client'"
 TI4EOF
   ( HOME="$ti4_home" _integrate_install_tmux_bindings false &>/dev/null )
-  _t_grep  "TI4: bind N still present"          "bind N.*zproj"       cat "$ti4_conf"
-  _t_grep  "TI4: bind X still present"          "bind X.*zproj"       cat "$ti4_conf"
-  _t_grep  "TI4: bind F added"                  "bind F.*zproj"       cat "$ti4_conf"
-  _t_grep  "TI4: bind J added"                  "bind J.*zproj"       cat "$ti4_conf"
-  _t_grep  "TI4: bind U added"                  "bind U.*zproj"       cat "$ti4_conf"
+  _t_grep  "TI4: bind N still present"          "bind N.*${SCRIPT_NAME}"       cat "$ti4_conf"
+  _t_grep  "TI4: bind X still present"          "bind X.*${SCRIPT_NAME}"       cat "$ti4_conf"
+  _t_grep  "TI4: bind F added"                  "bind F.*${SCRIPT_NAME}"       cat "$ti4_conf"
+  _t_grep  "TI4: bind J added"                  "bind J.*${SCRIPT_NAME}"       cat "$ti4_conf"
+  _t_grep  "TI4: bind U added"                  "bind U.*${SCRIPT_NAME}"       cat "$ti4_conf"
   # Marker should not be duplicated
   local ti4_marker_count
-  ti4_marker_count="$(grep -c 'zproj integration' "$ti4_conf")" || ti4_marker_count=0
+  ti4_marker_count="$(grep -c "${SCRIPT_NAME} integration" "$ti4_conf")" || ti4_marker_count=0
   _t_check "TI4: marker not duplicated"          test "$ti4_marker_count" -eq 1
   rm -rf "$ti4_home" || true
 
@@ -6475,8 +6994,22 @@ TI4EOF
   ( HOME="$ti6_home" _integrate_install_tmux_bindings false &>/dev/null )
   _t_grep  "TI6: prefix setting preserved"      "set -g prefix C-a"   cat "$ti6_conf"
   _t_grep  "TI6: reload binding preserved"      "bind r source-file"  cat "$ti6_conf"
-  _t_grep  "TI6: zproj bindings added"          "bind N.*zproj"       cat "$ti6_conf"
+  _t_grep  "TI6: ${SCRIPT_NAME} bindings added"          "bind N.*${SCRIPT_NAME}"       cat "$ti6_conf"
   rm -rf "$ti6_home" || true
+
+  _section "TI7 — tmux bindings: duplicate binds collapse on second integrate"
+  local ti7_home ti7_conf ti7_bn
+  ti7_home="$(mktemp -d)"
+  ti7_conf="${ti7_home}/.tmux.conf"
+  cat > "$ti7_conf" <<TI7EOF
+# ${SCRIPT_NAME} integration
+bind N command-prompt -p dup1 "run-shell 'cd #{pane_current_path}/.. && ${SCRIPT_NAME} %%'"
+bind N command-prompt -p dup2 "run-shell 'cd #{pane_current_path}/.. && ${SCRIPT_NAME} %%'"
+TI7EOF
+  ( HOME="$ti7_home" _integrate_install_tmux_bindings false &>/dev/null )
+  ti7_bn="$(grep -cE '^bind[[:space:]]+N ' "$ti7_conf" || true)"
+  _t_check "TI7: only one integrated bind N remains" test "$ti7_bn" -eq 1
+  rm -rf "$ti7_home" || true
 
   # ── Section: NT — notification helpers ───────────────────────────────────
 
@@ -6522,12 +7055,17 @@ TI4EOF
   nt6_out="$(TMUX='' _notify_osc777 "MyTitle" "MyBody" 2>/dev/null)" || true
   _t_grep "NT6: title and body present"  "MyTitle.*MyBody"  printf '%s' "$nt6_out"
 
-  _section "NT7 — notify: zproj notify --help exits 0 with usage"
-  _t_grep "NT7: help shows usage"  "notify"  "$BASH" "$0" notify --help
+  _section "NT6b — notify: OSC 777 sanitizes delimiters in title/body"
+  local nt6b_out
+  nt6b_out="$(TMUX='' _notify_osc777 'a;b' $'c\nd' 2>/dev/null)" || true
+  _t_grep "NT6b: semicolons escaped in payload"  "777;notify;a:b;c d"  printf '%s' "$nt6b_out"
 
-  _section "NT8 — notify: zproj notify outside tmux exits silently"
+  _section "NT7 — notify: SCRIPT_NAME notify --help exits 0 with usage"
+  _t_grep "NT7: help shows usage"  "notify"  "$BASH" "$_ZPROJ_SELF" notify --help
+
+  _section "NT8 — notify: SCRIPT_NAME notify outside tmux exits silently"
   local nt8_out
-  nt8_out="$(TMUX='' "$BASH" "$0" notify 2>&1)" || true
+  nt8_out="$(TMUX='' "$BASH" "$_ZPROJ_SELF" notify 2>&1)" || true
   _t_check "NT8: silent exit outside tmux"  test -z "$nt8_out"
 
   _section "NT9 — notify hooks: fresh install"
@@ -6536,20 +7074,24 @@ TI4EOF
   nt9_conf="${nt9_home}/.tmux.conf"
   ( HOME="$nt9_home" _integrate_install_notify_hooks false &>/dev/null )
   _t_check "NT9: config file created"      test -f "$nt9_conf"
-  _t_grep  "NT9: has zproj notification"   "zproj notification"        cat "$nt9_conf"
-  _t_grep  "NT9: has alert-bell hook"      "alert-bell.*zproj notify"  cat "$nt9_conf"
+  _t_grep  "NT9: has SCRIPT_NAME notification"   "${SCRIPT_NAME} notification"        cat "$nt9_conf"
+  _t_grep  "NT9: has alert-bell hook"      "alert-bell.*${SCRIPT_NAME} notify"  cat "$nt9_conf"
   _t_grep  "NT9: has monitor-silence"      "monitor-silence"           cat "$nt9_conf"
   rm -rf "$nt9_home" || true
 
   _section "NT10 — notify hooks: idempotent"
-  local nt10_home nt10_conf nt10_before nt10_after
+  local nt10_home nt10_conf nt10_nh nt10_nh2 nt10_mk
   nt10_home="$(mktemp -d)"
   nt10_conf="${nt10_home}/.tmux.conf"
   ( HOME="$nt10_home" _integrate_install_notify_hooks false &>/dev/null )
-  nt10_before="$(wc -l < "$nt10_conf")"
+  local nt10_nh
+  nt10_nh="$(grep -cE '^set-hook .*alert-bell' "$nt10_conf" 2>/dev/null || true)"
+  _t_check "NT10: first install one alert-bell" test "$nt10_nh" -eq 1
   ( HOME="$nt10_home" _integrate_install_notify_hooks false &>/dev/null )
-  nt10_after="$(wc -l < "$nt10_conf")"
-  _t_check "NT10: line count unchanged" test "$nt10_before" -eq "$nt10_after"
+  nt10_nh2="$(grep -cE '^set-hook .*alert-bell' "$nt10_conf" 2>/dev/null || true)"
+  nt10_mk="$(grep -cFx "# ${SCRIPT_NAME} notification" "$nt10_conf" 2>/dev/null || true)"
+  _t_check "NT10: alert-bell hook stays single" test "$nt10_nh2" -eq 1
+  _t_check "NT10: notification marker not duplicated" test "$nt10_mk" -eq 1
   rm -rf "$nt10_home" || true
 
   _section "NT11 — notify hooks: dry-run writes nothing"
@@ -6568,7 +7110,7 @@ TI4EOF
   printf 'set -g mouse on\n' > "$nt12_conf"
   ( HOME="$nt12_home" _integrate_install_notify_hooks false &>/dev/null )
   _t_grep "NT12: original content preserved"  "set -g mouse on"           cat "$nt12_conf"
-  _t_grep "NT12: hooks added"                 "alert-bell.*zproj notify"  cat "$nt12_conf"
+  _t_grep "NT12: hooks added"                 "alert-bell.*${SCRIPT_NAME} notify"  cat "$nt12_conf"
   rm -rf "$nt12_home" || true
 
   _section "NT13 — agent config: dry-run writes nothing"
@@ -6589,7 +7131,7 @@ TI4EOF
   ( HOME="$nt14_home" PATH="$nt14_home/bin:$PATH" _integrate_configure_agents false &>/dev/null )
   _t_check "NT14: aider config created"         test -f "$nt14_home/.aider.conf.yml"
   _t_grep  "NT14: has notifications setting"    "notifications: true"   cat "$nt14_home/.aider.conf.yml"
-  _t_grep  "NT14: has marker comment"           "zproj notification"    cat "$nt14_home/.aider.conf.yml"
+  _t_grep  "NT14: has marker comment"           "${SCRIPT_NAME} notification"    cat "$nt14_home/.aider.conf.yml"
   rm -rf "$nt14_home" || true
 
   _section "NT15 — agent config: aider idempotent"
@@ -6605,14 +7147,14 @@ TI4EOF
 
   _section "NT16 — integrate --plan: includes notification section"
   local nt16_out
-  nt16_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" integrate --plan 2>&1)"
+  nt16_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" integrate --plan 2>&1)"
   _t_grep "NT16: plan mentions notification hooks"  "notification hooks"  echo "$nt16_out"
   _t_grep "NT16: plan mentions agent config"        "agent notification"  echo "$nt16_out"
 
   _section "NT17 — integrate --plan: I-section not regressed"
   local nt17_out
-  nt17_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" integrate --plan 2>&1)"
-  _t_grep "NT17: editor prompt still present"  "zproj Editor Integration"  echo "$nt17_out"
+  nt17_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" integrate --plan 2>&1)"
+  _t_grep "NT17: editor prompt still present"  "${SCRIPT_NAME} Editor Integration"  echo "$nt17_out"
 
   _section "NT18 — agent config: marker present in created configs"
   local nt18_home
@@ -6620,7 +7162,7 @@ TI4EOF
   mkdir -p "$nt18_home/bin"
   printf '#!/bin/sh\n' > "$nt18_home/bin/aider" && chmod +x "$nt18_home/bin/aider"
   ( HOME="$nt18_home" PATH="$nt18_home/bin:$PATH" _integrate_configure_agents false &>/dev/null )
-  _t_grep "NT18: aider config has marker"  "zproj notification"  cat "$nt18_home/.aider.conf.yml"
+  _t_grep "NT18: aider config has marker"  "${SCRIPT_NAME} notification"  cat "$nt18_home/.aider.conf.yml"
   rm -rf "$nt18_home" || true
 
   _section "NT19 — agent config: claude already-configured detected"
@@ -6632,10 +7174,13 @@ TI4EOF
     > "$nt19_home/.claude/settings.json"
   local nt19_out
   nt19_out="$(HOME="$nt19_home" PATH="$nt19_home/bin:$PATH" _integrate_configure_agents true 2>/dev/null)"
-  _t_check "NT19: already configured — no [would configure]" \
-    bash -c '[[ "'"$nt19_out"'" != *"[would configure]"* ]]'
-  _t_grep  "NT19: already configured — shows [already configured]" \
-    "already configured" bash -c 'echo "'"$nt19_out"'"'
+  # Scope assertions to the claude line — other agents (codex/aider/etc.) may be
+  # installed on the developer's machine and would print their own `[would
+  # configure]` lines under this fresh fake HOME.
+  _t_check "NT19: claude line does not say [would configure]" \
+    bash -c 'grep "claude" <<<"$1" | grep -qv "\[would configure\]"' -- "$nt19_out"
+  _t_grep  "NT19: claude line shows [already configured]" \
+    "already configured.*claude" echo "$nt19_out"
    rm -rf "$nt19_home" || true
 
   _section "NT20 — diagnostics: editor ':' shows warning not checkmark"
@@ -6646,7 +7191,7 @@ TI4EOF
 
   _section "NT21 — integrate --plan: includes tmux reload reminder"
   local nt21_out
-  nt21_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" integrate --plan 2>&1)" || true
+  nt21_out="$(ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" integrate --plan 2>&1)" || true
   _t_grep "NT21: dry-run has reload reminder"  "source-file"  echo "$nt21_out"
 
   _section "NT22 — agent config: opencode global plugin detected"
@@ -6679,22 +7224,22 @@ TI4EOF
     "[Nn]otification pipeline"  echo "$nt24_out"
 
   _section "NT25 — diagnostics: alert-bell hook shown when server running"
-  if ! command -v tmux &>/dev/null || ! tmux list-sessions &>/dev/null; then
+  if ! command -v tmux &>/dev/null || ! _tmux list-sessions &>/dev/null; then
     _t_skip "NT25 (no tmux server)"
   else
-    tmux source-file "$(_tmux_config_path)" 2>/dev/null || true
+    _tmux source-file "$(_tmux_config_path)" 2>/dev/null || true
     local nt25_out
     nt25_out="$(_zproj --diagnostics 2>&1)" || true
     _t_grep "NT25: alert-bell hook shown"  "alert-bell"  echo "$nt25_out"
   fi
 
   _section "NT26 — diagnostics: allow-passthrough shown when server running"
-  if ! command -v tmux &>/dev/null || ! tmux list-sessions &>/dev/null; then
+  if ! command -v tmux &>/dev/null || ! _tmux list-sessions &>/dev/null; then
     _t_skip "NT26 (no tmux server)"
-  elif ! _version_gte "$(tmux -V 2>/dev/null | awk '{print $2}')" "3.2"; then
+  elif ! _version_gte "$(_tmux -V 2>/dev/null | awk '{print $2}')" "3.2"; then
     _t_skip "NT26 (tmux < 3.2)"
   else
-    tmux set -g allow-passthrough all 2>/dev/null || true
+    _tmux set -g allow-passthrough all 2>/dev/null || true
     local nt26_out
     nt26_out="$(_zproj --diagnostics 2>&1)" || true
     _t_grep "NT26: allow-passthrough shown"  "allow-passthrough"  echo "$nt26_out"
@@ -6717,7 +7262,7 @@ TI4EOF
     local nt29_home nt29_socket
     nt29_home="$(mktemp -d)"
     # Write tmux config with hooks (matching the grep pattern)
-    printf '# zproj notification\nset-hook -ga alert-bell run-shell "zproj notify"\n' \
+    printf '# '"${SCRIPT_NAME}"' notification\nset-hook -ga alert-bell run-shell "'"${SCRIPT_NAME}"' notify"\n' \
       > "$nt29_home/.tmux.conf"
     # Start isolated tmux server with NO hooks (empty config: /dev/null)
     tmux -L nt29test -f /dev/null new-session -d -s nt29 2>/dev/null || true
@@ -6727,13 +7272,93 @@ TI4EOF
     else
       local nt29_out nt29_pid
       nt29_pid="$(tmux -L nt29test display-message -p '#{pid}' 2>/dev/null)" || nt29_pid="0"
+      # Child must not use the self-test tmux socket; rely on TMUX=… (nt29test) for
+      # server-side checks, while HOME supplies a config file that claims hooks.
       nt29_out="$(HOME="$nt29_home" TMUX="${nt29_socket},${nt29_pid},0" \
-        ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$0" integrate --plan 2>&1)" || true
+        ZPROJ_TEST_NO_ATTACH=1 ZPROJ_TEST_TMUX_SOCKET= "$BASH" "$_ZPROJ_SELF" integrate --plan 2>&1)" || true
       _t_grep "NT29: divergence warning shown"  "config but not loaded"  \
         echo "$nt29_out"
       tmux -L nt29test kill-server 2>/dev/null || true
     fi
     rm -rf "$nt29_home" || true
+  fi
+
+  _section "NT32 — notify hooks: migrate -ga to -g when notifier present"
+  local nt32_home nt32_conf
+  nt32_home="$(mktemp -d)"
+  nt32_conf="${nt32_home}/.tmux.conf"
+  printf 'set-hook -ga alert-bell "noop %s notify noop"\n' "${SCRIPT_NAME}" > "$nt32_conf"
+  ( HOME="$nt32_home" _integrate_install_notify_hooks false &>/dev/null )
+  _t_grep "NT32: alert-bell uses set-hook -g" "set-hook -g alert-bell" cat "$nt32_conf"
+  if grep -qE 'set-hook -ga alert-(bell|silence).*'"${SCRIPT_NAME}"' notify' "$nt32_conf"; then
+    _t_fail "NT32: -ga notifier lines remain"
+  else
+    _t_pass "NT32: no -ga lines for ${SCRIPT_NAME} notify"
+  fi
+  rm -rf "$nt32_home" || true
+
+  # ── Section: Lima sandbox ───────────────────────────────────────────────────
+
+  _section "LM1 — --sandbox integrate is rejected in v1"
+  local lm1_out
+  lm1_out="$(cd "$tmp" && "$BASH" "$_ZPROJ_SELF" --sandbox integrate 2>&1)" || true
+  _t_grep "LM1 mentions not supported" "not supported" echo "$lm1_out"
+
+  _section "LM2 — --sandbox fails when Lima is explicitly disabled"
+  rm -rf "$tmp/lm2"
+  _zproj init lm2 &>/dev/null
+  local lm2_ec
+  lm2_ec="$(cd "$tmp/lm2" && ZPROJ_DISABLE_LIMA=1 \
+    "$BASH" "$_ZPROJ_SELF" --sandbox --plan launch main &>/dev/null; echo $?)"
+  _t_check "LM2: non-zero exit" test "$lm2_ec" -ne 0
+
+  _section "LM3 — fake limactl: --sandbox --plan launch prints instance name"
+  mkdir -p "$tmp/lmf/bin"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$tmp/lmf/bin/limactl"
+  chmod +x "$tmp/lmf/bin/limactl"
+  rm -rf "$tmp/lm3"
+  _zproj init lm3 &>/dev/null
+  local lm3_out
+  lm3_out="$(cd "$tmp/lm3" && PATH="$tmp/lmf/bin${PATH:+:}$PATH" \
+    "$BASH" "$_ZPROJ_SELF" --sandbox --plan launch main 2>&1)" || true
+  _t_check "LM3 mentions zp-" test "${lm3_out//zp-/}" != "$lm3_out"
+
+  _section "LM4 — live limactl: list succeeds when installed"
+  if [[ -n "${ZPROJ_DISABLE_LIMA:-}" ]]; then
+    _t_skip "LM4 (ZPROJ_DISABLE_LIMA set)"
+  elif ! command -v limactl &>/dev/null; then
+    _t_skip "LM4 (limactl not in PATH)"
+  else
+    _t_check "LM4: limactl list succeeds" limactl list
+  fi
+
+  _section "LM5 — live Lima: VM lifecycle + guest mount (slow; opt-in)"
+  if [[ "${ZPROJ_TEST_LIMA_VM:-}" != "1" ]]; then
+    _t_skip "LM5 (set ZPROJ_TEST_LIMA_VM=1 to create/start/delete a real instance)"
+  elif [[ -n "${ZPROJ_DISABLE_LIMA:-}" ]]; then
+    _t_skip "LM5 (ZPROJ_DISABLE_LIMA set)"
+  elif ! command -v limactl &>/dev/null; then
+    _t_skip "LM5 (limactl not in PATH)"
+  else
+    rm -rf "$tmp/lm5"
+    _zproj init lm5 &>/dev/null
+    if (
+      set -euo pipefail
+      lm5_parent="$(cd "$tmp/lm5" && pwd)"
+      lm5_inst="$(_lima_instance_name "$lm5_parent")"
+      lm5_yaml="$(_lima_yaml_for_instance "$lm5_parent" "$lm5_inst")"
+      mkdir -p "$(dirname "$lm5_yaml")"
+      _lima_write_template_file "$lm5_parent" "$lm5_yaml"
+      lm5_lc="$(_limactl_bin)"
+      lm5_cleanup() { "$lm5_lc" delete -f "$lm5_inst" 2>/dev/null || true; }
+      trap lm5_cleanup EXIT
+      _sandbox_ensure_limactl_vm "$lm5_inst" "$lm5_yaml"
+      "$lm5_lc" shell "$lm5_inst" -- test -d "${ZPROJ_LIMA_MOUNT}/main"
+    ); then
+      _t_pass "LM5: guest sees ${ZPROJ_LIMA_MOUNT}/main"
+    else
+      _t_fail "LM5: guest sees ${ZPROJ_LIMA_MOUNT}/main"
+    fi
   fi
 
   # ── Summary ──────────────────────────────────────────────────────────────
@@ -6754,6 +7379,11 @@ TI4EOF
 # ─── Main dispatch ────────────────────────────────────────────────────────────
 
 main() {
+  if [[ "${ZPROJ_SANDBOX:-0}" == "1" && "${1:-}" == "integrate" ]]; then
+    die "${SCRIPT_NAME} --sandbox integrate is not supported in v1.\n\
+  Use: ${CYAN}${SCRIPT_NAME} integrate${RESET} or ${CYAN}${SCRIPT_NAME} integrate --plan${RESET}"
+  fi
+
   case "${1:-}" in
   "") cmd_open ;;
   -h | --help)
@@ -6829,4 +7459,7 @@ main() {
   esac
 }
 
-main "$@"
+_zproj_argv_peel "$@"
+# Bash 3.2 + set -u: quoted "${arr[@]}" errors when arr is empty — use ${arr[@]+"${arr[@]}"}
+main ${_ZPROJ_ARGV_TAIL[@]+"${_ZPROJ_ARGV_TAIL[@]}"}
+
