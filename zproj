@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.18.0"
+readonly VERSION="4.18.1"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -93,10 +93,119 @@ _hint_next_steps() {
 # for sessions *and* windows (kill-window, new-window, select-*, attach, etc.).
 _tmux() {
   if [[ -n "${ZPROJ_TEST_TMUX_SOCKET:-}" ]]; then
+    case "${1:-}" in
+    kill-session | kill-window)
+      [[ -n "${3:-}" ]] && _test_kill_pane_processes_for_target "$3"
+      ;;
+    kill-server)
+      _test_kill_all_pane_processes
+      ;;
+    esac
     command tmux -L "$ZPROJ_TEST_TMUX_SOCKET" "$@"
   else
     command tmux "$@"
   fi
+}
+
+# Self-test only: kill $1 and all descendants (deepest first).
+_test_kill_process_tree() {
+  local pid="${1:-}"
+  local child
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  [[ "$pid" -le 1 ]] && return 0
+  while IFS= read -r child; do
+    [[ -n "$child" ]] && _test_kill_process_tree "$child"
+  done < <(pgrep -P "$pid" 2>/dev/null || true)
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+# Self-test only: kill pane processes for a tmux target before kill-session/window.
+_test_kill_pane_processes_for_target() {
+  local target="$1"
+  local socket="${ZPROJ_TEST_TMUX_SOCKET:-}"
+  local pane_pid
+  [[ -n "$socket" && -n "$target" ]] || return 0
+  while IFS= read -r pane_pid; do
+    [[ "$pane_pid" =~ ^[0-9]+$ ]] || continue
+    _test_kill_process_tree "$pane_pid"
+  done < <(command tmux -L "$socket" list-panes -t "$target" -F '#{pane_pid}' 2>/dev/null | sort -u)
+}
+
+# Self-test only: kill all pane processes on the isolated test tmux server.
+_test_kill_all_pane_processes() {
+  local socket="${ZPROJ_TEST_TMUX_SOCKET:-}"
+  local pane_pid
+  [[ -n "$socket" ]] || return 0
+  while IFS= read -r pane_pid; do
+    [[ "$pane_pid" =~ ^[0-9]+$ ]] || continue
+    _test_kill_process_tree "$pane_pid"
+  done < <(command tmux -L "$socket" list-panes -a -F '#{pane_pid}' 2>/dev/null | sort -u)
+}
+
+# Self-test only: return count of nvim processes whose cwd is under $1.
+_test_count_nvim_under() {
+  local dir="$1"
+  local count=0
+  local pid cwd
+  [[ -n "$dir" ]] || { echo 0; return 0; }
+  for pid in $(pgrep -x nvim 2>/dev/null || true); do
+    cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)" || cwd=""
+    [[ -n "$cwd" && "$cwd" == "$dir"* ]] && ((count++)) || true
+  done
+  echo "$count"
+}
+
+# Self-test only: reap nvim/nvim --embed left behind by tmux pane teardown.
+# Matches cwd under ZPROJ_TEST_TMPDIR and stale ZPROJ_TEST_TMUX_SOCKET env.
+# Called only from _test_teardown (not after each kill-session): a tmpdir-wide
+# sweep would kill nvim still running in other live panes on the same server.
+_test_sweep_nvim_orphans() {
+  local tmpdir="${ZPROJ_TEST_TMPDIR:-}"
+  local socket="${ZPROJ_TEST_TMUX_SOCKET:-}"
+  local pid cwd match
+
+  for pid in $(pgrep -x nvim 2>/dev/null || true); do
+    match=0
+    if [[ -n "$tmpdir" && -d "$tmpdir" ]]; then
+      cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)" || cwd=""
+      [[ -n "$cwd" && "$cwd" == "$tmpdir"* ]] && match=1
+    fi
+    if [[ $match -eq 0 && -n "$socket" ]] &&
+       ps eww -p "$pid" 2>/dev/null | grep -Fq "ZPROJ_TEST_TMUX_SOCKET=${socket}"; then
+      match=1
+    fi
+    [[ $match -eq 1 ]] && _test_kill_process_tree "$pid"
+  done
+
+  # nvim --embed often ignores TERM once orphaned; force-kill survivors.
+  sleep 0.1
+  for pid in $(pgrep -x nvim 2>/dev/null || true); do
+    match=0
+    if [[ -n "$tmpdir" && -d "$tmpdir" ]]; then
+      cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)" || cwd=""
+      [[ -n "$cwd" && "$cwd" == "$tmpdir"* ]] && match=1
+    fi
+    if [[ $match -eq 0 && -n "$socket" ]] &&
+       ps eww -p "$pid" 2>/dev/null | grep -Fq "ZPROJ_TEST_TMUX_SOCKET=${socket}"; then
+      match=1
+    fi
+    [[ $match -eq 1 ]] && kill -9 "$pid" 2>/dev/null || true
+  done
+}
+
+# Self-test EXIT trap: kill pane trees, tear down isolated tmux, sweep nvim, rm tmp.
+_test_teardown() {
+  local tmpdir="${1:-}"
+  local socket="${2:-}"
+  _test_kill_all_pane_processes
+  if [[ -n "$socket" ]]; then
+    command tmux -L "$socket" kill-server 2>/dev/null || true
+  fi
+  _test_sweep_nvim_orphans
+  if [[ -n "$tmpdir" && -d "$tmpdir" ]]; then
+    rm -rf -- "$tmpdir"
+  fi
+  unset ZPROJ_TEST_TMPDIR ZPROJ_TEST_TMUX_SOCKET
 }
 
 # Switch to or attach a tmux session, respecting ZPROJ_TEST_NO_ATTACH.
@@ -4646,17 +4755,20 @@ cmd_test() {
   # cmd_delete's kill-window) from the developer's live tmux.
   ZPROJ_TEST_TMUX_SOCKET="zproj-selftest-$$-${RANDOM}"
   export ZPROJ_TEST_TMUX_SOCKET
+  ZPROJ_TEST_TMPDIR="$tmp"
+  export ZPROJ_TEST_TMPDIR
   _tmux new-session -d -s zproj-selftest-boot -n _b_ -c / -x 80 -y 24 2>/dev/null || true
   # So plain `bash -c '_tmux …'` in assertions can reach the same isolated server.
   # bash always supports `export -f`; if this ever fails we want the test run to
   # abort loudly rather than silently lose isolation between subshells.
-  export -f _tmux
+  export -f _tmux _test_kill_pane_processes_for_target _test_kill_all_pane_processes
+  export -f _test_kill_process_tree _test_sweep_nvim_orphans _test_count_nvim_under
 
-  # Clean up temp dir and our dedicated tmux server when the test run exits.
-  # Double-quotes expand $tmp now (definition time). The inner single-quotes
+  # Clean up temp dir, pane processes, and orphaned nvim --embed on exit.
+  # Double-quotes expand $tmp / socket now (definition time). The inner single-quotes
   # protect the already-expanded path from word-splitting when the trap fires.
   # shellcheck disable=SC2064
-  trap "command tmux -L \"${ZPROJ_TEST_TMUX_SOCKET}\" kill-server 2>/dev/null || true; rm -rf -- '$tmp'" EXIT
+  trap "_test_teardown '$tmp' '${ZPROJ_TEST_TMUX_SOCKET}'" EXIT
 
   local passed=0 failed=0 skipped=0
 
@@ -5738,6 +5850,25 @@ NOTES
   (cd "$lt_root" && "$BASH" "$_ZPROJ_SELF" delete wt-present 2>/dev/null) || true
   # Prune the ghost worktree from git's registry
   git -C "$lt_root" worktree prune 2>/dev/null || true
+
+  _section "T13 — self-test: launch does not orphan nvim under temp dir"
+  if ! command -v nvim &>/dev/null; then
+    _t_skip "T13 (nvim not in PATH)"
+  else
+    local t13_root="$tmp/t13"
+    rm -rf "$t13_root" || true
+    ( cd "$tmp" && "$BASH" "$_ZPROJ_SELF" init t13 &>/dev/null ) || true
+    local t13_session
+    t13_session="$(basename "$t13_root")"
+    _tmux kill-session -t "$t13_session" 2>/dev/null || true
+    ( cd "$t13_root" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" launch main &>/dev/null ) || true
+    sleep 0.5
+    _tmux kill-session -t "$t13_session" 2>/dev/null || true
+    _test_sweep_nvim_orphans
+    local t13_nvim_count
+    t13_nvim_count="$(_test_count_nvim_under "$t13_root")"
+    _t_check "T13: no nvim orphaned under launch worktree" test "$t13_nvim_count" -eq 0
+  fi
 
   fi  # end: command -v tmux
 
