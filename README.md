@@ -168,7 +168,9 @@ zproj --diagnostics  # check the full environment for problems
 `zproj menu [dir]` opens a terminal menu that checks where you are:
 outside zproj, at a project root, or inside a worktree. It shows current
 status, suggests useful next steps, and displays the exact command before
-asking whether to run it.
+asking whether to run it. On the default worktree, the menu omits current
+worktree join/delete actions and steers you toward creating or forking a
+separate worktree.
 
 ```bash
 zproj menu                 # menu for current directory
@@ -354,7 +356,7 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-437 tests pass in the default suite. Some checks are skipped when optional
+451 tests pass in the default suite. Some checks are skipped when optional
 tools or agent binaries are absent; the one slow Lima VM test (`LM5`) is
 skipped unless you set `ZPROJ_TEST_LIMA_VM=1` and have `limactl` installed.
 Coverage includes init, clone, upgrade, worktree management, fork/update/join,

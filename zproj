@@ -440,7 +440,7 @@ _tmux_session_name() { tr '.:'  '--' <<< "$1"; }
 # titles after zproj names panes for dispatch targeting.
 _tmux_lock_pane_titles() {
   local target="$1"
-  _tmux set-option -t "$target" allow-set-title off 2>/dev/null || true
+  _tmux set-window-option -t "$target" allow-set-title off 2>/dev/null || true
 }
 
 # Return the path to the user's tmux config file.
@@ -2087,6 +2087,7 @@ cmd_update() {
 
 cmd_join() {
   local source="" target=""
+  local source_from_cwd=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2116,6 +2117,7 @@ cmd_join() {
   if [[ -z "$target" ]]; then
     target="$source"
     source=""
+    source_from_cwd=true
   fi
 
   check_session_deps
@@ -2149,6 +2151,9 @@ cmd_join() {
   _warn_branch_mismatch "$source_dir"
 
   # Resolve target worktree
+  if $source_from_cwd && [[ "$target" != /* ]]; then
+    target="$parent_dir/$target"
+  fi
   resolve_project_dir "$target"
   local target_dir="$PROJECT_DIR"
   local target_name="$WORKTREE_NAME"
@@ -2203,7 +2208,7 @@ cmd_join() {
     echo -e "  ${DIM}Commit or stash changes, then run: ${CYAN}$SCRIPT_NAME delete $source_name${RESET}"
   else
     echo -e "  Cleaning up source worktree..."
-    cmd_delete "$source_name" --force
+    cmd_delete "$source_dir" --force
   fi
 
   # Switch to target window
@@ -2469,13 +2474,13 @@ cmd_launch() {
 
   # Session exists?
   if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-    _tmux_lock_pane_titles "$SESSION_NAME"
-
     # Window already exists in this session?
     if _tmux list-windows -t "$SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -qx "$WINDOW_NAME"; then
+      _tmux_lock_pane_titles "$SESSION_NAME:$WINDOW_NAME"
       info "Switching to ${BOLD}${SESSION_NAME}:${WINDOW_NAME}${RESET}"
     else
       _tmux new-window -t "$SESSION_NAME:" -n "$WINDOW_NAME" -c "$PROJECT_DIR"
+      _tmux_lock_pane_titles "$SESSION_NAME:$WINDOW_NAME"
       _setup_panes
       info "Created window ${BOLD}${SESSION_NAME}:${WINDOW_NAME}${RESET}"
     fi
@@ -2483,7 +2488,7 @@ cmd_launch() {
   else
     # Create new session with this worktree as first window
     _tmux new-session -d -s "$SESSION_NAME" -n "$WINDOW_NAME" -c "$PROJECT_DIR" -x 220 -y 50
-    _tmux_lock_pane_titles "$SESSION_NAME"
+    _tmux_lock_pane_titles "$SESSION_NAME:$WINDOW_NAME"
     _setup_panes
     info "Started session ${BOLD}${SESSION_NAME}${RESET} with window ${BOLD}${WINDOW_NAME}${RESET}"
   fi
@@ -2845,6 +2850,15 @@ _menu_new_worktree_arg() {
   fi
 }
 
+_menu_existing_worktree_arg() {
+  local name="$1"
+  if [[ "$name" = /* || "$name" == */* ]]; then
+    echo "$name"
+  else
+    echo "$MENU_ROOT/$name"
+  fi
+}
+
 _menu_print_context() {
   echo ""
   echo -e "${BOLD}${SCRIPT_NAME} menu${RESET}"
@@ -2893,7 +2907,9 @@ _menu_print_suggestion() {
     elif [[ -n "$MENU_SOURCE" ]]; then
       echo -e "  Pull latest source changes with ${CYAN}${SCRIPT_NAME} update${RESET} before continuing work."
     elif [[ -n "$MENU_DEFAULT_BRANCH" && "$MENU_BRANCH" != "$MENU_DEFAULT_BRANCH" && "$MENU_BRANCH" != "HEAD" ]]; then
-      echo -e "  When this worktree is ready, merge it back with ${CYAN}${SCRIPT_NAME} join ${MENU_DEFAULT_BRANCH}${RESET}."
+      local target_arg
+      target_arg="$(_menu_existing_worktree_arg "$MENU_DEFAULT_BRANCH")"
+      echo -e "  When this worktree is ready, merge it back with ${CYAN}$(_menu_cmd "$SCRIPT_NAME" join "$MENU_WORKTREE_DIR" "$target_arg")${RESET}."
     else
       echo -e "  You are on the default path. Create or fork a worktree for isolated feature work."
     fi
@@ -2960,6 +2976,10 @@ _menu_build_items() {
     _menu_add_common_items
     ;;
   worktree)
+    local non_default_worktree=false
+    if [[ -n "$MENU_DEFAULT_BRANCH" && "$MENU_BRANCH" != "$MENU_DEFAULT_BRANCH" && "$MENU_BRANCH" != "HEAD" ]]; then
+      non_default_worktree=true
+    fi
     if [[ "$MENU_DIRTY" == "dirty" ]]; then
       _menu_add_item "Show git status" \
         "Inspect the current worktree before running zproj operations that merge or remove it." \
@@ -2974,24 +2994,26 @@ _menu_build_items() {
       "Show branch, dirty status, and tmux window state for every worktree." \
       "$SCRIPT_NAME list" \
       "list"
-    if [[ -n "$MENU_DEFAULT_BRANCH" && "$MENU_BRANCH" != "$MENU_DEFAULT_BRANCH" && "$MENU_BRANCH" != "HEAD" ]]; then
+    if $non_default_worktree; then
       _menu_add_item "Update this worktree" \
         "Merge the recorded or auto-detected fork source into the current worktree." \
         "$SCRIPT_NAME update" \
         "update_current"
       _menu_add_item "Join current worktree into ${MENU_DEFAULT_BRANCH}" \
         "Merge this branch into ${MENU_DEFAULT_BRANCH}; on success zproj removes this worktree." \
-        "$SCRIPT_NAME join ${MENU_DEFAULT_BRANCH}" \
+        "$(_menu_cmd "$SCRIPT_NAME" join "$MENU_WORKTREE_DIR" "$(_menu_existing_worktree_arg "$MENU_DEFAULT_BRANCH")")" \
         "join_default"
     fi
     _menu_add_item "Fork current worktree" \
       "Create a new worktree at this commit and record this branch as its source." \
       "$SCRIPT_NAME fork <new-worktree>" \
       "fork_prompt"
-    _menu_add_item "Join current worktree into another" \
-      "Merge this worktree into a target you choose." \
-      "$SCRIPT_NAME join <target-worktree>" \
-      "join_prompt"
+    if $non_default_worktree; then
+      _menu_add_item "Join current worktree into another" \
+        "Merge this worktree into a target you choose." \
+        "$(_menu_cmd "$SCRIPT_NAME" join "$MENU_WORKTREE_DIR" "<target-worktree>")" \
+        "join_prompt"
+    fi
     if [[ "$MENU_REVIEW_COUNT" -gt 0 ]]; then
       _menu_add_item "View review notes" \
         "Print accumulated review notes for this worktree." \
@@ -3010,10 +3032,12 @@ _menu_build_items() {
       "Print the exact notes file path used by editor integrations." \
       "$SCRIPT_NAME review path --abs" \
       "review_path"
-    _menu_add_item "Delete current worktree" \
-      "Remove this worktree, its branch, and its tmux window; normal safety checks still apply." \
-      "$(_menu_cmd "$SCRIPT_NAME" delete "$MENU_WORKTREE_DIR")" \
-      "delete_current"
+    if $non_default_worktree; then
+      _menu_add_item "Delete current worktree" \
+        "Remove this worktree, its branch, and its tmux window; normal safety checks still apply." \
+        "$(_menu_cmd "$SCRIPT_NAME" delete "$MENU_WORKTREE_DIR")" \
+        "delete_current"
+    fi
     _menu_add_common_items
     ;;
   esac
@@ -3069,13 +3093,14 @@ _menu_run_action() {
     ;;
   join_default)
     _menu_confirm_command "$label" "$cmd" "$desc" || return 0
-    cmd_join "$MENU_DEFAULT_BRANCH" || rc=$?
+    cmd_join "$MENU_WORKTREE_DIR" "$(_menu_existing_worktree_arg "$MENU_DEFAULT_BRANCH")" || rc=$?
     ;;
   join_prompt)
     _menu_prompt_required "Target worktree: " target || return 0
-    exact="$(_menu_cmd "$SCRIPT_NAME" join "$target")"
+    target="$(_menu_existing_worktree_arg "$target")"
+    exact="$(_menu_cmd "$SCRIPT_NAME" join "$MENU_WORKTREE_DIR" "$target")"
     _menu_confirm_command "$label" "$exact" "$desc" || return 0
-    cmd_join "$target" || rc=$?
+    cmd_join "$MENU_WORKTREE_DIR" "$target" || rc=$?
     ;;
   delete_current)
     _menu_confirm_command "$label" "$cmd" "$desc" || return 0
@@ -3193,7 +3218,7 @@ cmd_menu() {
       _menu_pause
       ;;
     *)
-      idx=$((choice - 1))
+      idx=$((10#$choice - 1))
       if [[ "$idx" -lt 0 || "$idx" -ge "${#_MENU_LABELS[@]}" ]]; then
         warn "No menu item $choice."
         _menu_pause
@@ -5223,7 +5248,7 @@ cmd_integrate() {
 
   step "Launching ${CYAN}${ai_binary}${RESET}..."
   _tmux new-session -d -s "$session" -n "$window" -c "$HOME" -x 220 -y 50
-  _tmux_lock_pane_titles "$session"
+  _tmux_lock_pane_titles "${session}:${window}"
 
   # Capture the pane ID at creation time — avoids pane-base-index dependency
   local pane_target
@@ -6189,6 +6214,44 @@ NOTES
   _t_grep "M6: suggests git status" "git status --short --branch" echo "$m6_out"
   rm -f "$tmp/mroot/main/untracked-menu-test"
 
+  _section "M7 — menu treats zero-padded choices as decimal"
+  local m7_out m7_exit=0
+  m7_out="$(printf '08\nq\n' | (cd "$tmp/mroot/main" && "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || m7_exit=$?
+  _t_check "M7: exits 0 after invalid zero-padded choice" test "$m7_exit" -eq 0
+  _t_grep "M7: reports missing item 08" "No menu item 08" echo "$m7_out"
+  _t_check "M7: does not hit octal arithmetic error" \
+    bash -c '[[ "$1" != *"value too great for base"* ]]' -- "$m7_out"
+
+  _section "M8 — menu hides destructive current-worktree actions on default"
+  local m8_out
+  m8_out="$(printf 'q\n' | (cd "$tmp/mroot/main" && "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || true
+  _t_check "M8: default menu hides join-into-another action" \
+    bash -c '[[ "$1" != *"Join current worktree into another"* ]]' -- "$m8_out"
+  _t_check "M8: default menu hides delete-current action" \
+    bash -c '[[ "$1" != *"Delete current worktree"* ]]' -- "$m8_out"
+
+  _section "M9 — menu can run an accepted action from a nested path argument"
+  mkdir -p "$tmp/mroot/main/src/menu" || true
+  local m9_out
+  m9_out="$(printf '4\ny\nq\n' | (cd "$tmp" && "$BASH" "$_ZPROJ_SELF" menu "$tmp/mroot/main/src/menu" 2>&1))" || true
+  _t_check "M9: accepted review path action uses worktree root" \
+    bash -c '[[ "$1" == *"$2"* ]]' -- "$m9_out" "$tmp/mroot/main/$REVIEW_NOTES_RELPATH"
+  _t_grep "M9: shows exact review path command" "${SCRIPT_NAME} review path --abs" echo "$m9_out"
+
+  _section "M10 — menu join action runs with explicit source and target"
+  if command -v tmux &>/dev/null; then
+    ( cd "$tmp/mroot/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork menu-join &>/dev/null ) || true
+    local m10_out m10_exit=0
+    m10_out="$(printf '4\ny\n' | (cd "$tmp/mroot/menu-join" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || m10_exit=$?
+    _t_check "M10: menu-driven join exits 0" test "$m10_exit" -eq 0
+    _t_grep "M10: confirmation shows two-argument join" "${SCRIPT_NAME} join .*/menu-join .*/main" echo "$m10_out"
+    _t_check "M10: joined source worktree removed" test ! -d "$tmp/mroot/menu-join"
+  else
+    _t_skip "M10: tmux not installed"
+    _t_skip "M10: (skipped)"
+    _t_skip "M10: (skipped)"
+  fi
+
   # ── Section: tmux (headless detached session) ────────────────────────────
   # T1–T8 require tmux >= 3.0 in PATH. Skip gracefully if absent.
 
@@ -6239,7 +6302,7 @@ NOTES
   local _ltp1 _ltp2 _ltp3
 
   _tmux new-session -d -s "$lt_session" -n "main" -c "$tmp" -x 220 -y 50
-  _tmux_lock_pane_titles "$lt_session"
+  _tmux_lock_pane_titles "$lt_session:main"
   _ltp1="$(_tmux list-panes -t "$lt_session:main" -F '#{pane_id}' | head -1)"
   _tmux send-keys   -t "$_ltp1" "$lt_agent_cmd" Enter
   _tmux select-pane -t "$_ltp1" -T "$t_agent_bin"
@@ -6259,6 +6322,18 @@ NOTES
   _t_grep  "T2: pane 1 named after agent ('${t_agent_bin}')"  "$t_agent_bin"  echo "$pane_titles"
   _t_grep  "T3: pane 2 named after editor ('${t_editor_bin}')" "$t_editor_bin" echo "$pane_titles"
   _t_grep  "T4: pane 3 named 'shell'"                         "^shell$"       echo "$pane_titles"
+
+  local lt_allow_title
+  lt_allow_title="$(_tmux show-options -w -v -t "$lt_session:main" allow-set-title 2>/dev/null)" || lt_allow_title=""
+  _t_check "T4b: first launch window blocks pane title overrides" \
+    test "$lt_allow_title" = "off"
+
+  _tmux new-window -t "$lt_session:" -n "later" -c "$tmp" 2>/dev/null || true
+  _tmux_lock_pane_titles "$lt_session:later"
+  local lt_later_allow_title
+  lt_later_allow_title="$(_tmux show-options -w -v -t "$lt_session:later" allow-set-title 2>/dev/null)" || lt_later_allow_title=""
+  _t_check "T4c: later launch window blocks pane title overrides" \
+    test "$lt_later_allow_title" = "off"
 
   _tmux kill-session -t "$lt_session" 2>/dev/null || true
 
@@ -7493,6 +7568,13 @@ NOTES
   _t_check "FJ7: exits 0"                     test "$fj7_exit" -eq 0
   _t_check "FJ7: main HEAD unchanged"         test "$fj7_before" = "$fj7_after"
   _t_check "FJ7: source deleted"               test ! -d "$fk_root/fj7-roundtrip"
+
+  _section "FJ7b — join: one-arg target resolves from source worktree"
+  ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork fj7-onearg &>/dev/null ) || true
+  local fj7b_exit
+  fj7b_exit="$( (cd "$fk_root/fj7-onearg" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" join main &>/dev/null); echo $? )"
+  _t_check "FJ7b: exits 0 from source worktree" test "$fj7b_exit" -eq 0
+  _t_check "FJ7b: source deleted"              test ! -d "$fk_root/fj7-onearg"
 
   _section "FJ8 — join: conflicting changes → aborts, saves prompt"
   ( cd "$fk_root/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork fj8-conflict &>/dev/null ) || true
