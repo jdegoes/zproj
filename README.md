@@ -19,6 +19,9 @@ branches, and windows are created and torn down together as a unit.
 A built-in review workflow lets you annotate lines during a diff review and
 dispatch the collected notes to your coding agent for implementation.
 
+Run `zproj menu` when you want a context-aware command picker instead of
+remembering subcommands.
+
 `zproj integrate` installs tmux keybindings for worktree management and asks
 your coding agent to wire up your editor with the review workflow.
 
@@ -83,6 +86,9 @@ zproj init .                 # upgrades in place (preserves history)
 
 # Done with a feature
 zproj delete feature-auth    # removes worktree, branch, and tmux window
+
+# Not sure what to run next?
+zproj menu                   # status-aware command menu with exact commands
 ```
 
 ## How it works
@@ -156,6 +162,26 @@ zproj --diagnostics  # check the full environment for problems
 |---------|---------|
 | `CODING_AGENT` | Override coding agent (e.g. `export CODING_AGENT=claude`) |
 | `ZPROJ_EDITOR` | Override editor (e.g. `export ZPROJ_EDITOR=nvim`) |
+
+## Interactive menu
+
+`zproj menu [dir]` opens a terminal menu that checks where you are:
+outside zproj, at a project root, or inside a worktree. It shows current
+status, suggests useful next steps, and displays the exact command before
+asking whether to run it.
+
+```bash
+zproj menu                 # menu for current directory
+zproj menu ~/repo/main     # menu for a specific project/worktree path
+```
+
+Optional fish shortcut:
+
+```fish
+function zp
+    zproj menu $argv
+end
+```
 
 ## Lima sandbox (optional)
 
@@ -311,6 +337,7 @@ zproj launch <worktree-dir>                 Start or switch to tmux window
 zproj --sandbox [--plan] launch <worktree-dir>
                                             Guest coding agent via Lima (project at /mnt/zproj)
 zproj list [dir]                            Show worktrees with status
+zproj menu [dir]                            Context-aware interactive command menu
 zproj review <subcommand>                   Manage review notes (path/view/dispatch/clear)
 zproj integrate [--plan]                    tmux bindings + editor integration
 zproj notify [session] [window] [pane]      Emit desktop notification (used by tmux hooks)
@@ -327,11 +354,12 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-438 tests pass by default; the one slow Lima VM test (`LM5`) is skipped unless
-you set `ZPROJ_TEST_LIMA_VM=1` and have `limactl` installed, in which case all
-439 run with none skipped. Coverage includes init, clone, upgrade, worktree
-management, fork/update/join, review workflow, tmux binding installation,
-diagnostics, integrate, notify, Lima sandbox flags, and tool detection.
+437 tests pass in the default suite. Some checks are skipped when optional
+tools or agent binaries are absent; the one slow Lima VM test (`LM5`) is
+skipped unless you set `ZPROJ_TEST_LIMA_VM=1` and have `limactl` installed.
+Coverage includes init, clone, upgrade, worktree management, fork/update/join,
+interactive menu, review workflow, tmux binding installation, diagnostics,
+integrate, notify, Lima sandbox flags, and tool detection.
 Requires tmux, git, and bash in `PATH`. The suite uses a dedicated tmux server
 socket (`ZPROJ_TEST_TMUX_SOCKET`) so it does not attach to or mutate your
 normal tmux sessions.

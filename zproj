@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.18.1"
+readonly VERSION="4.19.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -436,6 +436,13 @@ _plural() { [[ "${1:-0}" == "1" ]] && echo "" || echo "s"; }
 # Usage: session_name="$(_tmux_session_name "$dir")"
 _tmux_session_name() { tr '.:'  '--' <<< "$1"; }
 
+# Prevent shell prompt title escapes (common in fish) from overwriting pane
+# titles after zproj names panes for dispatch targeting.
+_tmux_lock_pane_titles() {
+  local target="$1"
+  _tmux set-option -t "$target" allow-set-title off 2>/dev/null || true
+}
+
 # Return the path to the user's tmux config file.
 # Prefers XDG location ($XDG_CONFIG_HOME/tmux/tmux.conf) if it exists,
 # otherwise falls back to ~/.tmux.conf.
@@ -448,7 +455,18 @@ _tmux_config_path() {
 # Return mtime of $1 as epoch seconds. Tries macOS stat first, falls back to GNU.
 _notify_stat_mtime() {
   local file="$1"
-  stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0
+  local out
+  out="$(stat -f %m "$file" 2>/dev/null)" || out=""
+  if [[ "$out" =~ ^[0-9]+$ ]]; then
+    echo "$out"
+    return
+  fi
+  out="$(stat -c %Y "$file" 2>/dev/null)" || out=""
+  if [[ "$out" =~ ^[0-9]+$ ]]; then
+    echo "$out"
+    return
+  fi
+  echo 0
 }
 
 # Debounce per pane: return 0 to proceed, 1 to suppress.
@@ -2451,6 +2469,7 @@ cmd_launch() {
 
   # Session exists?
   if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    _tmux_lock_pane_titles "$SESSION_NAME"
 
     # Window already exists in this session?
     if _tmux list-windows -t "$SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -qx "$WINDOW_NAME"; then
@@ -2464,6 +2483,7 @@ cmd_launch() {
   else
     # Create new session with this worktree as first window
     _tmux new-session -d -s "$SESSION_NAME" -n "$WINDOW_NAME" -c "$PROJECT_DIR" -x 220 -y 50
+    _tmux_lock_pane_titles "$SESSION_NAME"
     _setup_panes
     info "Started session ${BOLD}${SESSION_NAME}${RESET} with window ${BOLD}${WINDOW_NAME}${RESET}"
   fi
@@ -2624,6 +2644,569 @@ cmd_list() {
   done
 
   echo ""
+}
+
+# ─── Interactive menu ────────────────────────────────────────────────────────
+
+declare -a _MENU_LABELS=()
+declare -a _MENU_DESCS=()
+declare -a _MENU_CMDS=()
+declare -a _MENU_ACTIONS=()
+
+_menu_reset_items() {
+  _MENU_LABELS=()
+  _MENU_DESCS=()
+  _MENU_CMDS=()
+  _MENU_ACTIONS=()
+}
+
+_menu_add_item() {
+  _MENU_LABELS+=("$1")
+  _MENU_DESCS+=("$2")
+  _MENU_CMDS+=("$3")
+  _MENU_ACTIONS+=("$4")
+}
+
+_menu_cmd() {
+  local out="" arg quoted
+  for arg in "$@"; do
+    printf -v quoted '%q' "$arg"
+    if [[ -z "$out" ]]; then
+      out="$quoted"
+    else
+      out="$out $quoted"
+    fi
+  done
+  echo "$out"
+}
+
+_menu_read_line() {
+  local prompt="$1" var_name="$2" line
+  printf "%s" "$prompt"
+  IFS= read -r line || return 1
+  printf -v "$var_name" '%s' "$line"
+}
+
+_menu_pause() {
+  [[ -n "${ZPROJ_MENU_NO_PAUSE:-}" ]] && return 0
+  [[ -t 0 ]] || return 0
+  local _
+  _menu_read_line "Press Enter to return to the menu..." _ || true
+}
+
+_menu_confirm_command() {
+  local label="$1" cmd="$2" desc="$3" answer
+  echo ""
+  echo -e "${BOLD}${label}${RESET}"
+  echo -e "  ${desc}"
+  echo -e "  ${BOLD}Command:${RESET} ${CYAN}${cmd}${RESET}"
+  echo ""
+
+  [[ "${ZPROJ_MENU_ASSUME_YES:-}" == "1" ]] && return 0
+
+  _menu_read_line "Run this command? [y/N] " answer || return 1
+  case "$answer" in
+  y|Y|yes|YES|Yes|run|RUN|Run) return 0 ;;
+  *)
+    echo "Cancelled."
+    return 1
+    ;;
+  esac
+}
+
+_menu_prompt_required() {
+  local prompt="$1" var_name="$2" value
+  _menu_read_line "$prompt" value || return 1
+  if [[ -z "$value" ]]; then
+    warn "No value entered."
+    return 1
+  fi
+  printf -v "$var_name" '%s' "$value"
+}
+
+_menu_validate_worktree_name() {
+  local name="$1"
+  if [[ "$name" == */* ]]; then
+    warn "Use a single worktree directory name without '/'."
+    return 1
+  fi
+  if ! git check-ref-format --branch "$name" &>/dev/null; then
+    warn "Invalid worktree/branch name: '$name'."
+    return 1
+  fi
+  return 0
+}
+
+_menu_count_worktrees() {
+  local root="$1" count=0 line wt_path="" wt_branch=""
+
+  _menu_count_process_entry() {
+    [[ -z "$wt_path" ]] && return
+    [[ "$wt_branch" == "(bare)" ]] && return
+    [[ -d "$wt_path" ]] && ((count++)) || true
+  }
+
+  while IFS= read -r line; do
+    if [[ "$line" == "worktree "* ]]; then
+      wt_path="${line#worktree }"
+    elif [[ "$line" == "branch "* ]]; then
+      wt_branch="${line#branch }"; wt_branch="${wt_branch#refs/heads/}"
+    elif [[ "$line" == "bare" ]]; then
+      wt_branch="(bare)"
+    elif [[ "$line" == "detached" ]]; then
+      wt_branch=""
+    elif [[ -z "$line" && -n "$wt_path" ]]; then
+      _menu_count_process_entry
+      wt_path="" wt_branch=""
+    fi
+  done < <(git -C "$root" worktree list --porcelain 2>/dev/null)
+  [[ -n "$wt_path" ]] && _menu_count_process_entry
+
+  echo "$count"
+}
+
+_menu_window_state() {
+  local session="$1" window="$2" entry win active
+  if ! command -v tmux &>/dev/null; then
+    echo "tmux unavailable"
+    return
+  fi
+  if ! _tmux has-session -t "$session" 2>/dev/null; then
+    echo "no session"
+    return
+  fi
+  if [[ -z "$window" ]]; then
+    echo "open"
+    return
+  fi
+  while IFS= read -r entry; do
+    win="${entry%%:*}"
+    active="${entry##*:}"
+    if [[ "$win" == "$window" ]]; then
+      [[ "$active" == "1" ]] && echo "active" || echo "open"
+      return
+    fi
+  done < <(_tmux list-windows -t "$session" -F '#{window_name}:#{window_active}' 2>/dev/null)
+  echo "no window"
+}
+
+_menu_detect_context() {
+  MENU_CWD="$(pwd)"
+  MENU_CONTEXT="outside"
+  MENU_ROOT=""
+  MENU_PROJECT=""
+  MENU_SESSION=""
+  MENU_WORKTREE_COUNT=0
+  MENU_WORKTREE_DIR=""
+  MENU_WORKTREE_NAME=""
+  MENU_BRANCH=""
+  MENU_DEFAULT_BRANCH=""
+  MENU_SOURCE=""
+  MENU_DIRTY="clean"
+  MENU_WINDOW_STATE=""
+  MENU_REVIEW_COUNT=0
+
+  local root
+  if ! root="$(_bare_repo_root_from_cwd 2>/dev/null)"; then
+    return 0
+  fi
+
+  MENU_ROOT="$root"
+  MENU_PROJECT="$(basename "$MENU_ROOT")"
+  MENU_SESSION="$(_tmux_session_name "$MENU_PROJECT")"
+  MENU_CONTEXT="root"
+  MENU_WORKTREE_COUNT="$(_menu_count_worktrees "$MENU_ROOT")"
+  MENU_DEFAULT_BRANCH="$(_git_default_branch "$MENU_ROOT" 2>/dev/null)" || MENU_DEFAULT_BRANCH=""
+
+  if _review_locate; then
+    MENU_CONTEXT="worktree"
+    MENU_WORKTREE_DIR="$_REVIEW_WT_ROOT"
+    MENU_WORKTREE_NAME="$(basename "$MENU_WORKTREE_DIR")"
+    MENU_BRANCH="$(git -C "$MENU_WORKTREE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)" || MENU_BRANCH=""
+    [[ -z "$MENU_BRANCH" ]] && MENU_BRANCH="unknown"
+    _git_is_dirty "$MENU_WORKTREE_DIR" && MENU_DIRTY="dirty"
+    if [[ "$MENU_BRANCH" != "HEAD" && "$MENU_BRANCH" != "unknown" ]]; then
+      MENU_SOURCE="$(git -C "$MENU_WORKTREE_DIR" config "branch.${MENU_BRANCH}.zprojSource" 2>/dev/null)" || MENU_SOURCE=""
+    fi
+    MENU_WINDOW_STATE="$(_menu_window_state "$MENU_SESSION" "$MENU_WORKTREE_NAME")"
+    local review_file="$MENU_WORKTREE_DIR/$REVIEW_NOTES_RELPATH"
+    if [[ -f "$review_file" ]]; then
+      MENU_REVIEW_COUNT="$(_review_count_notes "$review_file")"
+    fi
+  fi
+}
+
+_menu_new_worktree_arg() {
+  local name="$1"
+  if [[ "$MENU_CONTEXT" == "root" && "$MENU_CWD" == "$MENU_ROOT" ]]; then
+    echo "$name"
+  else
+    echo "$MENU_ROOT/$name"
+  fi
+}
+
+_menu_print_context() {
+  echo ""
+  echo -e "${BOLD}${SCRIPT_NAME} menu${RESET}"
+  echo ""
+  case "$MENU_CONTEXT" in
+  outside)
+    echo -e "  ${BOLD}Context:${RESET} no zproj project found"
+    echo -e "  ${BOLD}Directory:${RESET} ${MENU_CWD}"
+    ;;
+  root)
+    echo -e "  ${BOLD}Project:${RESET} ${MENU_PROJECT}"
+    echo -e "  ${BOLD}Root:${RESET}    ${MENU_ROOT}"
+    echo -e "  ${BOLD}Worktrees:${RESET} ${MENU_WORKTREE_COUNT}"
+    echo -e "  ${BOLD}Default:${RESET} ${MENU_DEFAULT_BRANCH:-unknown}"
+    echo -e "  ${BOLD}Session:${RESET} ${MENU_SESSION} ($(_menu_window_state "$MENU_SESSION" ""))"
+    ;;
+  worktree)
+    echo -e "  ${BOLD}Project:${RESET}          ${MENU_PROJECT}"
+    echo -e "  ${BOLD}Current worktree:${RESET} ${MENU_WORKTREE_NAME}"
+    echo -e "  ${BOLD}Branch:${RESET}           ${MENU_BRANCH}"
+    echo -e "  ${BOLD}Status:${RESET}           ${MENU_DIRTY}"
+    echo -e "  ${BOLD}Fork source:${RESET}      ${MENU_SOURCE:-none recorded}"
+    echo -e "  ${BOLD}Review notes:${RESET}     ${MENU_REVIEW_COUNT}"
+    echo -e "  ${BOLD}Tmux window:${RESET}      ${MENU_WINDOW_STATE}"
+    ;;
+  esac
+  echo ""
+}
+
+_menu_print_suggestion() {
+  echo -e "${BOLD}Suggested next step:${RESET}"
+  case "$MENU_CONTEXT" in
+  outside)
+    echo -e "  Start with ${CYAN}${SCRIPT_NAME} init .${RESET} for this directory, or ${CYAN}${SCRIPT_NAME} clone <git-url>${RESET} for an existing remote."
+    ;;
+  root)
+    if command -v tmux &>/dev/null && _tmux has-session -t "$MENU_SESSION" 2>/dev/null; then
+      echo -e "  The project session exists. Use ${CYAN}${SCRIPT_NAME} list${RESET} to inspect worktrees or create a new one."
+    else
+      echo -e "  Open the project session with ${CYAN}${SCRIPT_NAME}${RESET}; it creates tmux windows for existing worktrees."
+    fi
+    ;;
+  worktree)
+    if [[ "$MENU_DIRTY" == "dirty" ]]; then
+      echo -e "  Inspect ${CYAN}git status --short --branch${RESET} before update, join, or delete."
+    elif [[ -n "$MENU_SOURCE" ]]; then
+      echo -e "  Pull latest source changes with ${CYAN}${SCRIPT_NAME} update${RESET} before continuing work."
+    elif [[ -n "$MENU_DEFAULT_BRANCH" && "$MENU_BRANCH" != "$MENU_DEFAULT_BRANCH" && "$MENU_BRANCH" != "HEAD" ]]; then
+      echo -e "  When this worktree is ready, merge it back with ${CYAN}${SCRIPT_NAME} join ${MENU_DEFAULT_BRANCH}${RESET}."
+    else
+      echo -e "  You are on the default path. Create or fork a worktree for isolated feature work."
+    fi
+    ;;
+  esac
+  echo ""
+}
+
+_menu_add_common_items() {
+  _menu_add_item "Show tool resolution" \
+    "Show which editor and coding agent zproj will use." \
+    "$SCRIPT_NAME --env" \
+    "env"
+  _menu_add_item "Run diagnostics" \
+    "Check git, tmux, editor, agent, notifications, and runtime environment." \
+    "$SCRIPT_NAME --diagnostics" \
+    "diagnostics"
+  _menu_add_item "Show command reference" \
+    "Print the main zproj help text." \
+    "$SCRIPT_NAME --help" \
+    "help"
+}
+
+_menu_build_items() {
+  _menu_reset_items
+
+  case "$MENU_CONTEXT" in
+  outside)
+    _menu_add_item "Initialize this directory" \
+      "Create or convert the current directory into a zproj project." \
+      "$SCRIPT_NAME init ." \
+      "init_here"
+    _menu_add_item "Initialize a new project directory" \
+      "Create a new empty zproj project, or convert an existing directory." \
+      "$SCRIPT_NAME init <dir>" \
+      "init_prompt"
+    _menu_add_item "Clone a remote repository" \
+      "Clone an existing git remote into zproj's bare worktree layout." \
+      "$SCRIPT_NAME clone <git-url> [dir]" \
+      "clone_prompt"
+    _menu_add_common_items
+    ;;
+  root)
+    _menu_add_item "Open project session" \
+      "Attach to the project tmux session, creating windows for existing worktrees if needed." \
+      "$SCRIPT_NAME" \
+      "open"
+    _menu_add_item "List worktrees" \
+      "Show branch, dirty status, and tmux window state for every worktree." \
+      "$SCRIPT_NAME list" \
+      "list"
+    _menu_add_item "Create and launch a worktree" \
+      "Create a branch/worktree and open its tmux window." \
+      "$SCRIPT_NAME <new-worktree>" \
+      "create_prompt"
+    _menu_add_item "Preview machine integration" \
+      "Show the tmux bindings, notification hooks, and editor integration plan without changing files." \
+      "$SCRIPT_NAME integrate --plan" \
+      "integrate_plan"
+    _menu_add_item "Install machine integration" \
+      "Install tmux bindings/notifications and dispatch the editor integration prompt." \
+      "$SCRIPT_NAME integrate" \
+      "integrate"
+    _menu_add_common_items
+    ;;
+  worktree)
+    if [[ "$MENU_DIRTY" == "dirty" ]]; then
+      _menu_add_item "Show git status" \
+        "Inspect the current worktree before running zproj operations that merge or remove it." \
+        "git status --short --branch" \
+        "git_status"
+    fi
+    _menu_add_item "Launch current worktree window" \
+      "Open or switch to this worktree's tmux window." \
+      "$(_menu_cmd "$SCRIPT_NAME" launch "$MENU_WORKTREE_DIR")" \
+      "launch_current"
+    _menu_add_item "List worktrees" \
+      "Show branch, dirty status, and tmux window state for every worktree." \
+      "$SCRIPT_NAME list" \
+      "list"
+    if [[ -n "$MENU_DEFAULT_BRANCH" && "$MENU_BRANCH" != "$MENU_DEFAULT_BRANCH" && "$MENU_BRANCH" != "HEAD" ]]; then
+      _menu_add_item "Update this worktree" \
+        "Merge the recorded or auto-detected fork source into the current worktree." \
+        "$SCRIPT_NAME update" \
+        "update_current"
+      _menu_add_item "Join current worktree into ${MENU_DEFAULT_BRANCH}" \
+        "Merge this branch into ${MENU_DEFAULT_BRANCH}; on success zproj removes this worktree." \
+        "$SCRIPT_NAME join ${MENU_DEFAULT_BRANCH}" \
+        "join_default"
+    fi
+    _menu_add_item "Fork current worktree" \
+      "Create a new worktree at this commit and record this branch as its source." \
+      "$SCRIPT_NAME fork <new-worktree>" \
+      "fork_prompt"
+    _menu_add_item "Join current worktree into another" \
+      "Merge this worktree into a target you choose." \
+      "$SCRIPT_NAME join <target-worktree>" \
+      "join_prompt"
+    if [[ "$MENU_REVIEW_COUNT" -gt 0 ]]; then
+      _menu_add_item "View review notes" \
+        "Print accumulated review notes for this worktree." \
+        "$SCRIPT_NAME review view" \
+        "review_view"
+      _menu_add_item "Dispatch review notes" \
+        "Send accumulated review notes to the coding agent and clear the notes file." \
+        "$SCRIPT_NAME review dispatch" \
+        "review_dispatch"
+      _menu_add_item "Clear review notes" \
+        "Delete accumulated review notes without dispatching them." \
+        "$SCRIPT_NAME review clear" \
+        "review_clear"
+    fi
+    _menu_add_item "Show review notes path" \
+      "Print the exact notes file path used by editor integrations." \
+      "$SCRIPT_NAME review path --abs" \
+      "review_path"
+    _menu_add_item "Delete current worktree" \
+      "Remove this worktree, its branch, and its tmux window; normal safety checks still apply." \
+      "$(_menu_cmd "$SCRIPT_NAME" delete "$MENU_WORKTREE_DIR")" \
+      "delete_current"
+    _menu_add_common_items
+    ;;
+  esac
+}
+
+_menu_print_items() {
+  local i
+  echo -e "${BOLD}Choices:${RESET}"
+  for i in "${!_MENU_LABELS[@]}"; do
+    printf "  %2d) %s\n" "$((i + 1))" "${_MENU_LABELS[$i]}"
+    printf "      %s\n" "${_MENU_DESCS[$i]}"
+    printf "      Command: %s\n" "${_MENU_CMDS[$i]}"
+  done
+  echo "   q) Quit"
+  echo ""
+}
+
+_menu_run_action() {
+  local action="$1" label="$2" desc="$3" cmd="$4"
+  local name target url dir exact rc=0
+
+  case "$action" in
+  open)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_open || rc=$?
+    ;;
+  list)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_list || rc=$?
+    ;;
+  launch_current)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_launch "$MENU_WORKTREE_DIR" || rc=$?
+    ;;
+  create_prompt)
+    _menu_prompt_required "New worktree name: " name || return 0
+    _menu_validate_worktree_name "$name" || return 0
+    target="$(_menu_new_worktree_arg "$name")"
+    exact="$(_menu_cmd "$SCRIPT_NAME" "$target")"
+    _menu_confirm_command "$label" "$exact" "$desc" || return 0
+    cmd_default "$target" || rc=$?
+    ;;
+  fork_prompt)
+    _menu_prompt_required "New worktree name: " name || return 0
+    _menu_validate_worktree_name "$name" || return 0
+    exact="$(_menu_cmd "$SCRIPT_NAME" fork "$name")"
+    _menu_confirm_command "$label" "$exact" "$desc" || return 0
+    cmd_fork "$name" || rc=$?
+    ;;
+  update_current)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_update || rc=$?
+    ;;
+  join_default)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_join "$MENU_DEFAULT_BRANCH" || rc=$?
+    ;;
+  join_prompt)
+    _menu_prompt_required "Target worktree: " target || return 0
+    exact="$(_menu_cmd "$SCRIPT_NAME" join "$target")"
+    _menu_confirm_command "$label" "$exact" "$desc" || return 0
+    cmd_join "$target" || rc=$?
+    ;;
+  delete_current)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_delete "$MENU_WORKTREE_DIR" || rc=$?
+    ;;
+  review_view)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_review view || rc=$?
+    ;;
+  review_dispatch)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_review dispatch || rc=$?
+    ;;
+  review_clear)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_review clear || rc=$?
+    ;;
+  review_path)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_review path --abs || rc=$?
+    ;;
+  git_status)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    (cd "$MENU_WORKTREE_DIR" && git status --short --branch) || rc=$?
+    ;;
+  init_here)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_init "." || rc=$?
+    ;;
+  init_prompt)
+    _menu_prompt_required "Project directory: " dir || return 0
+    exact="$(_menu_cmd "$SCRIPT_NAME" init "$dir")"
+    _menu_confirm_command "$label" "$exact" "$desc" || return 0
+    cmd_init "$dir" || rc=$?
+    ;;
+  clone_prompt)
+    _menu_prompt_required "Git URL: " url || return 0
+    _menu_read_line "Directory (optional): " dir || dir=""
+    if [[ -n "$dir" ]]; then
+      exact="$(_menu_cmd "$SCRIPT_NAME" clone "$url" "$dir")"
+      _menu_confirm_command "$label" "$exact" "$desc" || return 0
+      cmd_clone "$url" "$dir" || rc=$?
+    else
+      exact="$(_menu_cmd "$SCRIPT_NAME" clone "$url")"
+      _menu_confirm_command "$label" "$exact" "$desc" || return 0
+      cmd_clone "$url" || rc=$?
+    fi
+    ;;
+  integrate_plan)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_integrate --plan || rc=$?
+    ;;
+  integrate)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_integrate || rc=$?
+    ;;
+  env)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_env || rc=$?
+    ;;
+  diagnostics)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    cmd_diagnostics || rc=$?
+    ;;
+  help)
+    _menu_confirm_command "$label" "$cmd" "$desc" || return 0
+    usage_main || rc=$?
+    ;;
+  esac
+
+  _menu_pause
+  return "$rc"
+}
+
+cmd_menu() {
+  local dir="" choice idx
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --help|-h)
+      usage_menu
+      exit 0
+      ;;
+    -*)
+      die "Unknown option: $1."
+      ;;
+    *)
+      [[ -n "$dir" ]] && die "Too many arguments."
+      dir="$1"
+      ;;
+    esac
+    shift
+  done
+
+  check_git
+
+  if [[ -n "$dir" ]]; then
+    cd "$dir" 2>/dev/null || die "Directory '$dir' does not exist."
+  fi
+
+  while true; do
+    _menu_detect_context
+    _menu_build_items
+    _menu_print_context
+    _menu_print_suggestion
+    _menu_print_items
+
+    _menu_read_line "Choose a number, or q to quit: " choice || { echo ""; return 0; }
+    case "$choice" in
+    q|Q|quit|QUIT|Quit)
+      return 0
+      ;;
+    ''|*[!0-9]*)
+      warn "Choose a menu number, or q to quit."
+      _menu_pause
+      ;;
+    *)
+      idx=$((choice - 1))
+      if [[ "$idx" -lt 0 || "$idx" -ge "${#_MENU_LABELS[@]}" ]]; then
+        warn "No menu item $choice."
+        _menu_pause
+      else
+        _menu_run_action \
+          "${_MENU_ACTIONS[$idx]}" \
+          "${_MENU_LABELS[$idx]}" \
+          "${_MENU_DESCS[$idx]}" \
+          "${_MENU_CMDS[$idx]}" || true
+      fi
+      ;;
+    esac
+  done
 }
 
 # ─── Open session (no-arg) ────────────────────────────────────────────────────
@@ -2812,6 +3395,7 @@ ${BOLD}Usage:${RESET}
   $SCRIPT_NAME --sandbox [--plan] launch <dir>     Guest coding agent via Lima (${ZPROJ_LIMA_MOUNT} mount)
 
   $SCRIPT_NAME list [dir]                          Show worktrees with status
+  $SCRIPT_NAME menu [dir]                          Context-aware interactive command menu
   $SCRIPT_NAME review <subcommand>                 Manage review notes (path/view/dispatch/clear)
   $SCRIPT_NAME integrate [--plan]                  Generate editor integration prompt for coding agent
   $SCRIPT_NAME notify [session] [window] [pane]   Emit desktop notification (used by tmux hooks)
@@ -3055,6 +3639,35 @@ ${BOLD}Usage:${RESET} $SCRIPT_NAME list [directory]
   Show all worktrees with branch, dirty status, and tmux window state.
   Defaults to the current directory. Walks up to find the bare repo root
   if run from inside a worktree.
+
+EOF
+}
+
+usage_menu() {
+  cat <<EOF
+
+${BOLD}Usage:${RESET} $SCRIPT_NAME menu [directory]
+
+  Open a context-aware terminal menu for zproj. The menu checks whether the
+  current directory is outside zproj, at a project root, or inside a worktree,
+  then suggests useful next commands.
+
+  Every choice shows:
+    - what the command does
+    - the exact command it will run
+    - a confirmation prompt before execution
+
+  If [directory] is supplied, zproj changes to that directory before building
+  the menu.
+
+${BOLD}Examples:${RESET}
+  $SCRIPT_NAME menu                    ${DIM}# menu for the current directory${RESET}
+  $SCRIPT_NAME menu ~/src/app/main     ${DIM}# menu for a worktree path${RESET}
+
+${BOLD}Fish shortcut:${RESET}
+  function zp
+      zproj menu \$argv
+  end
 
 EOF
 }
@@ -4610,6 +5223,7 @@ cmd_integrate() {
 
   step "Launching ${CYAN}${ai_binary}${RESET}..."
   _tmux new-session -d -s "$session" -n "$window" -c "$HOME" -x 220 -y 50
+  _tmux_lock_pane_titles "$session"
 
   # Capture the pane ID at creation time — avoids pane-base-index dependency
   local pane_target
@@ -5531,6 +6145,50 @@ NOTES
   _section "X5 — --diagnostics: reports summary line"
   _t_grep "reports summary"  "checks passed\|error\|warning"  echo "$diag_out"
 
+  # ── Section: menu ───────────────────────────────────────────────────────
+
+  _section "M1 — menu --help describes context-aware command menu"
+  _t_grep "M1: help shows usage" "Usage:.*menu" _zproj menu --help
+  _t_grep "M1: help mentions exact command" "exact command" _zproj menu --help
+
+  _section "M2 — menu outside zproj suggests init or clone"
+  local m2_out
+  m2_out="$(printf 'q\n' | (cd "$tmp" && "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || true
+  _t_grep "M2: reports outside context" "no zproj project found" echo "$m2_out"
+  _t_grep "M2: suggests init" "${SCRIPT_NAME} init" echo "$m2_out"
+  _t_grep "M2: suggests clone" "${SCRIPT_NAME} clone" echo "$m2_out"
+
+  _section "M3 — menu at project root shows session and worktree commands"
+  rm -rf "$tmp/mroot"
+  _zproj init mroot &>/dev/null
+  local m3_out
+  m3_out="$(printf 'q\n' | (cd "$tmp/mroot" && "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || true
+  _t_grep "M3: shows project root" "Project:.*mroot" echo "$m3_out"
+  _t_grep "M3: lists zproj list command" "${SCRIPT_NAME} list" echo "$m3_out"
+  _t_grep "M3: offers create placeholder" "${SCRIPT_NAME} <new-worktree>" echo "$m3_out"
+
+  _section "M4 — menu inside worktree shows current status and review command"
+  local m4_out
+  m4_out="$(printf 'q\n' | (cd "$tmp/mroot/main" && "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || true
+  _t_grep "M4: shows current worktree" "Current worktree: main" echo "$m4_out"
+  _t_grep "M4: shows clean status" "Status:.*clean" echo "$m4_out"
+  _t_grep "M4: shows fork command" "${SCRIPT_NAME} fork <new-worktree>" echo "$m4_out"
+  _t_grep "M4: shows review path command" "${SCRIPT_NAME} review path --abs" echo "$m4_out"
+
+  _section "M5 — menu shows exact command before confirmation"
+  local m5_out
+  m5_out="$(printf '1\nn\nq\n' | (cd "$tmp/mroot/main" && "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || true
+  _t_grep "M5: asks before running" "Run this command" echo "$m5_out"
+  _t_grep "M5: cancellation returns to menu" "Cancelled" echo "$m5_out"
+
+  _section "M6 — menu dirty worktree suggests git status"
+  touch "$tmp/mroot/main/untracked-menu-test"
+  local m6_out
+  m6_out="$(printf 'q\n' | (cd "$tmp/mroot/main" && "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || true
+  _t_grep "M6: shows dirty status" "Status:.*dirty" echo "$m6_out"
+  _t_grep "M6: suggests git status" "git status --short --branch" echo "$m6_out"
+  rm -f "$tmp/mroot/main/untracked-menu-test"
+
   # ── Section: tmux (headless detached session) ────────────────────────────
   # T1–T8 require tmux >= 3.0 in PATH. Skip gracefully if absent.
 
@@ -5577,10 +6235,11 @@ NOTES
   # so the panes stay alive for inspection. Use pane IDs (not indices) to
   # match _setup_panes and avoid pane-base-index dependency.
   local lt_agent_cmd="tail -f /dev/null"
-  local lt_editor_cmd="tail -f /dev/null ."  # "." simulates how editor gets called
+  local lt_editor_cmd="tail -f /dev/null"
   local _ltp1 _ltp2 _ltp3
 
   _tmux new-session -d -s "$lt_session" -n "main" -c "$tmp" -x 220 -y 50
+  _tmux_lock_pane_titles "$lt_session"
   _ltp1="$(_tmux list-panes -t "$lt_session:main" -F '#{pane_id}' | head -1)"
   _tmux send-keys   -t "$_ltp1" "$lt_agent_cmd" Enter
   _tmux select-pane -t "$_ltp1" -T "$t_agent_bin"
@@ -7573,6 +8232,10 @@ main() {
     shift
     cmd_list "$@"
     ;;
+  menu)
+    shift
+    cmd_menu "$@"
+    ;;
   review)
     shift
     cmd_review "$@"
@@ -7593,4 +8256,3 @@ main() {
 _zproj_argv_peel "$@"
 # Bash 3.2 + set -u: quoted "${arr[@]}" errors when arr is empty — use ${arr[@]+"${arr[@]}"}
 main ${_ZPROJ_ARGV_TAIL[@]+"${_ZPROJ_ARGV_TAIL[@]}"}
-
