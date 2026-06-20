@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="zproj"
-readonly VERSION="4.19.0"
+readonly VERSION="4.20.0"
 readonly BARE_DIR=".bare"
 readonly GIT_POINTER=".git"
 readonly MIN_GIT_VERSION="2.5.0"
@@ -2657,6 +2657,11 @@ declare -a _MENU_LABELS=()
 declare -a _MENU_DESCS=()
 declare -a _MENU_CMDS=()
 declare -a _MENU_ACTIONS=()
+declare -a _MENU_WT_NAMES=()
+declare -a _MENU_WT_PATHS=()
+declare -a _MENU_WT_BRANCHES=()
+declare -a _MENU_WT_DIRTIES=()
+declare -a _MENU_WT_WINDOWS=()
 
 _menu_reset_items() {
   _MENU_LABELS=()
@@ -2670,6 +2675,14 @@ _menu_add_item() {
   _MENU_DESCS+=("$2")
   _MENU_CMDS+=("$3")
   _MENU_ACTIONS+=("$4")
+}
+
+_menu_reset_worktree_choices() {
+  _MENU_WT_NAMES=()
+  _MENU_WT_PATHS=()
+  _MENU_WT_BRANCHES=()
+  _MENU_WT_DIRTIES=()
+  _MENU_WT_WINDOWS=()
 }
 
 _menu_cmd() {
@@ -2768,6 +2781,84 @@ _menu_count_worktrees() {
   [[ -n "$wt_path" ]] && _menu_count_process_entry
 
   echo "$count"
+}
+
+_menu_collect_worktree_choices() {
+  local root="$1" line wt_path="" wt_branch=""
+  _menu_reset_worktree_choices
+
+  _menu_collect_worktree_entry() {
+    [[ -z "$wt_path" ]] && return
+    [[ "$wt_branch" == "(bare)" ]] && return
+    [[ -d "$wt_path" ]] || return
+
+    local name branch dirty window
+    name="$(basename "$wt_path")"
+    branch="${wt_branch:-HEAD}"
+    dirty="clean"
+    _git_is_dirty "$wt_path" && dirty="dirty"
+    window="$(_menu_window_state "$MENU_SESSION" "$name")"
+
+    _MENU_WT_NAMES+=("$name")
+    _MENU_WT_PATHS+=("$wt_path")
+    _MENU_WT_BRANCHES+=("$branch")
+    _MENU_WT_DIRTIES+=("$dirty")
+    _MENU_WT_WINDOWS+=("$window")
+  }
+
+  while IFS= read -r line; do
+    if [[ "$line" == "worktree "* ]]; then
+      wt_path="${line#worktree }"
+    elif [[ "$line" == "branch "* ]]; then
+      wt_branch="${line#branch }"; wt_branch="${wt_branch#refs/heads/}"
+    elif [[ "$line" == "bare" ]]; then
+      wt_branch="(bare)"
+    elif [[ "$line" == "detached" ]]; then
+      wt_branch="HEAD"
+    elif [[ -z "$line" && -n "$wt_path" ]]; then
+      _menu_collect_worktree_entry
+      wt_path="" wt_branch=""
+    fi
+  done < <(git -C "$root" worktree list --porcelain 2>/dev/null)
+  [[ -n "$wt_path" ]] && _menu_collect_worktree_entry
+}
+
+_menu_choose_worktree() {
+  local var_name="$1" choice idx i
+
+  _menu_collect_worktree_choices "$MENU_ROOT"
+  if [[ "${#_MENU_WT_PATHS[@]}" -eq 0 ]]; then
+    warn "No materialized worktrees found."
+    return 1
+  fi
+
+  echo ""
+  echo -e "${BOLD}Worktrees:${RESET}"
+  for i in "${!_MENU_WT_PATHS[@]}"; do
+    printf "  %2d) %s\n" "$((i + 1))" "${_MENU_WT_NAMES[$i]}"
+    printf "      Branch: %s; Status: %s; Tmux window: %s\n" \
+      "${_MENU_WT_BRANCHES[$i]}" "${_MENU_WT_DIRTIES[$i]}" "${_MENU_WT_WINDOWS[$i]}"
+    printf "      Command: %s\n" "$(_menu_cmd "$SCRIPT_NAME" launch "${_MENU_WT_PATHS[$i]}")"
+  done
+  echo "   q) Cancel"
+  echo ""
+
+  _menu_read_line "Choose a worktree number, or q to cancel: " choice || return 1
+  case "$choice" in
+  q|Q|quit|QUIT|Quit) return 1 ;;
+  ''|*[!0-9]*)
+    warn "Choose a worktree number, or q to cancel."
+    return 1
+    ;;
+  *)
+    idx=$((10#$choice - 1))
+    if [[ "$idx" -lt 0 || "$idx" -ge "${#_MENU_WT_PATHS[@]}" ]]; then
+      warn "No worktree item $choice."
+      return 1
+    fi
+    printf -v "$var_name" '%s' "${_MENU_WT_PATHS[$idx]}"
+    ;;
+  esac
 }
 
 _menu_window_state() {
@@ -2961,6 +3052,10 @@ _menu_build_items() {
       "Show branch, dirty status, and tmux window state for every worktree." \
       "$SCRIPT_NAME list" \
       "list"
+    _menu_add_item "Launch a worktree window" \
+      "Choose an existing worktree and open or switch to its tmux window." \
+      "$SCRIPT_NAME launch <worktree>" \
+      "launch_picker"
     _menu_add_item "Create and launch a worktree" \
       "Create a branch/worktree and open its tmux window." \
       "$SCRIPT_NAME <new-worktree>" \
@@ -2994,6 +3089,10 @@ _menu_build_items() {
       "Show branch, dirty status, and tmux window state for every worktree." \
       "$SCRIPT_NAME list" \
       "list"
+    _menu_add_item "Launch a worktree window" \
+      "Choose an existing worktree and open or switch to its tmux window." \
+      "$SCRIPT_NAME launch <worktree>" \
+      "launch_picker"
     if $non_default_worktree; then
       _menu_add_item "Update this worktree" \
         "Merge the recorded or auto-detected fork source into the current worktree." \
@@ -3071,6 +3170,12 @@ _menu_run_action() {
   launch_current)
     _menu_confirm_command "$label" "$cmd" "$desc" || return 0
     cmd_launch "$MENU_WORKTREE_DIR" || rc=$?
+    ;;
+  launch_picker)
+    _menu_choose_worktree target || return 0
+    exact="$(_menu_cmd "$SCRIPT_NAME" launch "$target")"
+    _menu_confirm_command "$label" "$exact" "$desc" || return 0
+    cmd_launch "$target" || rc=$?
     ;;
   create_prompt)
     _menu_prompt_required "New worktree name: " name || return 0
@@ -6190,6 +6295,7 @@ NOTES
   m3_out="$(printf 'q\n' | (cd "$tmp/mroot" && "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || true
   _t_grep "M3: shows project root" "Project:.*mroot" echo "$m3_out"
   _t_grep "M3: lists zproj list command" "${SCRIPT_NAME} list" echo "$m3_out"
+  _t_grep "M3: offers launch picker" "${SCRIPT_NAME} launch <worktree>" echo "$m3_out"
   _t_grep "M3: offers create placeholder" "${SCRIPT_NAME} <new-worktree>" echo "$m3_out"
 
   _section "M4 — menu inside worktree shows current status and review command"
@@ -6216,9 +6322,9 @@ NOTES
 
   _section "M7 — menu treats zero-padded choices as decimal"
   local m7_out m7_exit=0
-  m7_out="$(printf '08\nq\n' | (cd "$tmp/mroot/main" && "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || m7_exit=$?
+  m7_out="$(printf '09\nq\n' | (cd "$tmp/mroot/main" && "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || m7_exit=$?
   _t_check "M7: exits 0 after invalid zero-padded choice" test "$m7_exit" -eq 0
-  _t_grep "M7: reports missing item 08" "No menu item 08" echo "$m7_out"
+  _t_grep "M7: reports missing item 09" "No menu item 09" echo "$m7_out"
   _t_check "M7: does not hit octal arithmetic error" \
     bash -c '[[ "$1" != *"value too great for base"* ]]' -- "$m7_out"
 
@@ -6233,7 +6339,7 @@ NOTES
   _section "M9 — menu can run an accepted action from a nested path argument"
   mkdir -p "$tmp/mroot/main/src/menu" || true
   local m9_out
-  m9_out="$(printf '4\ny\nq\n' | (cd "$tmp" && "$BASH" "$_ZPROJ_SELF" menu "$tmp/mroot/main/src/menu" 2>&1))" || true
+  m9_out="$(printf '5\ny\nq\n' | (cd "$tmp" && "$BASH" "$_ZPROJ_SELF" menu "$tmp/mroot/main/src/menu" 2>&1))" || true
   _t_check "M9: accepted review path action uses worktree root" \
     bash -c '[[ "$1" == *"$2"* ]]' -- "$m9_out" "$tmp/mroot/main/$REVIEW_NOTES_RELPATH"
   _t_grep "M9: shows exact review path command" "${SCRIPT_NAME} review path --abs" echo "$m9_out"
@@ -6242,7 +6348,7 @@ NOTES
   if command -v tmux &>/dev/null; then
     ( cd "$tmp/mroot/main" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" fork menu-join &>/dev/null ) || true
     local m10_out m10_exit=0
-    m10_out="$(printf '4\ny\n' | (cd "$tmp/mroot/menu-join" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || m10_exit=$?
+    m10_out="$(printf '5\ny\n' | (cd "$tmp/mroot/menu-join" && ZPROJ_TEST_NO_ATTACH=1 "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || m10_exit=$?
     _t_check "M10: menu-driven join exits 0" test "$m10_exit" -eq 0
     _t_grep "M10: confirmation shows two-argument join" "${SCRIPT_NAME} join .*/menu-join .*/main" echo "$m10_out"
     _t_check "M10: joined source worktree removed" test ! -d "$tmp/mroot/menu-join"
@@ -6251,6 +6357,16 @@ NOTES
     _t_skip "M10: (skipped)"
     _t_skip "M10: (skipped)"
   fi
+
+  _section "M11 — menu launch picker shows existing worktrees"
+  ( cd "$tmp/mroot" && "$BASH" "$_ZPROJ_SELF" create menu-open &>/dev/null ) || true
+  local m11_out
+  m11_out="$(printf '3\n2\nn\nq\n' | (cd "$tmp/mroot/main" && "$BASH" "$_ZPROJ_SELF" menu 2>&1))" || true
+  _t_grep "M11: shows worktree picker" "Choose a worktree number" echo "$m11_out"
+  _t_grep "M11: picker lists target worktree" "menu-open" echo "$m11_out"
+  _t_grep "M11: picker shows exact launch command" "${SCRIPT_NAME} launch .*/menu-open" echo "$m11_out"
+  _t_grep "M11: confirmation uses selected worktree" "Command:.*${SCRIPT_NAME} launch .*/menu-open" echo "$m11_out"
+  ( cd "$tmp/mroot" && "$BASH" "$_ZPROJ_SELF" delete menu-open --force &>/dev/null ) || true
 
   # ── Section: tmux (headless detached session) ────────────────────────────
   # T1–T8 require tmux >= 3.0 in PATH. Skip gracefully if absent.

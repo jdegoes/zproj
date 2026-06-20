@@ -20,7 +20,8 @@ A built-in review workflow lets you annotate lines during a diff review and
 dispatch the collected notes to your coding agent for implementation.
 
 Run `zproj menu` when you want a context-aware command picker instead of
-remembering subcommands.
+remembering subcommands; it can also open existing worktree windows from a
+numbered picker.
 
 `zproj integrate` installs tmux keybindings for worktree management and asks
 your coding agent to wire up your editor with the review workflow.
@@ -170,7 +171,8 @@ outside zproj, at a project root, or inside a worktree. It shows current
 status, suggests useful next steps, and displays the exact command before
 asking whether to run it. On the default worktree, the menu omits current
 worktree join/delete actions and steers you toward creating or forking a
-separate worktree.
+separate worktree. Use `Launch a worktree window` when you want to switch from
+`main` to another existing worktree.
 
 ```bash
 zproj menu                 # menu for current directory
@@ -356,7 +358,7 @@ Run `zproj <command> --help` for details on any command.
 zproj --test
 ```
 
-451 tests pass in the default suite. Some checks are skipped when optional
+456 tests pass in the default suite. Some checks are skipped when optional
 tools or agent binaries are absent; the one slow Lima VM test (`LM5`) is
 skipped unless you set `ZPROJ_TEST_LIMA_VM=1` and have `limactl` installed.
 Coverage includes init, clone, upgrade, worktree management, fork/update/join,
