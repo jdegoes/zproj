@@ -39,7 +39,7 @@ Before every commit:
 4. **Tool resolution** — `_resolve_editor`, `_resolve_ai`
 5. **Directory resolution** — `resolve_project_dir`
 6. **Init helpers** — `_init_bare_structure`, `_case1_plain_dir`, `_case2_upgrade_repo`
-7. **Subcommands** — `cmd_init`, `cmd_clone`, `cmd_create`, `cmd_delete`, `cmd_fork`, `cmd_update`, `cmd_join`, `cmd_launch`, `cmd_list`, `cmd_open`, `cmd_default`, `cmd_review`, `cmd_diagnostics`, `cmd_integrate`, `cmd_notify`; global **`--sandbox`** / **`--plan`** / **`--force`** (see `_zproj_argv_peel`, sandbox helpers)
+7. **Subcommands** — `cmd_init`, `cmd_clone`, `cmd_create`, `cmd_delete`, `cmd_fork`, `cmd_update`, `cmd_join`, `cmd_launch`, `cmd_list`, `cmd_menu`, `cmd_open`, `cmd_default`, `cmd_review`, `cmd_diagnostics`, `cmd_integrate`, `cmd_notify`; global **`--sandbox`** / **`--plan`** / **`--force`** (see `_zproj_argv_peel`, sandbox helpers)
 8. **Usage functions** — `usage_main`, `usage_init`, etc.
 9. **Self-test** — `cmd_test()`
 10. **Main dispatch** — `main()` case statement
@@ -50,7 +50,7 @@ Every feature, behaviour change, or bug fix requires tests. No exceptions.
 
 Helpers: `_t_check "desc" <cmd>` (pass if exit 0), `_t_grep "desc" <pattern> <cmd>` (pass if output matches), `_t_pass`, `_t_fail`, `_t_skip`, `_section "XX1 — desc"`.
 
-Each section uses a unique 1-3 letter prefix: R (init), C (plain dir), U (upgrade), E (editor), A (agent), RP (cursor), P/V/RC/D (review), I (integrate), X (diagnostics), T (tmux/launch), B (regressions), TM (session names), S (safety/meta), N (edge cases), RT (runtime), TX (tmux config), FK (fork), FJ (join), UP (update), BM (branch-name mismatch), TI (tmux binding installation), LM (Lima sandbox), NT (notify / integrate UX).
+Each section uses a unique 1-3 letter prefix: R (init), C (plain dir), U (upgrade), E (editor), A (agent), RP (cursor), P/V/RC/D (review), I (integrate), X (diagnostics), M (menu), T (tmux/launch), B (regressions), TM (session names), S (safety/meta), N (edge cases), RT (runtime), TX (tmux config), FK (fork), FJ (join), UP (update), BM (branch-name mismatch), TI (tmux binding installation), LM (Lima sandbox), NT (notify / integrate UX).
 
 To add a test: find the prefix, use the next number (e.g. `T12` exists, add `T13`), place adjacent to related tests. Tests requiring tmux are gated behind `command -v tmux`; tests requiring specific binaries use `_t_skip`. Live Lima VM tests (`LM5`): set `ZPROJ_TEST_LIMA_VM=1` (slow; creates/deletes a real instance).
 
